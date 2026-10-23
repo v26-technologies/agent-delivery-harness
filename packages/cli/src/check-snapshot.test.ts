@@ -141,6 +141,7 @@ it.each([
   ["directory output itself", "out", "absolute"],
   ["nested output", "out/nested/escape", "absolute"],
   ["nested relative escape", "out/nested/escape", "relative"],
+  ["resolved escape via excluded Git metadata", "out/link", "resolved"],
   ["exact output", "result", "absolute"],
   ["nested Git-named output", "out/.git/escape", "absolute"],
 ])("still checks unsafe links in %s", async (_name, relative, targetKind) => {
@@ -149,7 +150,11 @@ it.each([
   try {
     const link = path.join(snapshot.rootDir, relative!);
     await mkdir(path.dirname(link), { recursive: true });
-    await symlink(targetKind === "relative" ? path.relative(path.dirname(link), f.root) : f.root, link);
+    const gitLink = path.join(snapshot.rootDir, ".git/outside");
+    if (targetKind === "resolved") await symlink(f.root, gitLink);
+    const target = targetKind === "resolved" ? path.relative(path.dirname(link), gitLink)
+      : targetKind === "relative" ? path.relative(path.dirname(link), f.root) : f.root;
+    await symlink(target, link);
     await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
   } finally { await snapshot.cleanup(); }
 });
