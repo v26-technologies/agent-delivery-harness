@@ -87,6 +87,7 @@ export const prepareCommand: CommandDescriptor = {
         attemptId = await invalidatePreparationReceipt(context.rootDir, context.config, wiring.storageOptions);
         ownedAttemptId = attemptId;
         retainedAttemptId = undefined;
+        if (context.config.scopedExecution?.repairCommands?.length) throw new CheckSnapshotError("preparation_candidate_changed", "Preparation wiring changed after repairs were skipped; reload the configuration and prepare again.");
       }
       let validationDigest = await computeDeliverableIdentity({ rootDir: context.rootDir, treeSha: capture.candidate.treeSha,
         config: { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral } });

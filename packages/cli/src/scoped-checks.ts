@@ -51,6 +51,7 @@ export class ScopedChecks {
   private readonly owned = new Map<string, Awaited<ReturnType<AttemptStore["allocate"]>>>();
   private readonly stores = new Map<string, AttemptStore>();
   private readonly identities = new Map<string, Awaited<ReturnType<typeof scopedCheckIdentity>>>();
+  private readonly executionIdentities = new Map<string, Awaited<ReturnType<typeof scopedCheckIdentity>>>();
   private readonly observations = new Map<string, ScopedRuntimeObservation>();
   private readonly runId = randomUUID();
   private readonly submissions: (() => Promise<void>)[] = [];
@@ -98,6 +99,7 @@ export class ScopedChecks {
       const store = new AttemptStore(path.join(storage.storageDir, digestCanonical({ gate: context.config.gateId, provider: provider.id })));
       session.stores.set(provider.id, store);
       let identity = await scopedCheckIdentity(context.config, provider, inventory, read, observation, candidate, readEvidence);
+      session.executionIdentities.set(provider.id, identity);
       // Preserve raw Git identity for execution. Only proven record-neutral tree
       // transport may select a prior identity, and only for reusable attempts.
       const history = await store.read();
@@ -138,7 +140,10 @@ export class ScopedChecks {
     for (const id of ids) if (!this.identities.get(id)!.reusable && !this.owned.has(id)) await this.allocate(id);
   }
   private async allocate(id: string) {
-    const identity = this.identities.get(id)!;
+    // Historical identity transport selects retained evidence only. A fresh
+    // attempt executes this candidate and must bind its actual source tree.
+    const identity = this.executionIdentities.get(id)!;
+    this.identities.set(id, identity);
     const attempt = await this.locked(() => this.stores.get(id)!.allocate({ version: "scoped-attempt/1", providerId: id, inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, origin: { candidate: scopedCandidate(this.candidate), runId: this.runId } }));
     this.owned.set(id, attempt); return attempt;
   }

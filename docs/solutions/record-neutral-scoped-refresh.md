@@ -7,6 +7,9 @@ existing receipt proves the same strict validation projection, policy, wiring,
 base and workspace. Ordinary preparation still repairs; missing, revoked or
 stale receipts still take the execution path. The evaluated capture remains the
 baseline for the final drift check.
+If wiring drifts after a reusable receipt was evaluated and repairs were
+skipped, refresh invalidates the receipt and refuses publication. A fresh
+prepare must load the new wiring and run its repairs.
 
 Full-Git checks retain raw HEAD and tree identity. When staging only configured
 record-neutral paths, the executor can match a historical attempt by proving
@@ -16,6 +19,9 @@ This does not make arbitrary Git consumers file-only or permit reuse after a
 HEAD change. Declared neutral files that are also explicit check inputs still
 invalidate those checks. Existing matching current-tree attempts take precedence;
 failed and interrupted matching attempts remain fences, not reusable success.
+Transport selects retained evidence only: any fresh retry resets to the current
+candidate's raw identity before allocation, so its digest and recorded origin
+describe the tree that actually executed.
 
 The resulting record can describe a newer neutral tree than the original
 execution. Portable verification must prove equivalence to the originating
