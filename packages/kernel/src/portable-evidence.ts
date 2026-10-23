@@ -2,6 +2,7 @@
 import { BlockedError, createBlocker, type Blocker } from "./blockers.ts";
 import { digestCanonical, sha256Hex } from "./digest.ts";
 import type { HarnessConfig } from "./config.ts";
+import { recordOutputConfiguration } from "./record-output.ts";
 import type { ArtifactObservation, ArtifactsPort } from "./artifacts.types.ts";
 import type { PortableEvidence, PortableEvidenceContext, RecordCandidateBinding, CheckBinding } from "./records.types.ts";
 import { readWorkflowRelease, resolveReviewCharters, type ReviewInputReader } from "./review-inputs.ts";
@@ -33,7 +34,7 @@ export function repositoryEvidenceReader(rootDir: string, artifacts: ArtifactsPo
 }
 
 export async function capturePortableEvidenceContext(
-  config: HarnessConfig, read: ReviewInputReader, preparationFingerprint: string,
+  config: HarnessConfig, read: ReviewInputReader, preparationFingerprint: string, deliverableDigest?: string,
 ): Promise<PortableEvidenceContext> {
   const policy = await read(".agents/policy/compiled-snapshot.json");
   const release = await readWorkflowRelease(read);
@@ -42,7 +43,7 @@ export async function capturePortableEvidenceContext(
   const reviewerCharters = policy === null ? [] : await resolveReviewCharters(read, config);
   const graph = release === null ? null : await read(".agent-skills/current/workflows/delivery-v1.json");
   if (policy !== null && graph === null) refuse("portable_context_incomplete", "The installed workflow graph is missing.");
-  return { configurationDigest: digestCanonical(config), preparationFingerprint, policyDigest: policy === null ? null : sha256Hex(policy),
+  return { configurationDigest: digestCanonical(recordOutputConfiguration(config, deliverableDigest)), preparationFingerprint, policyDigest: policy === null ? null : sha256Hex(policy),
     release, workflowGraphSha256: graph === null ? null : sha256Hex(graph), reviewerCharters };
 }
 

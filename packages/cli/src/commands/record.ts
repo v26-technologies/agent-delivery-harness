@@ -124,7 +124,7 @@ export const recordCommand: CommandDescriptor = {
 
     const evidenceReader = repositoryEvidenceReader(context.rootDir, context.artifacts);
     const evidenceContext = await capturePortableEvidenceContext(context.config, evidenceReader,
-      await computePreparationFingerprint(context.rootDir, context.config));
+      await computePreparationFingerprint(context.rootDir, context.config), recheck.candidate.deliverable.digest);
     const compiledPolicy = context.policyBinding?.compiledPolicy ??
       await readCompiledRepositoryPolicy(await candidateTreeEvidenceReader(context.rootDir, recheck.candidate.treeSha));
     // The delivery's own span, read off the run journal rather than off a

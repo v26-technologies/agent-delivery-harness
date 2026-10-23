@@ -88,7 +88,7 @@ export async function buildReviewContext(
   candidate: CapturedCandidate,
   receipt: PreparationReceipt,
 ) {
-  const inputs = await capturePortableEvidenceContext(config, repositoryEvidenceReader(rootDir, createArtifactsPort()), receipt.preparationFingerprint);
+  const inputs = await capturePortableEvidenceContext(config, repositoryEvidenceReader(rootDir, createArtifactsPort()), receipt.preparationFingerprint, candidate.deliverable.digest);
   const charters = inputs.reviewerCharters;
   if (charters.length === 0 || inputs.release === null) throw new OutcomeError("the compiled policy activates no review lens or installed release");
   const binding = {

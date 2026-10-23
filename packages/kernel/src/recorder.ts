@@ -556,7 +556,7 @@ export async function submitManifest(input: SubmissionInput, options: Submission
 
   // ── SUB-4 ──
   try {
-    const context = await capturePortableEvidenceContext(input.config, repositoryEvidenceReader(input.rootDir, artifacts), preparationFingerprint!);
+    const context = await capturePortableEvidenceContext(input.config, repositoryEvidenceReader(input.rootDir, artifacts), preparationFingerprint!, captured!.deliverable.digest);
     const portable = retainPortableEvidence(validation.manifest, observations, context);
     const blockers = verifyPortableEvidence(input.config, portable, recordBinding(validation.manifest), context, checkBindings);
     if (blockers.length > 0) return blockedOutcome(blockers);

@@ -51,6 +51,7 @@ import { BlockedError, createBlocker, sanitizedDetail, type Blocker, type NonEmp
 import { CANDIDATE_MODES, classifyCandidateDrift, type CandidateBinding, type CandidateMode } from "./candidate.types.ts";
 import type { HarnessConfig } from "./config.ts";
 import { digestCanonical } from "./digest.ts";
+import { recordOutputConfiguration } from "./record-output.ts";
 import { computeDeliverableIdentity } from "./identity.ts";
 import { resolveRecordStorage, type RecordStorageOptions } from "./records.ts";
 import type { WorkspaceStorage } from "./records.types.ts";
@@ -490,7 +491,7 @@ export async function publishPreparationReceipt(
   const receipt = {
     ...buildReceipt(workspaceId, input.config.gateId, input.candidate, fingerprint),
     ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
-    ...(input.validationDigest === undefined ? {} : { validationDigest: input.validationDigest, policyDigest: digestCanonical(input.config) }),
+    ...(input.validationDigest === undefined ? {} : { validationDigest: input.validationDigest, policyDigest: digestCanonical(recordOutputConfiguration(input.config, input.candidate.deliverable.digest)) }),
   };
   const destination = path.join(storageDir, receiptFileName(input.config.gateId));
   await requireCurrentAttempt(destination, input.attemptId);
@@ -765,7 +766,7 @@ export async function evaluatePreparationReceipt(
   // requires the exact receipt coordinates. The narrower projection keeps
   // report/solution changes significant even when review identity excludes them.
   if (options.allowValidationEquivalent && receipt.validationDigest !== undefined &&
-      receipt.policyDigest === digestCanonical(input.config) && !drift.has("workspace_changed") &&
+      receipt.policyDigest === digestCanonical(recordOutputConfiguration(input.config, input.candidate.deliverable.digest)) && !drift.has("workspace_changed") &&
       receipt.identityToken === input.candidate.deliverable.identity &&
       receipt.validationDigest === await computeDeliverableIdentity({ rootDir, treeSha: input.candidate.treeSha,
         config: { ...input.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: input.config.recordNeutral } })) {
