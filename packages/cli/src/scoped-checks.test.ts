@@ -1036,3 +1036,54 @@ it("records an unscoped declared check's evidence during gate alongside scoped p
   await f.git("add", ".");
   expect(await f.run("verify"), f.err.join("\n")).toBe(0);
 }, 30000);
+
+it("record-neutral refresh and record reuse full-Git checks and repairs", async () => {
+  const f = await fixture(); f.env.FAIL = "0";
+  const repairCounter = path.join(f.dir, ".git", "repair-count");
+  f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }], scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
+    profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
+    repairCommands: [{ id: "repair", command: [process.execPath, "-e", `const fs=require('fs');fs.appendFileSync(${JSON.stringify(repairCounter)},'x')`], timeoutMs: 5000 }] } });
+  const { readScopedCheckObservations } = await import("./scoped-observations.ts");
+  const attempts = async () => (await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => p.attempts.length);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  await mkdir(path.join(f.dir, "telemetry/delivery-runs"), { recursive: true });
+  await writeFile(path.join(f.dir, "telemetry/delivery-runs/neutral.json"), "{}"); await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await readFile(repairCounter, "utf8")).toBe("x");
+  expect(await attempts()).toEqual([1, 1]);
+  expect(await f.run("record"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await f.run("verify"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  expect(await readFile(repairCounter, "utf8")).toBe("x");
+}, 30000);
+
+it.each(["source", "base", "wiring", "release"])("record-neutral refresh invalidates %s movement", async kind => {
+  const f = await fixture(); f.env.FAIL = "0";
+  const repairCounter = path.join(f.dir, ".git", "repair-count");
+  f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }], scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
+    profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
+    repairCommands: [{ id: "repair", command: [process.execPath, "-e", `require('fs').appendFileSync(${JSON.stringify(repairCounter)},'x')`], timeoutMs: 5000 }] } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  if (kind === "source") await writeFile(path.join(f.dir, "source.txt"), "changed");
+  if (kind === "wiring") await writeFile(path.join(f.dir, "harness.config.ts"), "// changed wiring\nexport default {};\n");
+  if (kind === "release") {
+    await mkdir(path.join(f.dir, ".agent-skills"), { recursive: true });
+    await writeFile(path.join(f.dir, ".agent-skills/active.json"), JSON.stringify({ release: { releaseId: "changed", profile: "core", archiveSha256: "a".repeat(64), metadataSha256: "b".repeat(64) } }));
+  }
+  if (kind === "base") {
+    await f.git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "new base");
+    await f.git("branch", "-f", "origin/main", "HEAD");
+  }
+  await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await readFile(repairCounter, "utf8")).toBe("xx");
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  const { readScopedCheckObservations } = await import("./scoped-observations.ts");
+  expect((await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => p.attempts.length)).toEqual([2, 2]);
+}, 30000);

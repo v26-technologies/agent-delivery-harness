@@ -48,7 +48,16 @@ export const prepareCommand: CommandDescriptor = {
       let reusableFingerprint: string | undefined;
       let attemptId: string;
       try {
-        if (context.config.scopedExecution?.repairCommands?.length) {
+        capture = await wiring.captureCandidate();
+        if (capture.ok && refreshRecordNeutral) {
+          const previous = await evaluatePreparationReceipt(context.rootDir,
+            { config: context.config, candidate: capture.candidate }, { ...wiring.storageOptions, allowValidationEquivalent: true });
+          if (previous.prepared && previous.receipt.attemptId !== undefined) {
+            reusableFingerprint = previous.receipt.preparationFingerprint;
+            retainedAttemptId = previous.receipt.attemptId;
+          }
+        }
+        if (retainedAttemptId === undefined && context.config.scopedExecution?.repairCommands?.length) {
           ownedAttemptId = await invalidatePreparationReceipt(context.rootDir, context.config, wiring.storageOptions);
           const beforeRepair = await computePreparationFingerprint(context.rootDir, context.config, wiring.storageOptions);
           for (const repair of context.config.scopedExecution.repairCommands) {
@@ -59,15 +68,7 @@ export const prepareCommand: CommandDescriptor = {
             if (result.code !== 0) throw new CheckSnapshotError("preparation_repair_failed", `Source repair ${repair.id} failed; fix it and prepare again.`);
           }
           if (beforeRepair !== await computePreparationFingerprint(context.rootDir, context.config, wiring.storageOptions)) throw new CheckSnapshotError("preparation_candidate_changed", "Repair changed preparation wiring; reload the configuration and prepare again.");
-        }
-        capture = await wiring.captureCandidate();
-        if (capture.ok && refreshRecordNeutral) {
-          const previous = await evaluatePreparationReceipt(context.rootDir,
-            { config: context.config, candidate: capture.candidate }, { ...wiring.storageOptions, allowValidationEquivalent: true });
-          if (previous.prepared && previous.receipt.attemptId !== undefined) {
-            reusableFingerprint = previous.receipt.preparationFingerprint;
-            retainedAttemptId = previous.receipt.attemptId;
-          }
+          capture = await wiring.captureCandidate();
         }
       } finally {
         attemptId = retainedAttemptId ?? ownedAttemptId ?? await invalidatePreparationReceipt(context.rootDir, context.config, wiring.storageOptions);
