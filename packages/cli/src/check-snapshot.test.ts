@@ -165,6 +165,23 @@ it("checks narrowed output ownership and accepts safe dangling output links", as
     await expect(snapshot.verify({ outputs: ["own/"] })).rejects.toMatchObject({ code: "check_snapshot_drift" });
   } finally { await snapshot.cleanup(); }
 });
+it("excludes exact directory outputs recursively while checking descendant safety", async () => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: ["result"], environment: {} });
+  try {
+    await mkdir(path.join(snapshot.rootDir, "result/nested"), { recursive: true });
+    await writeFile(path.join(snapshot.rootDir, "result/nested/file"), "mutable bytes");
+    await symlink("../../source.txt", path.join(snapshot.rootDir, "result/nested/link"));
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+    await writeFile(path.join(snapshot.rootDir, "result/nested/file"), "changed mutable bytes");
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+    await symlink(f.root, path.join(snapshot.rootDir, "result/nested/escape"));
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
+    await rm(path.join(snapshot.rootDir, "result/nested/escape"));
+    await exec("mkfifo", [path.join(snapshot.rootDir, "result/nested/pipe")]);
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
+  } finally { await snapshot.cleanup(); }
+});
 it("installs private dependencies, excludes inherited flags, and detects dependency mutation", async () => {
   const f = await fixture();
   const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: { DECLARED_FLAG: "bound" },
