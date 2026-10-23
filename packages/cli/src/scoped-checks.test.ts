@@ -1036,3 +1036,132 @@ it("records an unscoped declared check's evidence during gate alongside scoped p
   await f.git("add", ".");
   expect(await f.run("verify"), f.err.join("\n")).toBe(0);
 }, 30000);
+
+it("record-neutral refresh and record reuse full-Git checks and repairs", async () => {
+  const f = await fixture(); f.env["FAIL"] = "0";
+  const repairCounter = path.join(f.dir, ".git", "repair-count");
+  f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }], scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
+    profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
+    repairCommands: [{ id: "repair", command: [process.execPath, "-e", `const fs=require('fs');fs.appendFileSync(${JSON.stringify(repairCounter)},'x')`], timeoutMs: 5000 }] } });
+  const { readScopedCheckObservations } = await import("./scoped-observations.ts");
+  const attempts = async () => (await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => p.attempts.length);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  await mkdir(path.join(f.dir, "telemetry/delivery-runs"), { recursive: true });
+  await writeFile(path.join(f.dir, "telemetry/delivery-runs/neutral.json"), "{}"); await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await readFile(repairCounter, "utf8")).toBe("x");
+  expect(await attempts()).toEqual([1, 1]);
+  expect(await f.run("record"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await f.run("verify"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  expect(await readFile(repairCounter, "utf8")).toBe("x");
+}, 30000);
+
+it.each(["source", "base", "wiring", "release"])("record-neutral refresh invalidates %s movement", async kind => {
+  const f = await fixture(); f.env["FAIL"] = "0";
+  const repairCounter = path.join(f.dir, ".git", "repair-count");
+  f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }], scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
+    profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
+    repairCommands: [{ id: "repair", command: [process.execPath, "-e", `require('fs').appendFileSync(${JSON.stringify(repairCounter)},'x')`], timeoutMs: 5000 }] } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  if (kind === "source") await writeFile(path.join(f.dir, "source.txt"), "changed");
+  if (kind === "wiring") await writeFile(path.join(f.dir, "harness.config.ts"), "// changed wiring\nexport default {};\n");
+  if (kind === "release") {
+    await mkdir(path.join(f.dir, ".agent-skills"), { recursive: true });
+    await writeFile(path.join(f.dir, ".agent-skills/active.json"), JSON.stringify({ release: { releaseId: "changed", profile: "core", archiveSha256: "a".repeat(64), metadataSha256: "b".repeat(64) } }));
+  }
+  if (kind === "base") {
+    await f.git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "new base");
+    await f.git("branch", "-f", "origin/main", "HEAD");
+  }
+  await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await readFile(repairCounter, "utf8")).toBe("xx");
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  const { readScopedCheckObservations } = await import("./scoped-observations.ts");
+  expect((await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => p.attempts.length)).toEqual([2, 2]);
+}, 30000);
+
+it("failed full-Git check retry after neutral staging stays verifiable", async () => {
+  const f = await fixture(); f.env["FAIL"] = "0";
+  const failOnce = path.join(f.dir, ".git", "fail-once");
+  const a = f.config.providers[0]!;
+  f.setConfig({ ...f.config,
+    recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }],
+    scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })) },
+    providers: [{ ...a, check: { ...a.check!, command: [process.execPath, "-e", `const fs=require('fs');if(!fs.existsSync(${JSON.stringify(failOnce)})){fs.writeFileSync(${JSON.stringify(failOnce)},'x');process.exit(3)};fs.writeFileSync('result-a.json','{}')`] } }, f.config.providers[1]!],
+  });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.out.join("\n")+f.err.join("\n")).toBe(1);
+  await mkdir(path.join(f.dir, "telemetry/delivery-runs"), { recursive: true });
+  await writeFile(path.join(f.dir, "telemetry/delivery-runs/neutral.json"), "{}"); await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.out.join("\n")+f.err.join("\n")).toBe(0);
+  expect(await f.run("record"), f.out.join("\n")+f.err.join("\n")).toBe(0);
+  await f.git("add", ".");
+  expect(await f.run("verify"), f.out.join("\n")+f.err.join("\n")).toBe(0);
+}, 30000);
+
+it("current full-Git failed attempt fences older neutral-tree success", async () => {
+  const { AttemptStore } = await import("./scoped-attempts.ts");
+  const f = await fixture(); f.env["FAIL"] = "0";
+  const initialTree = await f.git("write-tree");
+  const a = f.config.providers[0]!;
+  f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }],
+    scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })) },
+    providers: [{ ...a, check: { ...a.check!, command: [process.execPath, "-e", `if(process.env.DELIVERY_CHECK_ORIGIN_TREE!==${JSON.stringify(initialTree)})process.exit(7);require('fs').writeFileSync('result-a.json','{}')`] } }, f.config.providers[1]!] });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  await mkdir(path.join(f.dir, "telemetry/delivery-runs"), { recursive: true });
+  await writeFile(path.join(f.dir, "telemetry/delivery-runs/neutral.json"), "{}"); await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  // Retain an independently executed attempt on the current raw tree. Hide the
+  // older history only while that invocation chooses its execution identity.
+  const read = AttemptStore.prototype.read;
+  const spy = vi.spyOn(AttemptStore.prototype, "read").mockImplementation(async function(this: import("./scoped-attempts.ts").AttemptStore) {
+    return (await read.call(this)).filter(row => row.attempt.origin.candidate.treeSha !== initialTree);
+  });
+  try {
+    expect(await f.run("gate"), f.out.join("\n") + f.err.join("\n")).toBe(1);
+    expect(f.out.join("\n")).toContain("checking check.a");
+  } finally { spy.mockRestore(); }
+  expect(await f.run("gate"), f.out.join("\n") + f.err.join("\n")).toBe(1);
+  expect(f.out.join("\n")).toContain("checking check.a");
+  expect(f.out.join("\n")).not.toContain("reusing check.a");
+}, 30000);
+
+it("portable origin-tree transport rejects undeclared nonneutral drift", async () => {
+  const { readdir } = await import("node:fs/promises");
+  const { capturePortableVerificationInputs, withDeliverableIdentity } = await import("@agent-delivery-harness/kernel");
+  const { captureScopedCandidate } = await import("./scoped-candidate.ts");
+  const f = await fixture(); f.env["FAIL"] = "0";
+  f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }],
+    scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })) } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  await mkdir(path.join(f.dir, "telemetry/delivery-runs"), { recursive: true });
+  await writeFile(path.join(f.dir, "telemetry/delivery-runs/neutral.json"), "{}"); await f.git("add", ".");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await f.run("record"), f.err.join("\n")).toBe(0); await f.git("add", ".");
+  const recordRoot = path.join(f.dir, path.dirname(f.config.deliveryRecordPath));
+  const record = JSON.parse(await readFile(path.join(recordRoot, (await readdir(recordRoot))[0]!), "utf8"));
+  const capture = async () => {
+    const value = await captureScopedCandidate({ rootDir: f.dir, config: f.config, workspaceId: record.candidateBinding.workspaceId, computeIdentity: withDeliverableIdentity() });
+    if (!value.ok) throw new Error("capture failed");
+    return value.candidate;
+  };
+  await expect(capturePortableVerificationInputs(f.dir, f.config, await capture(), record)).resolves.toBeDefined();
+  await mkdir(path.join(f.dir, "docs/reports"), { recursive: true });
+  await writeFile(path.join(f.dir, "docs/reports/not-record-neutral.md"), "unvalidated raw-tree change"); await f.git("add", ".");
+  const changed = await capture();
+  // A record claiming this newer tree must still independently prove the tree
+  // of its historical full-Git attempt. Declared source files have not changed.
+  record.candidateBinding.treeSha = changed.treeSha;
+  await expect(capturePortableVerificationInputs(f.dir, f.config, changed, record)).rejects.toMatchObject({ blockers: [expect.objectContaining({ code: "portable_scoped_inputs_invalid" })] });
+}, 30000);

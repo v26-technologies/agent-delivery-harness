@@ -382,3 +382,30 @@ describe("declared deterministic check providers", () => {
   }, 30_000);
 
 });
+
+it("rejects wiring drift after refresh skipped repairs, then repairs on retry", async () => {
+  const f = await fixture([process.execPath, "-e", ""]);
+  await writeFile(path.join(f.dir, ".git/wiring"), "first");
+  f.setConfig({ ...f.config, preparationWiringPaths: ["harness.config.ts", ".git/wiring"],
+    scopedExecution: { version: "scoped-execution/1", mechanicalProviders: [],
+      profiles: [{ id: "fixture", gitContext: "none", dependencyInputs: [], mutableOutputs: [], credentialIdentities: {} }],
+      repairCommands: [{ id: "repair", command: [process.execPath, "-e", "const fs=require('fs');fs.appendFileSync('.git/repair-count','x');fs.writeFileSync('.git/repaired-wiring',fs.readFileSync('.git/wiring'))"], timeoutMs: 5000 }] },
+    preparationCommands: [{ id: "mechanical", command: [process.execPath, "-e", "require('fs').appendFileSync('.git/mechanical','x')"], timeoutMs: 5000 }] });
+  expect(await f.run("prepare")).toBe(0);
+  let reached!: () => void, resume!: () => void;
+  const paused = new Promise<void>(resolve => { reached = resolve; });
+  refreshPause.resume = new Promise<void>(resolve => { resume = resolve; });
+  refreshPause.reached = reached; refreshPause.enabled = true;
+  const refresh = runCli(["prepare", "--refresh-record-neutral"], f.runtime);
+  try { await paused; await writeFile(path.join(f.dir, ".git/wiring"), "second"); }
+  finally { refreshPause.enabled = false; resume(); }
+  expect(await refresh, f.err.join("\n")).toBe(1);
+  expect(f.err.join("\n")).toContain("preparation_candidate_changed");
+  expect(await f.run("review-context")).toBe(1);
+  expect(await readFile(path.join(f.dir, ".git/repair-count"), "utf8")).toBe("x");
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await f.run("review-context"), f.err.join("\n")).toBe(0);
+  expect(await readFile(path.join(f.dir, ".git/mechanical"), "utf8")).toBe("xx");
+  expect(await readFile(path.join(f.dir, ".git/repaired-wiring"), "utf8")).toBe("second");
+  expect(await readFile(path.join(f.dir, ".git/repair-count"), "utf8")).toBe("xx");
+}, 30000);

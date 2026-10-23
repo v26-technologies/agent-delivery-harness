@@ -156,8 +156,18 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
         // Record-only transport verifies the historical execution, including its
         // HEAD. The strict equivalence/base proof above does not grant gate reuse.
         const manifestCandidate = (portable?.manifest as { candidate?: { headSha?: unknown } } | undefined)?.candidate;
-        const identityCandidate = bindingCandidate.treeSha === record.candidateBinding.treeSha && bindingCandidate.workspaceId === record.candidateBinding.workspaceId && typeof manifestCandidate?.headSha === "string" && /^[a-f0-9]{40}$/.test(manifestCandidate.headSha) && await recordTransportFrom(manifestCandidate.headSha)
+        let identityCandidate = bindingCandidate.treeSha === record.candidateBinding.treeSha && bindingCandidate.workspaceId === record.candidateBinding.workspaceId && typeof manifestCandidate?.headSha === "string" && /^[a-f0-9]{40}$/.test(manifestCandidate.headSha) && await recordTransportFrom(manifestCandidate.headSha)
           ? { ...bindingCandidate, headSha: manifestCandidate.headSha } : candidate;
+        // A record can itself have reused an earlier execution after neutral
+        // staging. Prove that attempt's tree too, rather than assuming every
+        // evidence manifest was executed on the record's final tree.
+        const origin = retained.attempt.origin.candidate;
+        if (identityCandidate !== candidate && origin.treeSha !== identityCandidate.treeSha) {
+          const validationConfig = { ...config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: config.recordNeutral };
+          const [original, current] = await Promise.all([origin.treeSha, candidate.treeSha].map(treeSha => computeDeliverableIdentity({ rootDir, treeSha, config: validationConfig }, { run })));
+          if (original === current && origin.baseRef === candidate.base.ref && origin.baseTipSha === candidate.base.tipSha && origin.mergeBaseSha === candidate.base.mergeBaseSha)
+            identityCandidate = { ...identityCandidate, treeSha: origin.treeSha };
+        }
         const identity = await scopedCheckIdentity(config, provider, listing.stdout.split("\0").filter(Boolean), readSource, retained.observation, identityCandidate, read);
         if (retained.attempt.providerId !== provider.id || retained.attempt.status !== "passed" || retained.attempt.inputDigest !== identity.inputDigest || retained.attempt.profileDigest !== identity.profileDigest) throw new Error("Mismatched scoped execution identity");
         checks[provider.id] = { inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, reusable: identity.reusable, attempts: [retained.attempt] };

@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
+import { computeDeliverableIdentity, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
 import { AttemptStore, type AttemptPayload, type StoredAttempt } from "./scoped-attempts.ts";
@@ -51,6 +51,7 @@ export class ScopedChecks {
   private readonly owned = new Map<string, Awaited<ReturnType<AttemptStore["allocate"]>>>();
   private readonly stores = new Map<string, AttemptStore>();
   private readonly identities = new Map<string, Awaited<ReturnType<typeof scopedCheckIdentity>>>();
+  private readonly executionIdentities = new Map<string, Awaited<ReturnType<typeof scopedCheckIdentity>>>();
   private readonly observations = new Map<string, ScopedRuntimeObservation>();
   private readonly runId = randomUUID();
   private readonly submissions: (() => Promise<void>)[] = [];
@@ -73,6 +74,13 @@ export class ScopedChecks {
     const listing = await runGitCommand(["git", "ls-tree", "-r", "--name-only", "-z", candidate.treeSha], { cwd: context.rootDir });
     if (listing.exitCode !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Cannot enumerate the prepared source tree.");
     const inventory = listing.stdout.split("\0").filter(Boolean);
+    const validationConfig = { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral };
+    const validationTrees = new Map<string, Promise<string>>();
+    const validation = (treeSha: string) => {
+      let digest = validationTrees.get(treeSha);
+      if (!digest) { digest = computeDeliverableIdentity({ rootDir: context.rootDir, treeSha, config: validationConfig }); validationTrees.set(treeSha, digest); }
+      return digest;
+    };
     for (const provider of providers) {
       const scope = provider.check!.scope!, profile = context.config.scopedExecution.profiles.find(p => p.id === scope.profile)!;
       if (!profile) throw new CheckSnapshotError("scoped_executor_required", "A selected execution profile is unsupported.");
@@ -88,8 +96,24 @@ export class ScopedChecks {
           return [e.name, { present, identity }];
         })) };
       session.observations.set(provider.id, observation);
-      session.identities.set(provider.id, await scopedCheckIdentity(context.config, provider, inventory, read, observation, candidate, readEvidence));
-      session.stores.set(provider.id, new AttemptStore(path.join(storage.storageDir, digestCanonical({ gate: context.config.gateId, provider: provider.id }))));
+      const store = new AttemptStore(path.join(storage.storageDir, digestCanonical({ gate: context.config.gateId, provider: provider.id })));
+      session.stores.set(provider.id, store);
+      let identity = await scopedCheckIdentity(context.config, provider, inventory, read, observation, candidate, readEvidence);
+      session.executionIdentities.set(provider.id, identity);
+      // Preserve raw Git identity for execution. Only proven record-neutral tree
+      // transport may select a prior identity, and only for reusable attempts.
+      const history = await store.read();
+      if (identity.reusable && profile.gitContext !== "none" && !history.some(({ attempt }) => attempt.inputDigest === identity.inputDigest && attempt.profileDigest === identity.profileDigest)) {
+        for (const { attempt } of history.reverse()) {
+          const origin = attempt.origin.candidate;
+          if (origin.treeSha === candidate.treeSha || origin.baseRef !== candidate.base.ref || origin.baseTipSha !== candidate.base.tipSha ||
+              origin.mergeBaseSha !== candidate.base.mergeBaseSha || origin.workspaceId !== candidate.workspaceId ||
+              origin.identityToken !== candidate.deliverable.identity || await validation(origin.treeSha) !== await validation(candidate.treeSha)) continue;
+          const transported = await scopedCheckIdentity(context.config, provider, inventory, read, observation, { ...candidate, treeSha: origin.treeSha }, readEvidence);
+          if (transported.inputDigest === attempt.inputDigest && transported.profileDigest === attempt.profileDigest) { identity = transported; break; }
+        }
+      }
+      session.identities.set(provider.id, identity);
     }
     return session;
   }
@@ -116,7 +140,10 @@ export class ScopedChecks {
     for (const id of ids) if (!this.identities.get(id)!.reusable && !this.owned.has(id)) await this.allocate(id);
   }
   private async allocate(id: string) {
-    const identity = this.identities.get(id)!;
+    // Historical identity transport selects retained evidence only. A fresh
+    // attempt executes this candidate and must bind its actual source tree.
+    const identity = this.executionIdentities.get(id)!;
+    this.identities.set(id, identity);
     const attempt = await this.locked(() => this.stores.get(id)!.allocate({ version: "scoped-attempt/1", providerId: id, inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, origin: { candidate: scopedCandidate(this.candidate), runId: this.runId } }));
     this.owned.set(id, attempt); return attempt;
   }
