@@ -4491,7 +4491,7 @@ export function createManagedDeliveryFacade(input: CreateFacadeInput): ManagedDe
         });
         evidenceRecords.push(...discovery.records);
       }
-      const context = await capturePortableEvidenceContext(config, repositoryEvidenceReader(rootDir, createArtifactsPort()), await computePreparationFingerprint(rootDir, config));
+      const context = await capturePortableEvidenceContext(config, repositoryEvidenceReader(rootDir, createArtifactsPort()), await computePreparationFingerprint(rootDir, config), admission.decision.candidate.deliverable.digest);
       const built = buildDeliveryRecord({ config, decision: admission.decision, evidenceRecords, context });
       if (!built.ok) return refuseWith(built.blockers);
       const relativePath = deliveryRecordPathFor(config, admission.decision.candidate.deliverable.digest);

@@ -10,6 +10,7 @@ import { BlockedError, createBlocker } from "./blockers.ts";
 import { readWorkflowRelease, type ReviewInputReader } from "./review-inputs.ts";
 import type { CheckBinding, ScopedCheckPlan } from "./records.types.ts";
 import { selectScopedCheckAttempt } from "./evaluator.ts";
+import { recordOutputConfiguration } from "./record-output.ts";
 
 export interface ScopedInputCapturePorts {
   /** Enumerate and read the same pinned snapshot, never the authoring checkout. */
@@ -150,14 +151,14 @@ export async function computeCheckWiringFingerprint(rootDir: string, config: Har
 }
 
 export async function captureCheckBindings(rootDir: string, config: HarnessConfig, candidate: CandidateBinding, options: CheckBindingOptions = {}): Promise<Readonly<Record<string, CheckBinding>>> {
-  const providers = config.providers.filter(provider => provider.check !== undefined);
+  const providers = recordOutputConfiguration(config, candidate.deliverable.digest).providers.filter(provider => provider.check !== undefined);
   if (providers.length === 0) return {};
   const scopedProviders = providers.filter(p => p.check?.scope !== undefined);
   if (scopedProviders.length > 0) {
     const plan = options.scopedPlan;
     const current = { treeSha: candidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: candidate.workspaceId };
     if (plan?.version !== "scoped-plan/1" || digestCanonical(plan.candidate) !== digestCanonical(current) ||
-      plan.selectionDigest !== digestCanonical(scopedProviders.map(p => ({ id: p.id, check: p.check })).sort((a, b) => a.id.localeCompare(b.id))) ||
+      plan.selectionDigest !== digestCanonical(config.providers.filter(p => p.check?.scope).map(p => ({ id: p.id, check: p.check })).sort((a, b) => a.id.localeCompare(b.id))) ||
       Object.keys(plan.checks).sort().join("\0") !== scopedProviders.map(p => p.id).sort().join("\0")) {
       throw new BlockedError([createBlocker({ code: "scoped_check_plan_required", source: { kind: "preparation", id: config.gateId }, summary: "Scoped checks require a supported executor and a complete plan rebuilt for the current candidate and base.", remediations: [{ id: "provide-scoped-plan", kind: "manual_action", summary: "Use a scoped-capable executor to capture the current plan before execution." }] })]);
     }

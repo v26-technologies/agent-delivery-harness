@@ -1,7 +1,8 @@
 /** Recomputable source identity shared by the executor and portable verifier. */
 import { captureScopedCheckInputs } from "./checks.ts";
 import { digestCanonical, sha256Hex } from "./digest.ts";
-import type { HarnessConfig, ProviderRegistration } from "./config.ts";
+import { deliveryRecordPathFor, type HarnessConfig, type ProviderRegistration } from "./config.ts";
+import { recordOutputProvider } from "./record-output.ts";
 import { readWorkflowRelease, type ReviewInputReader } from "./review-inputs.ts";
 import type { CandidateTreeInputReader } from "./portable-inputs.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
@@ -14,8 +15,9 @@ export interface ScopedRuntimeObservation {
   readonly flags: Readonly<Record<string, string>>;
   readonly credentials: Readonly<Record<string, { readonly present: boolean; readonly identity: string | null }>>;
 }
-export async function scopedCheckIdentity(config: HarnessConfig, provider: ProviderRegistration, inventory: readonly string[], read: CandidateTreeInputReader, observation: ScopedRuntimeObservation, candidate: Pick<CapturedCandidate, "base" | "headSha" | "treeSha">, readEvidence: ReviewInputReader = read) {
-  const scope = provider.check?.scope;
+export async function scopedCheckIdentity(config: HarnessConfig, provider: ProviderRegistration, inventory: readonly string[], read: CandidateTreeInputReader, observation: ScopedRuntimeObservation, candidate: Pick<CapturedCandidate, "base" | "headSha" | "treeSha" | "deliverable">, readEvidence: ReviewInputReader = read) {
+  const output = deliveryRecordPathFor(config, candidate.deliverable.digest);
+  const scope = recordOutputProvider(provider, output).check?.scope;
   const profile = config.scopedExecution?.profiles.find(p => p.id === scope?.profile);
   if (!scope || !profile || observation.version !== "scoped-runtime/1" || !/^[a-f0-9]{64}$/.test(observation.runtimeDigest)) throw invalid("check_identity_invalid", "Unsupported scoped execution identity.");
   const flags = scope.environment.filter(e => e.kind === "flag").map(e => e.name);
@@ -43,7 +45,7 @@ export async function scopedCheckIdentity(config: HarnessConfig, provider: Provi
   // differently after the base moves. Recompute this from the selected candidate.
   const runtimeDigest = digestCanonical({ runtime: observation.runtimeDigest, base: candidate.base, ...(profile.gitContext === "none" ? {} : { headSha: candidate.headSha, treeSha: candidate.treeSha }) });
   const profileDigest = digestCanonical({ profile: relevantProfile, runtimeDigest, dependencyDigest, releaseDigest, policyDigest });
-  const capture = await captureScopedCheckInputs(scope, { listFiles: async () => inventory, readFile: read, readMetadata: read.metadata, command: provider.check!.command, timeoutMs: provider.check!.timeoutMs,
+  const capture = await captureScopedCheckInputs(scope, { listFiles: async () => inventory.filter(file => file !== output), readFile: read, readMetadata: read.metadata, command: provider.check!.command, timeoutMs: provider.check!.timeoutMs,
     runtimeDigest, dependencyDigest, releaseDigest, policyDigest, environment, credentialIdentity: name => observation.credentials[name]?.identity ?? null });
   return { ...capture, profileDigest };
 }

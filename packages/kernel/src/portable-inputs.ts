@@ -128,7 +128,7 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
     return bytes;
   };
   const preparationFingerprint = await computePreparationFingerprint(rootDir, config, { readWiring });
-  const evidenceContext = await capturePortableEvidenceContext(config, read, preparationFingerprint);
+  const evidenceContext = await capturePortableEvidenceContext(config, read, preparationFingerprint, candidate.deliverable.digest);
   const compiledPolicy = await readCompiledRepositoryPolicy(read);
   let scopedPlan: ScopedCheckPlan | undefined;
   let bindingCandidate = candidate;
@@ -151,6 +151,7 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
       const contents = portableArtifactContents(portable?.artifacts);
       const raw = contents.artifacts.get("scoped-inputs.json");
       if (!raw) throw new BlockedError([portableBlocker("portable_scoped_inputs_missing", "Scoped execution requires retained input observations and its originating attempt.")]);
+      let mismatch = "retained observation";
       try {
         const retained = JSON.parse(raw) as { observation: ScopedRuntimeObservation; attempt: ScopedCheckAttempt };
         // Record-only transport verifies the historical execution, including its
@@ -169,9 +170,18 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
             identityCandidate = { ...identityCandidate, treeSha: origin.treeSha };
         }
         const identity = await scopedCheckIdentity(config, provider, listing.stdout.split("\0").filter(Boolean), readSource, retained.observation, identityCandidate, read);
-        if (retained.attempt.providerId !== provider.id || retained.attempt.status !== "passed" || retained.attempt.inputDigest !== identity.inputDigest || retained.attempt.profileDigest !== identity.profileDigest) throw new Error("Mismatched scoped execution identity");
+        const differences = [
+          ...(retained.attempt.providerId !== provider.id ? ["providerId"] : []),
+          ...(retained.attempt.status !== "passed" ? ["attempt status"] : []),
+          ...(retained.attempt.inputDigest !== identity.inputDigest ? ["inputDigest"] : []),
+          ...(retained.attempt.profileDigest !== identity.profileDigest ? ["profileDigest"] : []),
+        ];
+        if (differences.length) { mismatch = differences.join(", "); throw new Error("Mismatched scoped execution identity"); }
         checks[provider.id] = { inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, reusable: identity.reusable, attempts: [retained.attempt] };
-      } catch { throw new BlockedError([portableBlocker("portable_scoped_inputs_invalid", "Retained scoped inputs do not match the selected source, profile or policy.")]); }
+      } catch (error) {
+        const cause = error instanceof BlockedError ? ` (${error.blockers.map(blocker => blocker.code).join(", ")})` : "";
+        throw new BlockedError([portableBlocker("portable_scoped_inputs_invalid", `Provider ${provider.id}: ${mismatch} does not match the selected source, profile or policy${cause}.`)]);
+      }
     }
     scopedPlan = { version: "scoped-plan/1", candidate: { treeSha: bindingCandidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: bindingCandidate.workspaceId },
       selectionDigest: digestCanonical(scopedProviders.map(p => ({ id: p.id, check: p.check })).sort((a, b) => a.id.localeCompare(b.id))), checks };

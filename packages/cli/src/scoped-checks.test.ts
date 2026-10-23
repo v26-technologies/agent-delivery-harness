@@ -1062,6 +1062,59 @@ it("record-neutral refresh and record reuse full-Git checks and repairs", async 
   expect(await readFile(repairCounter, "utf8")).toBe("x");
 }, 30000);
 
+it.each(["files", "membership", "both"])("verifies its own staged record when dynamic scopes enumerate %s", async mode => {
+  const f = await fixture(); f.env["FAIL"] = "0";
+  const { readScopedCheckObservations } = await import("./scoped-observations.ts");
+  const sibling = `${path.posix.dirname(f.config.deliveryRecordPath)}/record--${"f".repeat(64)}.json`;
+  await mkdir(path.dirname(path.join(f.dir, sibling)), { recursive: true });
+  await writeFile(path.join(f.dir, sibling), "validated artifact");
+  await f.git("add", ".");
+  const refreshDefinition = async () => {
+    const inventory = (await f.git("ls-files")).split("\n");
+    f.setConfig({ ...f.config,
+      providers: f.config.providers.map(p => ({ ...p, check: { ...p.check!, scope: { ...p.check!.scope!,
+        files: mode === "membership" ? ["source.txt"] : inventory,
+        memberships: mode === "files" ? [] : [`${path.posix.dirname(f.config.deliveryRecordPath)}/`],
+      } } })),
+      scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
+        profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
+      },
+    });
+  };
+  const attempts = async () => (await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => p.attempts.length);
+  await refreshDefinition();
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  expect(await f.run("record"), f.err.join("\n")).toBe(0);
+  await f.git("add", ".");
+  await refreshDefinition();
+  expect(await f.run("verify"), f.err.join("\n")).toBe(0);
+  expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(await attempts()).toEqual([1, 1]);
+  if (mode === "both") {
+    const ownRecord = (await f.git("ls-files", path.posix.dirname(f.config.deliveryRecordPath))).split("\n").find(file => file !== sibling)!;
+    const original = await readFile(path.join(f.dir, ownRecord), "utf8");
+    await writeFile(path.join(f.dir, ownRecord), JSON.stringify({ ...JSON.parse(original), integrityDigest: "0".repeat(64) }));
+    await f.git("add", ".");
+    expect(await f.run("verify")).toBe(1);
+    expect(f.err.join("\n")).toContain("portable_record_integrity");
+    await writeFile(path.join(f.dir, ownRecord), original); await f.git("add", ".");
+    expect(await f.run("verify"), f.err.join("\n")).toBe(0);
+    expect(await attempts()).toEqual([1, 1]);
+  }
+  await writeFile(path.join(f.dir, sibling), "tampered artifact"); await f.git("add", ".");
+  expect(await f.run("verify")).toBe(1);
+  expect(f.err.join("\n")).toContain("Provider check.a: inputDigest");
+  await writeFile(path.join(f.dir, sibling), "validated artifact"); await f.git("add", ".");
+  expect(await f.run("verify"), f.err.join("\n")).toBe(0);
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!,
+    profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "none" })),
+  } });
+  expect(await f.run("verify")).toBe(1);
+  expect(f.err.join("\n")).toContain("Provider check.a: inputDigest, profileDigest");
+}, 30000);
+
 it.each(["source", "base", "wiring", "release"])("record-neutral refresh invalidates %s movement", async kind => {
   const f = await fixture(); f.env["FAIL"] = "0";
   const repairCounter = path.join(f.dir, ".git", "repair-count");
