@@ -1038,7 +1038,7 @@ it("records an unscoped declared check's evidence during gate alongside scoped p
 }, 30000);
 
 it("record-neutral refresh and record reuse full-Git checks and repairs", async () => {
-  const f = await fixture(); f.env.FAIL = "0";
+  const f = await fixture(); f.env["FAIL"] = "0";
   const repairCounter = path.join(f.dir, ".git", "repair-count");
   f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }], scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
     profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
@@ -1063,7 +1063,7 @@ it("record-neutral refresh and record reuse full-Git checks and repairs", async 
 }, 30000);
 
 it.each(["source", "base", "wiring", "release"])("record-neutral refresh invalidates %s movement", async kind => {
-  const f = await fixture(); f.env.FAIL = "0";
+  const f = await fixture(); f.env["FAIL"] = "0";
   const repairCounter = path.join(f.dir, ".git", "repair-count");
   f.setConfig({ ...f.config, recordNeutral: [...f.config.recordNeutral, { prefix: "telemetry/delivery-runs/" }], scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"],
     profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, gitContext: "full" })),
