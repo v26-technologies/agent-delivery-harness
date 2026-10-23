@@ -165,7 +165,7 @@ export async function captureCheckBindings(rootDir: string, config: HarnessConfi
   }
   const validationDigest = await computeDeliverableIdentity({ rootDir, treeSha: candidate.treeSha,
     config: { ...config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: config.recordNeutral } });
-  const policyDigest = digestCanonical(config);
+  const policyDigest = digestCanonical(recordOutputConfiguration(config, candidate.deliverable.digest));
   const wiringFingerprint = await computeCheckWiringFingerprint(rootDir, config, options);
   const bindings: Record<string, CheckBinding> = {};
   for (const provider of providers) {

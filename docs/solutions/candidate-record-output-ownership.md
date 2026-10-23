@@ -32,6 +32,12 @@ and release invalidation and failed-attempt fences remain required controls.
 The combined-inventory case also tampers with the current record's integrity
 digest, requires `portable_record_integrity`, restores the original bytes and
 verifies successfully with no additional check attempts.
+Independent review added a mixed scoped/ordinary-provider case: ordinary check
+policy bindings must project the same exact output too. It also exposed that
+attempt counts alone cannot prove preparation reuse, because a later reuse
+layer can hide a receipt miss. The fixture now requires the preparation reuse
+result both after record staging and after a second own-output-only change,
+covering receipt evaluation and publication independently.
 
 An adopter that embeds a digest of its raw check definitions in another
 provider's command must apply this same exact output contract when constructing

@@ -1062,8 +1062,14 @@ it("record-neutral refresh and record reuse full-Git checks and repairs", async 
   expect(await readFile(repairCounter, "utf8")).toBe("x");
 }, 30000);
 
-it.each(["files", "membership", "both"])("verifies its own staged record when dynamic scopes enumerate %s", async mode => {
+it.each(["files", "membership", "both", "mixed"])("verifies its own staged record when dynamic scopes enumerate %s", async mode => {
   const f = await fixture(); f.env["FAIL"] = "0";
+  if (mode === "mixed") {
+    const plain = { id: "check.plain", findingCodes: [], check: { command: [process.execPath, "-e", ""] as [string, ...string[]], timeoutMs: 5000 } };
+    f.setConfig({ ...f.config, providers: [...f.config.providers, plain],
+      obligations: [...f.config.obligations, { ...f.config.obligations[0]!, id: "check.plain.passed", providers: [plain.id] }],
+    });
+  }
   const { readScopedCheckObservations } = await import("./scoped-observations.ts");
   const sibling = `${path.posix.dirname(f.config.deliveryRecordPath)}/record--${"f".repeat(64)}.json`;
   await mkdir(path.dirname(path.join(f.dir, sibling)), { recursive: true });
@@ -1072,7 +1078,7 @@ it.each(["files", "membership", "both"])("verifies its own staged record when dy
   const refreshDefinition = async () => {
     const inventory = (await f.git("ls-files")).split("\n");
     f.setConfig({ ...f.config,
-      providers: f.config.providers.map(p => ({ ...p, check: { ...p.check!, scope: { ...p.check!.scope!,
+      providers: f.config.providers.map(p => !p.check?.scope ? p : ({ ...p, check: { ...p.check!, scope: { ...p.check!.scope!,
         files: mode === "membership" ? ["source.txt"] : inventory,
         memberships: mode === "files" ? [] : [`${path.posix.dirname(f.config.deliveryRecordPath)}/`],
       } } })),
@@ -1091,12 +1097,15 @@ it.each(["files", "membership", "both"])("verifies its own staged record when dy
   await refreshDefinition();
   expect(await f.run("verify"), f.err.join("\n")).toBe(0);
   expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+  expect(f.out.join("\n")).toContain("reusing preparation checks");
   expect(await attempts()).toEqual([1, 1]);
   if (mode === "both") {
     const ownRecord = (await f.git("ls-files", path.posix.dirname(f.config.deliveryRecordPath))).split("\n").find(file => file !== sibling)!;
     const original = await readFile(path.join(f.dir, ownRecord), "utf8");
     await writeFile(path.join(f.dir, ownRecord), JSON.stringify({ ...JSON.parse(original), integrityDigest: "0".repeat(64) }));
     await f.git("add", ".");
+    expect(await f.run("prepare", "--refresh-record-neutral"), f.err.join("\n")).toBe(0);
+    expect(f.out.join("\n")).toContain("reusing preparation checks");
     expect(await f.run("verify")).toBe(1);
     expect(f.err.join("\n")).toContain("portable_record_integrity");
     await writeFile(path.join(f.dir, ownRecord), original); await f.git("add", ".");
