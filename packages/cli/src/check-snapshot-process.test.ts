@@ -100,7 +100,7 @@ it("shares one deadline across inventories and Git reads, and checks mutable out
     for (const timeoutMs of [0, -1, NaN, Infinity, 300001]) {
       await expect(snapshot.verify({ timeoutMs })).rejects.toMatchObject({ code: "check_snapshot_timeout" });
     }
-    state.rows = []; await snapshot.verify(); expect(state.rows).toHaveLength(6);
+    state.rows = []; await snapshot.verify(); expect(state.rows).toHaveLength(5);
     state.mode = "replay"; state.now = 0; state.next = 0;
     const clock = vi.spyOn(performance, "now").mockImplementation(() => state.now);
     // Every child succeeds within 110ms; together they exceed the 500ms budget.

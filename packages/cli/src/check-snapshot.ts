@@ -156,8 +156,10 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
         if (result.code !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git identity could not be read.");
         return result.stdout.trim();
       };
-      await inventory([], false, deadline);
-      if (await verifyGit("write-tree") !== input.candidate.treeSha || await verifyGit("rev-parse", "HEAD") !== candidateCommit || await verifyGit("rev-parse", `${candidateRef}^{tree}`) !== input.candidate.treeSha || await verifyGit("rev-parse", baseRef) !== input.candidate.base.tipSha || dependencyDigest !== await inventory(options?.outputs ?? input.outputs, false, deadline)) throw new CheckSnapshotError("check_snapshot_drift", "Execution changed the private source, dependencies or pinned Git context.");
+      // One worker checks every non-Git link/type and hashes only immutable bytes.
+      // Finish safety validation before Git reads, under the same owned deadline.
+      const currentDigest = await inventory(options?.outputs ?? input.outputs, false, deadline);
+      if (await verifyGit("write-tree") !== input.candidate.treeSha || await verifyGit("rev-parse", "HEAD") !== candidateCommit || await verifyGit("rev-parse", `${candidateRef}^{tree}`) !== input.candidate.treeSha || await verifyGit("rev-parse", baseRef) !== input.candidate.base.tipSha || dependencyDigest !== currentDigest) throw new CheckSnapshotError("check_snapshot_drift", "Execution changed the private source, dependencies or pinned Git context.");
     };
     return { rootDir, commandRoot: path.join(controlRoot, "commands"), environment, dependencyDigest, verify, cleanup };
   } catch (error) {
