@@ -7,6 +7,12 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createCheckSnapshot } from "./check-snapshot.ts";
 
 const removal = vi.hoisted(() => ({ fail: "" }));
+const inventoryProbe = vi.hoisted(() => ({ preload: "" }));
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: (command: string, args: string[], options: object) =>
+    actual.spawn(command, inventoryProbe.preload && command === process.execPath ? ["--import", inventoryProbe.preload, ...args] : args, options) };
+});
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return { ...actual, rm: async (...args: Parameters<typeof actual.rm>) => {
@@ -16,7 +22,7 @@ vi.mock("node:fs/promises", async importOriginal => {
 });
 const exec = promisify(execFile);
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))); });
+afterEach(async () => { inventoryProbe.preload = ""; await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))); });
 async function fixture() {
   const root = await mkdtemp(path.join(tmpdir(), "scoped-snapshot-test-")); roots.push(root);
   const git = async (...args: string[]) => (await exec("git", args, { cwd: root })).stdout.trim();
@@ -105,6 +111,81 @@ it("rejects source links escaping the private snapshot", async () => {
   const f = await fixture(); await symlink(f.root, path.join(f.root, "escape")); await f.git("add", "escape");
   f.candidate.treeSha = await f.git("write-tree");
   await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} })).rejects.toMatchObject({ code: "check_snapshot_escape" });
+});
+it("verifies safety and immutable bytes in one traversal without reading mutable file bytes", async () => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: ["out/"], environment: {},
+    dependencies: { command: [process.execPath, "-e", "require('fs').mkdirSync('node_modules');require('fs').writeFileSync('node_modules/dep','d'.repeat(128))"], timeoutMs: 5000 } });
+  try {
+    await mkdir(path.join(snapshot.rootDir, "out/nested"), { recursive: true });
+    await writeFile(path.join(snapshot.rootDir, "out/nested/result"), "x".repeat(1024));
+    await symlink("../../source.txt", path.join(snapshot.rootDir, "out/nested/link"));
+    const log = path.join(f.root, "inventory.jsonl"), preload = path.join(f.root, "inventory-probe.mjs");
+    // Instrument the actual worker's filesystem boundary, with no production diagnostics API.
+    await writeFile(preload, `import fs from 'node:fs/promises';import {appendFileSync} from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+const counts={bytes:0,files:[],stats:[],directories:[]};
+for(const [name,field] of [['readFile','files'],['lstat','stats'],['readdir','directories']]){const original=fs[name];fs[name]=async(...args)=>{const result=await original(...args);counts[field].push(args[0]);if(name==='readFile')counts.bytes+=result.length;return result;};}
+syncBuiltinESMExports();process.on('exit',()=>appendFileSync(${JSON.stringify(log)},JSON.stringify(counts)+'\\n'));`);
+    inventoryProbe.preload = preload;
+    await snapshot.verify();
+    const scans = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { bytes: number; files: string[]; stats: string[]; directories: string[] });
+    const bytes = scans.reduce((sum, scan) => sum + scan.bytes, 0);
+    const immutableBytes = Buffer.byteLength("preparedstaged new source") + 128;
+    expect({ scans: scans.length, bytes }).toEqual({ scans: 1, bytes: immutableBytes });
+    expect(scans[0]!.files.map(file => path.relative(snapshot.rootDir, file)).sort()).toEqual(["new.txt", "node_modules/dep", "source.txt"]);
+    expect(scans[0]!.directories.filter(dir => dir === snapshot.rootDir)).toHaveLength(1);
+    expect(scans[0]!.stats).toContain(path.join(snapshot.rootDir, "out/nested/link"));
+  } finally { inventoryProbe.preload = ""; await snapshot.cleanup(); }
+});
+it.each([
+  ["directory output itself", "out", "absolute"],
+  ["nested output", "out/nested/escape", "absolute"],
+  ["nested relative escape", "out/nested/escape", "relative"],
+  ["resolved escape via excluded Git metadata", "out/link", "resolved"],
+  ["exact output", "result", "absolute"],
+  ["nested Git-named output", "out/.git/escape", "absolute"],
+])("still checks unsafe links in %s", async (_name, relative, targetKind) => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: ["out/", "result"], environment: {} });
+  try {
+    const link = path.join(snapshot.rootDir, relative!);
+    await mkdir(path.dirname(link), { recursive: true });
+    const gitLink = path.join(snapshot.rootDir, ".git/outside");
+    if (targetKind === "resolved") await symlink(f.root, gitLink);
+    const target = targetKind === "resolved" ? path.relative(path.dirname(link), gitLink)
+      : targetKind === "relative" ? path.relative(path.dirname(link), f.root) : f.root;
+    await symlink(target, link);
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
+  } finally { await snapshot.cleanup(); }
+});
+it("checks narrowed output ownership and accepts safe dangling output links", async () => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: ["own/", "sibling/"], environment: {} });
+  try {
+    await mkdir(path.join(snapshot.rootDir, "own"));
+    await symlink("missing", path.join(snapshot.rootDir, "own/link"));
+    await expect(snapshot.verify({ outputs: ["own/"] })).resolves.toBeUndefined();
+    await mkdir(path.join(snapshot.rootDir, "sibling"));
+    await writeFile(path.join(snapshot.rootDir, "sibling/result"), "not this profile's output");
+    await expect(snapshot.verify({ outputs: ["own/"] })).rejects.toMatchObject({ code: "check_snapshot_drift" });
+  } finally { await snapshot.cleanup(); }
+});
+it("excludes exact directory outputs recursively while checking descendant safety", async () => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: ["result"], environment: {} });
+  try {
+    await mkdir(path.join(snapshot.rootDir, "result/nested"), { recursive: true });
+    await writeFile(path.join(snapshot.rootDir, "result/nested/file"), "mutable bytes");
+    await symlink("../../source.txt", path.join(snapshot.rootDir, "result/nested/link"));
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+    await writeFile(path.join(snapshot.rootDir, "result/nested/file"), "changed mutable bytes");
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+    await symlink(f.root, path.join(snapshot.rootDir, "result/nested/escape"));
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
+    await rm(path.join(snapshot.rootDir, "result/nested/escape"));
+    await exec("mkfifo", [path.join(snapshot.rootDir, "result/nested/pipe")]);
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
+  } finally { await snapshot.cleanup(); }
 });
 it("installs private dependencies, excludes inherited flags, and detects dependency mutation", async () => {
   const f = await fixture();

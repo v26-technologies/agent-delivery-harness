@@ -11,20 +11,22 @@ const inside = target => {
   return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
 };
 const escape = () => { throw { code: 'check_snapshot_escape' }; };
-const walk = async relative => {
-  if (relative === '.git' || (excludeDependencies && relative.split('/').includes('node_modules')) ||
-      outputs.some(o => o.endsWith('/') ? relative === o.slice(0, -1) || relative.startsWith(o) : relative === o)) return;
+const walk = async (relative, mutable = false) => {
+  if (relative === '.git' || (excludeDependencies && relative.split('/').includes('node_modules'))) return;
+  // Mutable paths are excluded from the digest, never from the link/type walk.
+  // Carry the exclusion through directories, including an exact output path.
+  mutable ||= outputs.some(o => o.endsWith('/') ? relative === o.slice(0, -1) || relative.startsWith(o) : relative === o);
   const absolute = path.join(root, relative), stat = await lstat(absolute);
   if (stat.isSymbolicLink()) {
     const target = await readlink(absolute);
     if (path.isAbsolute(target) || !inside(path.resolve(path.dirname(absolute), target))) escape();
     try { if (!inside(await realpath(absolute))) escape(); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    entries.push([relative, 'link', target]);
+    if (!mutable) entries.push([relative, 'link', target]);
   } else if (stat.isDirectory()) {
-    for (const name of (await readdir(absolute)).sort()) await walk(relative ? relative + '/' + name : name);
+    for (const name of (await readdir(absolute)).sort()) await walk(relative ? relative + '/' + name : name, mutable);
   } else if (stat.isFile()) {
-    entries.push([relative, stat.mode & 0o111, createHash('sha256').update(await readFile(absolute)).digest('hex')]);
+    if (!mutable) entries.push([relative, stat.mode & 0o111, createHash('sha256').update(await readFile(absolute)).digest('hex')]);
   } else escape();
 };
 try {
