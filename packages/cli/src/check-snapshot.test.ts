@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,11 +8,11 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createCheckSnapshot } from "./check-snapshot.ts";
 
 const removal = vi.hoisted(() => ({ fail: "" }));
-const inventoryProbe = vi.hoisted(() => ({ preload: "" }));
+const inventoryProbe = vi.hoisted(() => ({ preload: "", commands: [] as Array<{ command: string; args: string[] }> }));
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: (command: string, args: string[], options: object) =>
-    actual.spawn(command, inventoryProbe.preload && command === process.execPath ? ["--import", inventoryProbe.preload, ...args] : args, options) };
+    (inventoryProbe.commands.push({ command, args }), actual.spawn(command, inventoryProbe.preload && command === process.execPath && args.includes("--eval") ? ["--import", inventoryProbe.preload, ...args] : args, options)) };
 });
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -271,4 +272,75 @@ it.each([
     onDependencyResult: result => observed.push(result.errorCode ?? "missing"),
   })).rejects.toMatchObject({ code: "check_dependency_failed" });
   expect(observed).toEqual([errorCode]);
+});
+
+it.each([false, true])("consolidates setup scans and verification Git calls (dependencies=%s)", async dependencies => {
+  const f = await fixture(); inventoryProbe.commands = [];
+  const log = path.join(f.root, "setup-inventory.jsonl"), preload = path.join(f.root, "setup-probe.mjs");
+  await writeFile(preload, `import fs from 'node:fs/promises';import {appendFileSync} from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+let bytes=0;const read=fs.readFile;fs.readFile=async(...args)=>{const result=await read(...args);bytes+=result.length;return result;};syncBuiltinESMExports();process.on('exit',()=>appendFileSync(${JSON.stringify(log)},JSON.stringify({bytes})+'\\n'));`);
+  inventoryProbe.preload = preload;
+  const phases: Array<{ phase: string; durationMs: number }> = [];
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    onPhase: (phase, durationMs) => { phases.push({ phase, durationMs }); throw new Error("ignored observation failure"); },
+    ...(dependencies ? { dependencies: { command: [process.execPath, "-e", "require('fs').mkdirSync('node_modules');require('fs').writeFileSync('node_modules/dep','private')"] as [string, ...string[]], timeoutMs: 5000 } } : {}) });
+  try {
+    const workers = () => inventoryProbe.commands.filter(row => row.args.includes("--eval"));
+    expect(workers()).toHaveLength(dependencies ? 2 : 1);
+    const sourceBytes = Buffer.byteLength("preparedstaged new source");
+    const scans = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { bytes: number });
+    expect(scans.map(scan => scan.bytes)).toEqual(dependencies ? [sourceBytes, sourceBytes + 7] : [sourceBytes]);
+    const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+    const tuples = [["new.txt", 0, hash("staged new source")], ...(dependencies ? [["node_modules/dep", 0, hash("private")]] : []), ["source.txt", 0, hash("prepared")]];
+    expect(snapshot.dependencyDigest).toBe(hash(JSON.stringify(tuples)));
+    expect(phases.map(row => row.phase)).toEqual(["materialization", "baseline-inventory", ...(dependencies ? ["dependencies", "post-dependency-inventory"] : [])]);
+    inventoryProbe.commands = [];
+    await snapshot.verify();
+    expect(workers()).toHaveLength(1);
+    expect(inventoryProbe.commands.filter(row => row.command === "git")).toHaveLength(2);
+    expect(phases.at(-1)?.phase).toBe("verification");
+    expect(phases.every(row => Number.isFinite(row.durationMs) && row.durationMs >= 0)).toBe(true);
+    console.info(JSON.stringify({ snapshotMeasurement: { dependencies, setupWalks: scans.length, setupBytes: scans.reduce((sum, scan) => sum + scan.bytes, 0), verificationWalks: workers().length, verificationGitCalls: inventoryProbe.commands.filter(row => row.command === "git").length, phases } }));
+  } finally { await snapshot.cleanup(); }
+});
+
+it("rejects tracked dependency paths before setup and unsafe setup output links", async () => {
+  const f = await fixture();
+  await mkdir(path.join(f.root, "node_modules")); await writeFile(path.join(f.root, "node_modules/tracked"), "source");
+  await f.git("add", "-f", "node_modules/tracked"); f.candidate.treeSha = await f.git("write-tree");
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} })).rejects.toMatchObject({ code: "check_dependency_source_overlap" });
+  await f.git("rm", "--cached", "node_modules/tracked"); f.candidate.treeSha = await f.git("write-tree");
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: ["out/"], environment: {},
+    dependencies: { command: [process.execPath, "-e", "const fs=require('fs');fs.mkdirSync('out');fs.symlinkSync('/tmp','out/link')"], timeoutMs: 5000 },
+  })).rejects.toMatchObject({ code: "check_snapshot_escape" });
+});
+
+it("rejects source executable-mode changes made by dependency setup", async () => {
+  const f = await fixture();
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    dependencies: { command: [process.execPath, "-e", "require('fs').chmodSync('source.txt',0o755)"], timeoutMs: 5000 },
+  })).rejects.toMatchObject({ code: "check_snapshot_drift" });
+});
+
+it("excludes nested dependency segments but preserves similarly named source paths", async () => {
+  const f = await fixture();
+  await mkdir(path.join(f.root, "node_modules-extra"));
+  await writeFile(path.join(f.root, "node_modules-extra/source"), "source boundary");
+  await f.git("add", "."); f.candidate.treeSha = await f.git("write-tree");
+  const install = "const fs=require('fs');fs.mkdirSync('nested/node_modules',{recursive:true});fs.writeFileSync('nested/node_modules/dep','dependency')";
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    dependencies: { command: [process.execPath, "-e", install], timeoutMs: 5000 } });
+  try {
+    const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+    expect(snapshot.dependencyDigest).toBe(hash(JSON.stringify([
+      ["nested/node_modules/dep", 0, hash("dependency")], ["new.txt", 0, hash("staged new source")],
+      ["node_modules-extra/source", 0, hash("source boundary")], ["source.txt", 0, hash("prepared")],
+    ])));
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+    await writeFile(path.join(snapshot.rootDir, "nested/node_modules/dep"), "dependency drift");
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_drift" });
+  } finally { await snapshot.cleanup(); }
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    dependencies: { command: [process.execPath, "-e", install + ";fs.writeFileSync('node_modules-extra/source','changed')"], timeoutMs: 5000 },
+  })).rejects.toMatchObject({ code: "check_snapshot_drift" });
 });
