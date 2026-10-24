@@ -12,6 +12,7 @@ export class CheckSnapshotError extends Error {
   readonly code: string;
   constructor(code: string, message: string) { super(message); this.code = code; }
 }
+export type SnapshotPhase = "materialization" | "baseline-inventory" | "dependencies" | "post-dependency-inventory" | "verification";
 export interface SnapshotRequest {
   readonly rootDir: string;
   readonly candidate: { readonly treeSha: string; readonly headSha: string; readonly base: { readonly ref: string; readonly tipSha: string; readonly mergeBaseSha: string } };
@@ -20,6 +21,8 @@ export interface SnapshotRequest {
   readonly environment: Readonly<Record<string, string>>;
   readonly dependencies?: { readonly command: readonly [string, ...string[]]; readonly timeoutMs: number };
   readonly onDependencyResult?: (result: ExecOutcome, durationMs: number) => void;
+  /** Best-effort phase timing only; never admission evidence. */
+  readonly onPhase?: (phase: SnapshotPhase, durationMs: number) => void;
   readonly signal?: AbortSignal;
 }
 export interface CheckSnapshot {
@@ -69,17 +72,28 @@ async function snapshotProcess(command: string, args: string[], cwd: string, env
 }
 /** The inventory's blocking filesystem operations live only in a killable process. */
 export async function snapshotInventory(root: string, outputs: readonly string[], excludeDependencies = false, deadline = performance.now() + SNAPSHOT_TIMEOUT_MS, signal?: AbortSignal, forbidGit = false): Promise<string> {
+  return (await snapshotDigests(root, outputs, excludeDependencies, deadline, signal, forbidGit)).digest;
+}
+async function snapshotDigests(root: string, outputs: readonly string[], excludeDependencies: boolean, deadline: number, signal?: AbortSignal, forbidGit = false, includeSource = false): Promise<{ digest: string; sourceDigest?: string }> {
   const result = await snapshotProcess(process.execPath, ["--input-type=module", "--eval", snapshotInventoryWorker], root,
-    { PATH: process.env["PATH"] ?? "/usr/bin:/bin", DELIVERY_SNAPSHOT_REQUEST: JSON.stringify({ root, outputs, excludeDependencies, forbidGit }) }, deadline, signal);
-  let parsed: { code?: string; digest?: string };
+    { PATH: process.env["PATH"] ?? "/usr/bin:/bin", DELIVERY_SNAPSHOT_REQUEST: JSON.stringify({ root, outputs, excludeDependencies, forbidGit, includeSource }) }, deadline, signal);
+  let parsed: { code?: string; digest?: string; sourceDigest?: string };
   try { parsed = JSON.parse(result.stdout); } catch { throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot inventory returned no valid result."); }
-  if (result.code !== 0 || !/^[a-f0-9]{64}$/.test(parsed.digest ?? "")) throw new CheckSnapshotError(["check_snapshot_escape", "check_snapshot_drift"].includes(parsed.code ?? "") ? parsed.code! : "check_snapshot_unavailable", "Snapshot inventory could not verify private bytes and links.");
-  return parsed.digest!;
+  if (result.code !== 0 || !/^[a-f0-9]{64}$/.test(parsed.digest ?? "") || (includeSource && !/^[a-f0-9]{64}$/.test(parsed.sourceDigest ?? ""))) throw new CheckSnapshotError(["check_snapshot_escape", "check_snapshot_drift"].includes(parsed.code ?? "") ? parsed.code! : "check_snapshot_unavailable", "Snapshot inventory could not verify private bytes and links.");
+  return { digest: parsed.digest!, ...(includeSource ? { sourceDigest: parsed.sourceDigest! } : {}) };
 }
 export function executionPath(root: string, value: string): string {
   return value.split(path.delimiter).filter(p => p && path.isAbsolute(p) && !inside(root, p) && !p.split(path.sep).includes("node_modules")).join(path.delimiter) || "/usr/bin:/bin";
 }
 export async function createCheckSnapshot(input: SnapshotRequest): Promise<CheckSnapshot> {
+  const report = (phase: SnapshotPhase, started: number) => {
+    try { input.onPhase?.(phase, performance.now() - started); } catch { /* Timing cannot change admission. */ }
+  };
+  const measured = async <T>(phase: SnapshotPhase, operation: () => Promise<T>): Promise<T> => {
+    const started = performance.now();
+    try { return await operation(); } finally { report(phase, started); }
+  };
+  const materializationStarted = performance.now();
   const rootDir = await realpath(await mkdtemp(path.join(tmpdir(), "delivery-check-")));
   const cleanEnv = { ...input.environment, PATH: executionPath(input.rootDir, input.environment["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z" };
   let privateControl: string | undefined;
@@ -131,35 +145,44 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
     }
     const controlRoot = privateControl ?? path.join(rootDir, ".git");
     const inventory = (outputs: readonly string[], sourceOnly = false, deadline = performance.now() + SNAPSHOT_TIMEOUT_MS) => snapshotInventory(rootDir, outputs, sourceOnly, deadline, input.signal, input.gitContext === "none");
-    const sourceDigest = await inventory(input.outputs, true);
+    report("materialization", materializationStarted);
+    // Setup needs a source baseline only when a dependency command can mutate it.
+    const baseline = await measured("baseline-inventory", () => inventory(input.outputs, Boolean(input.dependencies)));
+    let dependencyDigest = baseline;
     const environment: Record<string, string> = { ...input.environment, PATH: `${path.join(rootDir, "node_modules/.bin")}${path.delimiter}${cleanEnv["PATH"]}`, HOME: path.join(controlRoot, "home"), TMPDIR: path.join(controlRoot, "tmp"), GIT_CEILING_DIRECTORIES: path.dirname(rootDir),
       ...(input.gitContext === "none" ? {} : {
       DELIVERY_CHECK_BASE_REF: baseRef, DELIVERY_CHECK_CANDIDATE_REF: candidateRef, DELIVERY_CHECK_ORIGIN_HEAD: input.candidate.headSha, DELIVERY_CHECK_ORIGIN_TREE: input.candidate.treeSha, DELIVERY_CHECK_MERGE_BASE: input.candidate.base.mergeBaseSha }) };
     await mkdir(environment["HOME"]!, { recursive: true }); await mkdir(environment["TMPDIR"]!, { recursive: true });
     if (input.dependencies) {
       const started = performance.now();
-      const result = await createExecPort().run({ command: input.dependencies.command[0], args: input.dependencies.command.slice(1), cwd: rootDir, env: environment, timeoutMs: input.dependencies.timeoutMs, maxBuffer: 1024 * 1024, ...(input.signal ? { signal: input.signal } : {}) });
+      const result = await measured("dependencies", () => createExecPort().run({ command: input.dependencies!.command[0], args: input.dependencies!.command.slice(1), cwd: rootDir, env: environment, timeoutMs: input.dependencies!.timeoutMs, maxBuffer: 1024 * 1024, ...(input.signal ? { signal: input.signal } : {}) }));
       input.onDependencyResult?.(result, Math.round(performance.now() - started));
       if (result.code !== 0 || input.signal?.aborted) throw new CheckSnapshotError("check_dependency_failed", "Private dependency installation did not complete successfully.");
+      // Both digests use the same tuples from one safety walk, hashing each
+      // immutable file once. Source comparison still excludes node_modules.
+      const installed = await measured("post-dependency-inventory", () => snapshotDigests(rootDir, input.outputs, false, performance.now() + SNAPSHOT_TIMEOUT_MS, input.signal, input.gitContext === "none", true));
+      if (baseline !== installed.sourceDigest) throw new CheckSnapshotError("check_snapshot_drift", "Dependency setup changed prepared source bytes.");
+      dependencyDigest = installed.digest;
     }
-    if (sourceDigest !== await inventory(input.outputs, true)) throw new CheckSnapshotError("check_snapshot_drift", "Dependency setup changed prepared source bytes.");
-    const dependencyDigest = await inventory(input.outputs);
-    // The second digest covers both source and installed dependency bytes and
-    // all links. It intentionally excludes only declared mutable output paths.
+    // The full baseline always covers source, dependencies and immutable links.
     const verify = async (options?: { readonly timeoutMs?: number; readonly outputs?: readonly string[] }) => {
-      const timeoutMs = options?.timeoutMs ?? SNAPSHOT_TIMEOUT_MS;
-      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > SNAPSHOT_TIMEOUT_MS) throw new CheckSnapshotError("check_snapshot_timeout", "Snapshot deadline must be positive and cannot exceed five minutes.");
-      const deadline = performance.now() + timeoutMs;
-      // The worker also checks file-only Git metadata, so lstat cannot stall the parent.
-      const verifyGit = async (...args: string[]) => {
-        const result = await snapshotProcess("git", gitDirectory ? [`--git-dir=${gitDirectory}`, `--work-tree=${rootDir}`, ...args] : args, rootDir, cleanEnv, deadline, input.signal);
-        if (result.code !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git identity could not be read.");
-        return result.stdout.trim();
-      };
-      // One worker checks every non-Git link/type and hashes only immutable bytes.
-      // Finish safety validation before Git reads, under the same owned deadline.
-      const currentDigest = await inventory(options?.outputs ?? input.outputs, false, deadline);
-      if (await verifyGit("write-tree") !== input.candidate.treeSha || await verifyGit("rev-parse", "HEAD") !== candidateCommit || await verifyGit("rev-parse", `${candidateRef}^{tree}`) !== input.candidate.treeSha || await verifyGit("rev-parse", baseRef) !== input.candidate.base.tipSha || dependencyDigest !== currentDigest) throw new CheckSnapshotError("check_snapshot_drift", "Execution changed the private source, dependencies or pinned Git context.");
+      return measured("verification", async () => {
+        const timeoutMs = options?.timeoutMs ?? SNAPSHOT_TIMEOUT_MS;
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > SNAPSHOT_TIMEOUT_MS) throw new CheckSnapshotError("check_snapshot_timeout", "Snapshot deadline must be positive and cannot exceed five minutes.");
+        const deadline = performance.now() + timeoutMs;
+        // The worker also checks file-only Git metadata, so lstat cannot stall the parent.
+        const verifyGit = async (...args: string[]) => {
+          const result = await snapshotProcess("git", gitDirectory ? [`--git-dir=${gitDirectory}`, `--work-tree=${rootDir}`, ...args] : args, rootDir, cleanEnv, deadline, input.signal);
+          if (result.code !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git identity could not be read.");
+          return result.stdout.trim();
+        };
+        // One worker checks every non-Git link/type and hashes only immutable bytes.
+        // Finish safety validation before Git reads, under the same owned deadline.
+        const currentDigest = await inventory(options?.outputs ?? input.outputs, false, deadline);
+        const tree = await verifyGit("write-tree");
+        const identities = (await verifyGit("rev-parse", "HEAD", `${candidateRef}^{tree}`, baseRef)).split("\n");
+        if (tree !== input.candidate.treeSha || identities.length !== 3 || identities[0] !== candidateCommit || identities[1] !== input.candidate.treeSha || identities[2] !== input.candidate.base.tipSha || dependencyDigest !== currentDigest) throw new CheckSnapshotError("check_snapshot_drift", "Execution changed the private source, dependencies or pinned Git context.");
+      });
     };
     return { rootDir, commandRoot: path.join(controlRoot, "commands"), environment, dependencyDigest, verify, cleanup };
   } catch (error) {

@@ -100,12 +100,19 @@ it("shares one deadline across inventories and Git reads, and checks mutable out
     for (const timeoutMs of [0, -1, NaN, Infinity, 300001]) {
       await expect(snapshot.verify({ timeoutMs })).rejects.toMatchObject({ code: "check_snapshot_timeout" });
     }
-    state.rows = []; await snapshot.verify(); expect(state.rows).toHaveLength(5);
+    state.rows = []; await snapshot.verify(); expect(state.rows).toHaveLength(3);
+    const identities = state.rows[2]!;
+    state.mode = "replay";
+    for (const malformed of [identities.trim().split("\n").slice(0, 2).join("\n"), identities + "extra\n"]) {
+      state.rows[2] = malformed; state.next = 0;
+      await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_drift" });
+    }
+    state.rows[2] = identities;
     state.mode = "replay"; state.now = 0; state.next = 0;
     const clock = vi.spyOn(performance, "now").mockImplementation(() => state.now);
-    // Every child succeeds within 110ms; together they exceed the 500ms budget.
-    await expect(snapshot.verify({ timeoutMs: 500 })).rejects.toMatchObject({ code: "check_snapshot_timeout" });
-    expect(state.next).toBe(5); clock.mockRestore(); state.mode = "record";
+    // Every child succeeds within 110ms; together they exceed the 300ms budget.
+    await expect(snapshot.verify({ timeoutMs: 300 })).rejects.toMatchObject({ code: "check_snapshot_timeout" });
+    expect(state.next).toBe(3); clock.mockRestore(); state.mode = "record";
     await mkdir(path.join(snapshot.rootDir, "out"));
     await symlink(root, path.join(snapshot.rootDir, "out", "escape"));
     await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_escape" });
