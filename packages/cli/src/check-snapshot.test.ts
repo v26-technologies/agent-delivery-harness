@@ -314,3 +314,33 @@ it("rejects tracked dependency paths before setup and unsafe setup output links"
     dependencies: { command: [process.execPath, "-e", "const fs=require('fs');fs.mkdirSync('out');fs.symlinkSync('/tmp','out/link')"], timeoutMs: 5000 },
   })).rejects.toMatchObject({ code: "check_snapshot_escape" });
 });
+
+it("rejects source executable-mode changes made by dependency setup", async () => {
+  const f = await fixture();
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    dependencies: { command: [process.execPath, "-e", "require('fs').chmodSync('source.txt',0o755)"], timeoutMs: 5000 },
+  })).rejects.toMatchObject({ code: "check_snapshot_drift" });
+});
+
+it("excludes nested dependency segments but preserves similarly named source paths", async () => {
+  const f = await fixture();
+  await mkdir(path.join(f.root, "node_modules-extra"));
+  await writeFile(path.join(f.root, "node_modules-extra/source"), "source boundary");
+  await f.git("add", "."); f.candidate.treeSha = await f.git("write-tree");
+  const install = "const fs=require('fs');fs.mkdirSync('nested/node_modules',{recursive:true});fs.writeFileSync('nested/node_modules/dep','dependency')";
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    dependencies: { command: [process.execPath, "-e", install], timeoutMs: 5000 } });
+  try {
+    const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+    expect(snapshot.dependencyDigest).toBe(hash(JSON.stringify([
+      ["nested/node_modules/dep", 0, hash("dependency")], ["new.txt", 0, hash("staged new source")],
+      ["node_modules-extra/source", 0, hash("source boundary")], ["source.txt", 0, hash("prepared")],
+    ])));
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+    await writeFile(path.join(snapshot.rootDir, "nested/node_modules/dep"), "dependency drift");
+    await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_drift" });
+  } finally { await snapshot.cleanup(); }
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {},
+    dependencies: { command: [process.execPath, "-e", install + ";fs.writeFileSync('node_modules-extra/source','changed')"], timeoutMs: 5000 },
+  })).rejects.toMatchObject({ code: "check_snapshot_drift" });
+});
