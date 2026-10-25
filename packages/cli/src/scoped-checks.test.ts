@@ -26,6 +26,19 @@ async function fixture() {
   const run = async (...args: string[]) => { out.length = 0; err.length = 0; return runCli(args, runtime); };
   return { dir, git, run, out, err, env, get config() { return config; }, runtime, setConfig: (v: HarnessConfigInput) => { config = defineHarnessConfig(v); } };
 }
+it("forwards existing snapshot phase timings with the check and attempt", async () => {
+  const f = await fixture();
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"], profiles: f.config.scopedExecution!.profiles.map(profile => ({ ...profile,
+    dependencies: { command: [process.execPath, "-e", "require('fs').mkdirSync('node_modules');require('fs').writeFileSync('node_modules/fixture','dependency')"], timeoutMs: 5000 },
+  })) } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const timings = f.out.flatMap(line => line.split("\n")).filter(line => line.startsWith("snapshot check.a:"));
+  const parsed = timings.map(line => /^snapshot check\.a: attempt ([^;]+); ([a-z-]+) (\d+)ms$/.exec(line));
+  expect(parsed.length).toBeGreaterThan(0);
+  expect(parsed.every(match => match !== null)).toBe(true);
+  expect(new Set(parsed.map(match => match![1])).size).toBe(1);
+  expect([...new Set(parsed.map(match => match![2]))].sort()).toEqual(["baseline-inventory", "dependencies", "materialization", "post-dependency-inventory", "verification"]);
+});
 it.each(["none", "full"] as const)("prepares and verifies portable evidence from a shallow source with %s Git context", async gitContext => {
   const f = await fixture(); f.env["FAIL"] = "0";
   await writeFile(path.join(f.dir, "source.txt"), "boundary"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "boundary");

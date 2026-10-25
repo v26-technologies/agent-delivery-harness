@@ -46,7 +46,8 @@ export async function captureScopedCheckInputs(definition: ScopedCheckDefinition
   }
   if (ports.command.length === 0 || ports.command.some(arg => typeof arg !== "string" || arg.includes("\0")) || !Number.isSafeInteger(ports.timeoutMs) || ports.timeoutMs < 1) throw new Error("Invalid scoped execution command");
   const inventory = [...await ports.listFiles()].sort();
-  if (new Set(inventory).size !== inventory.length || inventory.some(p => !p || p.startsWith("/") || p.includes("\\") || p.includes("\0") || p.split("/").some(s => s === ".." || s === "." || s === ""))) throw new Error("Invalid snapshot inventory");
+  const inventoryPaths = new Set(inventory);
+  if (inventoryPaths.size !== inventory.length || inventory.some(p => !p || p.startsWith("/") || p.includes("\\") || p.includes("\0") || p.split("/").some(s => s === ".." || s === "." || s === ""))) throw new Error("Invalid snapshot inventory");
   const memberships = [...definition.memberships].sort().map(prefix => ({ prefix, paths: inventory.filter(p => p.startsWith(prefix)) }));
   const selected = [...new Set([...definition.files, ...definition.tests, ...memberships.flatMap(m => m.paths)])].sort();
   const files: ScopedInputCapture["files"][number][] = new Array(selected.length);
@@ -63,7 +64,7 @@ export async function captureScopedCheckInputs(definition: ScopedCheckDefinition
       try {
         const bytes = await ports.readFile(file);
         if (definition.tests.includes(file) && bytes === null) throw new Error("Required test is absent");
-        if ((bytes !== null) !== inventory.includes(file)) throw new Error("Snapshot membership and bytes disagree");
+        if ((bytes !== null) !== inventoryPaths.has(file)) throw new Error("Snapshot membership and bytes disagree");
         files[index] = { path: file, sha256: bytes === null ? null : sha256Hex(bytes), ...(ports.readMetadata ? { metadata: await ports.readMetadata(file) } : {}) };
       } catch (error) {
         // Stop scheduling, but drain every started read. Earlier sorted inputs
