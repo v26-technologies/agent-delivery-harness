@@ -982,6 +982,20 @@ it("prepare finishes the first declared mechanical check before overlapping the 
   expect(await f.installs("1")).toBeLessThanOrEqual(3);
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
 }, 90000);
+it("simultaneous workers phase attribution", async () => {
+ const f = await poolFixture(["1", "1"], 2, (_id, shared) => barrier(shared, 2));
+ expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+ expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+ const {readScopedCheckObservations} = await import("./index.ts");
+ const recorded = await readScopedCheckObservations({rootDir:f.dir,config:f.config});
+ const lines=f.out.flatMap(line=>line.split("\n"));
+ for (const provider of recorded.providers) {
+   const own=lines.filter(line=>line.startsWith(`snapshot ${provider.providerId}:`)&&line.includes("; verification "));
+   expect(own,lines.join("\n")).toHaveLength(2);
+   for(const line of own) expect(line).toContain(`attempt ${provider.attempts[0]!.attemptId};`);
+ }
+},30000);
+
 it("concurrency 1 keeps serial output and one live snapshot exactly as when unset", async () => {
   const runs: { out: string[]; setups: number }[] = [];
   for (const concurrency of [undefined, 1]) {
@@ -1008,9 +1022,19 @@ it("failures, diagnostics, retained attempts, reuse and evidence under concurren
     expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
     await writeFile(path.join(f.shared, "fail"), "");
     expect(await f.run("gate")).toBe(1);
-    // Each check's lines arrive together: nothing else is printed between a check starting and its result.
-    const out = f.out.map(line => normalized(f, line));
-    for (const [index, line] of out.entries()) if (line.startsWith("checking ")) expect(out[index + 1], out.join("\n")).toMatch(new RegExp(`^(passed|failed) ${line.split(" ")[1]!.replace(":", "")}:`));
+    // A check's phase observations stay in its group until its result, with no other check interleaved.
+    const lines = f.out.flatMap(line => line.trimEnd().split("\n"));
+    for (const [index, line] of lines.entries()) if (line.startsWith("checking ")) {
+      const provider = line.split(" ")[1]!.replace(":", "");
+      let next = index + 1;
+      while (lines[next]?.startsWith("snapshot ")) {
+        expect(lines[next], lines.join("\n")).toMatch(new RegExp(`^snapshot ${provider}: attempt [^;]+; verification \\d+ms$`));
+        next++;
+      }
+      expect(lines[next], lines.join("\n")).toMatch(new RegExp(`^(passed|failed) ${provider}:`));
+    }
+    // Setup counts differ with worker reuse; phase values are checked by the dedicated forwarding rows.
+    const out = f.out.filter(line => !line.startsWith("snapshot ")).map(line => normalized(f, line));
     const failedGate = { out: [...out].sort(), err: f.err.map(line => normalized(f, line)) };
     const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
     const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.map(a => a.attemptId)) });
@@ -1019,7 +1043,7 @@ it("failures, diagnostics, retained attempts, reuse and evidence under concurren
         command: "unavailable" in a.diagnostic.command ? a.diagnostic.command : { exitCode: a.diagnostic.command.exitCode, outputTail: a.diagnostic.command.outputTail } } : a.diagnostic })) }));
     await rm(path.join(f.shared, "fail"));
     expect(await f.run("gate"), f.err.join("\n")).toBe(0);
-    const passedGate = f.out.map(line => normalized(f, line)).sort();
+    const passedGate = f.out.filter(line => !line.startsWith("snapshot ")).map(line => normalized(f, line)).sort();
     expect(await f.run("record"), f.err.join("\n")).toBe(0);
     await f.git("add", ".");
     expect(await f.run("verify"), f.err.join("\n")).toBe(0);
