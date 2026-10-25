@@ -44,6 +44,7 @@ export class ScopedChecks {
   /** `scopedExecution.concurrency` workers, each owning its snapshots; the first is the serial lane. */
   private readonly workers: Map<string, CheckSnapshot>[];
   readonly concurrency: number;
+  private readonly phaseWriters = new WeakMap<Map<string, CheckSnapshot>, (phase: string, durationMs: number) => void>();
   /** Attempt allocation is two writes, so readers of attempt history wait for it to finish. */
   private readonly locked = oneAtATime();
   /** Evidence submission captures the candidate through the author's Git index, which one writer may hold. */
@@ -222,6 +223,7 @@ export class ScopedChecks {
   async execute(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission = false, lane: Lane = this.serial): Promise<void> {
     const started = Date.now(), check = provider.check!, profile = this.context.config.scopedExecution!.profiles.find(p => p.id === check.scope!.profile)!;
     const attempt = this.owned.get(provider.id) ?? await this.allocate(provider.id);
+    this.phaseWriters.set(lane.snapshots, (phase, durationMs) => lane.write(`snapshot ${provider.id}: attempt ${attempt.attemptId}; ${phase} ${Math.round(durationMs)}ms`));
     let payload: AttemptPayload = { outputs: [] }, terminal = false;
     let diagnostic: RecordedScopedAttemptDiagnostic = { availability: "available", phase: "snapshot-setup", failure: { unavailable: "not-failed" }, command: { unavailable: "not-started" } };
     let executionErrorCode: string | undefined;
@@ -242,7 +244,7 @@ export class ScopedChecks {
           lane.snapshots.delete(previousKey);
         }
         snapshot = await createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
-          onPhase: (phase, durationMs) => lane.write(`snapshot ${provider.id}: attempt ${attempt.attemptId}; ${phase} ${Math.round(durationMs)}ms`),
+          onPhase: (phase, durationMs) => this.phaseWriters.get(lane.snapshots)?.(phase, durationMs),
           onDependencyResult: (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; },
         });
         lane.snapshots.set(key, snapshot);

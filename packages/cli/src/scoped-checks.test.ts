@@ -26,18 +26,33 @@ async function fixture() {
   const run = async (...args: string[]) => { out.length = 0; err.length = 0; return runCli(args, runtime); };
   return { dir, git, run, out, err, env, get config() { return config; }, runtime, setConfig: (v: HarnessConfigInput) => { config = defineHarnessConfig(v); } };
 }
-it("forwards existing snapshot phase timings with the check and attempt", async () => {
-  const f = await fixture();
-  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"], profiles: f.config.scopedExecution!.profiles.map(profile => ({ ...profile,
+it.each([1, 2])("forwards existing snapshot phase timings with the active check and attempt at concurrency %s", async concurrency => {
+  const f = await fixture(); f.env["FAIL"] = "0";
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, concurrency, mechanicalProviders: ["check.a", "check.b"], profiles: f.config.scopedExecution!.profiles.map(profile => ({ ...profile,
     dependencies: { command: [process.execPath, "-e", "require('fs').mkdirSync('node_modules');require('fs').writeFileSync('node_modules/fixture','dependency')"], timeoutMs: 5000 },
   })) } });
-  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
-  const timings = f.out.flatMap(line => line.split("\n")).filter(line => line.startsWith("snapshot check.a:"));
-  const parsed = timings.map(line => /^snapshot check\.a: attempt ([^;]+); ([a-z-]+) (\d+)ms$/.exec(line));
-  expect(parsed.length).toBeGreaterThan(0);
-  expect(parsed.every(match => match !== null)).toBe(true);
-  expect(new Set(parsed.map(match => match![1])).size).toBe(1);
-  expect([...new Set(parsed.map(match => match![2]))].sort()).toEqual(["baseline-inventory", "dependencies", "materialization", "post-dependency-inventory", "verification"]);
+  const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
+  const observations: { phase: string; durationMs: number }[] = [];
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(input => create({ ...input, onPhase: (phase, durationMs) => {
+    observations.push({ phase, durationMs: Math.round(durationMs) }); input.onPhase?.(phase, durationMs);
+  } }));
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const timings = f.out.flatMap(line => line.split("\n")).filter(line => line.startsWith("snapshot check."));
+    const parsed = timings.map(line => /^snapshot (check\.[ab]): attempt ([^;]+); ([a-z-]+) (\d+)ms$/.exec(line));
+    expect(parsed.length).toBeGreaterThan(0);
+    expect(parsed.every(match => match !== null)).toBe(true);
+    expect(parsed.map(match => ({ phase: match![3], durationMs: Number(match![4]) }))).toEqual(observations);
+    expect([...new Set(parsed.map(match => match![3]))].sort()).toEqual(["baseline-inventory", "dependencies", "materialization", "post-dependency-inventory", "verification"]);
+    const { readScopedCheckObservations } = await import("./index.ts");
+    const recorded = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
+    for (const provider of recorded.providers) {
+      const own = parsed.filter(match => match![1] === provider.providerId);
+      expect(own.filter(match => match![3] === "verification")).toHaveLength(2);
+      expect([...new Set(own.map(match => match![2]))]).toEqual([provider.attempts[0]!.attemptId]);
+    }
+  } finally { spy.mockRestore(); }
 });
 it.each(["none", "full"] as const)("prepares and verifies portable evidence from a shallow source with %s Git context", async gitContext => {
   const f = await fixture(); f.env["FAIL"] = "0";

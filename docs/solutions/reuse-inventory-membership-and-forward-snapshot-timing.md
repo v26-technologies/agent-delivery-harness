@@ -18,7 +18,10 @@ The snapshot helper already measures materialization, baseline inventory,
 dependency setup, post-dependency inventory and verification. Its caller did
 not pass the observation callback. Forwarding that hook through the existing
 scoped lane sink exposes those durations with provider and attempt identity.
-The helper already suppresses observation errors, so a failing output sink
+A reused snapshot resolves its phase sink through its worker’s current writer,
+so verification is attributed to the active check and attempt rather than the
+check that first allocated the snapshot. The helper already suppresses
+observation errors, so a failing output sink
 cannot change execution or admission. Parallel lanes still buffer output until
 their check finishes; these lines are not a new live phase clock or evidence.
 
