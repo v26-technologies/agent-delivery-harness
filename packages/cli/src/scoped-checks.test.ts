@@ -26,6 +26,34 @@ async function fixture() {
   const run = async (...args: string[]) => { out.length = 0; err.length = 0; return runCli(args, runtime); };
   return { dir, git, run, out, err, env, get config() { return config; }, runtime, setConfig: (v: HarnessConfigInput) => { config = defineHarnessConfig(v); } };
 }
+it.each([1, 2])("forwards existing snapshot phase timings with the active check and attempt at concurrency %s", async concurrency => {
+  const f = await fixture(); f.env["FAIL"] = "0";
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, concurrency, mechanicalProviders: ["check.a", "check.b"], profiles: f.config.scopedExecution!.profiles.map(profile => ({ ...profile,
+    dependencies: { command: [process.execPath, "-e", "require('fs').mkdirSync('node_modules');require('fs').writeFileSync('node_modules/fixture','dependency')"], timeoutMs: 5000 },
+  })) } });
+  const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
+  const observations: { phase: string; durationMs: number }[] = [];
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(input => create({ ...input, onPhase: (phase, durationMs) => {
+    observations.push({ phase, durationMs: Math.round(durationMs) }); input.onPhase?.(phase, durationMs);
+  } }));
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const timings = f.out.flatMap(line => line.split("\n")).filter(line => line.startsWith("snapshot check."));
+    const parsed = timings.map(line => /^snapshot (check\.[ab]): attempt ([^;]+); ([a-z-]+) (\d+)ms$/.exec(line));
+    expect(parsed.length).toBeGreaterThan(0);
+    expect(parsed.every(match => match !== null)).toBe(true);
+    expect(parsed.map(match => ({ phase: match![3], durationMs: Number(match![4]) }))).toEqual(observations);
+    expect([...new Set(parsed.map(match => match![3]))].sort()).toEqual(["baseline-inventory", "dependencies", "materialization", "post-dependency-inventory", "verification"]);
+    const { readScopedCheckObservations } = await import("./index.ts");
+    const recorded = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
+    for (const provider of recorded.providers) {
+      const own = parsed.filter(match => match![1] === provider.providerId);
+      expect(own.filter(match => match![3] === "verification")).toHaveLength(2);
+      expect([...new Set(own.map(match => match![2]))]).toEqual([provider.attempts[0]!.attemptId]);
+    }
+  } finally { spy.mockRestore(); }
+});
 it.each(["none", "full"] as const)("prepares and verifies portable evidence from a shallow source with %s Git context", async gitContext => {
   const f = await fixture(); f.env["FAIL"] = "0";
   await writeFile(path.join(f.dir, "source.txt"), "boundary"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "boundary");
@@ -954,6 +982,20 @@ it("prepare finishes the first declared mechanical check before overlapping the 
   expect(await f.installs("1")).toBeLessThanOrEqual(3);
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
 }, 90000);
+it("simultaneous workers phase attribution", async () => {
+ const f = await poolFixture(["1", "1"], 2, (_id, shared) => barrier(shared, 2));
+ expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+ expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+ const {readScopedCheckObservations} = await import("./index.ts");
+ const recorded = await readScopedCheckObservations({rootDir:f.dir,config:f.config});
+ const lines=f.out.flatMap(line=>line.split("\n"));
+ for (const provider of recorded.providers) {
+   const own=lines.filter(line=>line.startsWith(`snapshot ${provider.providerId}:`)&&line.includes("; verification "));
+   expect(own,lines.join("\n")).toHaveLength(2);
+   for(const line of own) expect(line).toContain(`attempt ${provider.attempts[0]!.attemptId};`);
+ }
+},30000);
+
 it("concurrency 1 keeps serial output and one live snapshot exactly as when unset", async () => {
   const runs: { out: string[]; setups: number }[] = [];
   for (const concurrency of [undefined, 1]) {
@@ -980,9 +1022,19 @@ it("failures, diagnostics, retained attempts, reuse and evidence under concurren
     expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
     await writeFile(path.join(f.shared, "fail"), "");
     expect(await f.run("gate")).toBe(1);
-    // Each check's lines arrive together: nothing else is printed between a check starting and its result.
-    const out = f.out.map(line => normalized(f, line));
-    for (const [index, line] of out.entries()) if (line.startsWith("checking ")) expect(out[index + 1], out.join("\n")).toMatch(new RegExp(`^(passed|failed) ${line.split(" ")[1]!.replace(":", "")}:`));
+    // A check's phase observations stay in its group until its result, with no other check interleaved.
+    const lines = f.out.flatMap(line => line.trimEnd().split("\n"));
+    for (const [index, line] of lines.entries()) if (line.startsWith("checking ")) {
+      const provider = line.split(" ")[1]!.replace(":", "");
+      let next = index + 1;
+      while (lines[next]?.startsWith("snapshot ")) {
+        expect(lines[next], lines.join("\n")).toMatch(new RegExp(`^snapshot ${provider}: attempt [^;]+; verification \\d+ms$`));
+        next++;
+      }
+      expect(lines[next], lines.join("\n")).toMatch(new RegExp(`^(passed|failed) ${provider}:`));
+    }
+    // Setup counts differ with worker reuse; phase values are checked by the dedicated forwarding rows.
+    const out = f.out.filter(line => !line.startsWith("snapshot ")).map(line => normalized(f, line));
     const failedGate = { out: [...out].sort(), err: f.err.map(line => normalized(f, line)) };
     const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
     const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.map(a => a.attemptId)) });
@@ -991,7 +1043,7 @@ it("failures, diagnostics, retained attempts, reuse and evidence under concurren
         command: "unavailable" in a.diagnostic.command ? a.diagnostic.command : { exitCode: a.diagnostic.command.exitCode, outputTail: a.diagnostic.command.outputTail } } : a.diagnostic })) }));
     await rm(path.join(f.shared, "fail"));
     expect(await f.run("gate"), f.err.join("\n")).toBe(0);
-    const passedGate = f.out.map(line => normalized(f, line)).sort();
+    const passedGate = f.out.filter(line => !line.startsWith("snapshot ")).map(line => normalized(f, line)).sort();
     expect(await f.run("record"), f.err.join("\n")).toBe(0);
     await f.git("add", ".");
     expect(await f.run("verify"), f.err.join("\n")).toBe(0);
