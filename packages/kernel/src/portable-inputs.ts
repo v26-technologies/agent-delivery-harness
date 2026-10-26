@@ -36,23 +36,67 @@ async function candidateTreeReader(rootDir: string, treeSha: string, run: Candid
   if (listing.exitCode !== 0) refusal("The target candidate tree cannot be enumerated.");
   const entries = new Map(parseCandidateTreeListing(listing.stdout).map(entry => [entry.path, entry]));
   const objectReads = new Map<string, Promise<Buffer>>();
+  const verifyObject = (sha: string, type: "blob" | "tree", bytes: Buffer): Buffer => {
+    const actual = createHash(sha.length === 64 ? "sha256" : "sha1").update(`${type} ${bytes.length}\0`).update(bytes).digest("hex");
+    if (actual !== sha) refusal(`The target-tree reader did not preserve the exact ${type} bytes.`);
+    return bytes;
+  };
   const loadObject = async (sha: string, type: "blob" | "tree"): Promise<Buffer> => {
     const size = await run(["git", "cat-file", "-s", sha], { cwd: rootDir });
     if (size.exitCode !== 0 || !/^\d+\s*$/.test(size.stdout) || (maxBytes !== undefined && Number(size.stdout) > maxBytes)) refusal("A target-tree input is missing or oversized.");
     const result = await run(["git", "cat-file", type, sha], { cwd: rootDir, captureBytes: true });
     if (result.exitCode !== 0) refusal("A target-tree evidence input cannot be read.");
     const bytes = result.stdoutBase64 === undefined ? Buffer.from(result.stdout, "utf8") : Buffer.from(result.stdoutBase64, "base64");
-    const actual = createHash(sha.length === 64 ? "sha256" : "sha1").update(`${type} ${bytes.length}\0`).update(bytes).digest("hex");
-    if (actual !== sha) refusal(`The target-tree reader did not preserve the exact ${type} bytes.`);
-    return bytes;
+    return verifyObject(sha, type, bytes);
   };
+  type ObjectRequest = { sha: string; type: "blob" | "tree"; resolve: (bytes: Buffer) => void; reject: (error: unknown) => void };
+  const queued: ObjectRequest[] = [];
+  let active = false, scheduled = false;
+  const schedule = () => {
+    if (active || scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => { void flush(); });
+  };
+  const flush = async () => {
+    scheduled = false;
+    active = true;
+    const batch = queued.splice(0, 8);
+    try {
+      const result = await runGitCommand(["git", "cat-file", "--batch"], {
+        cwd: rootDir, captureBytes: true, stdin: batch.map(request => `${request.sha}\n`).join(""),
+      });
+      if (result.exitCode !== 0 || result.stdoutBase64 === undefined) refusal("A target-tree evidence input cannot be read.");
+      const output = Buffer.from(result.stdoutBase64!, "base64"), values: Buffer[] = [];
+      let offset = 0;
+      for (const request of batch) {
+        const end = output.indexOf(0x0a, offset);
+        if (end < offset || end - offset > 128) refusal("A target-tree object batch has an invalid header.");
+        const header = /^([a-f0-9]{40}(?:[a-f0-9]{24})?) (blob|tree) (0|[1-9][0-9]*)$/.exec(output.subarray(offset, end).toString("utf8"));
+        if (!header || header[1] !== request.sha || header[2] !== request.type) refusal("A target-tree object batch has an invalid identity or type.");
+        const size = Number(header![3]), start = end + 1, finish = start + size;
+        if (!Number.isSafeInteger(size) || !Number.isSafeInteger(finish) || finish >= output.length || output[finish] !== 0x0a) refusal("A target-tree object batch has invalid or truncated bytes.");
+        values.push(verifyObject(request.sha, request.type, Buffer.from(output.subarray(start, finish))));
+        offset = finish + 1;
+      }
+      if (offset !== output.length) refusal("A target-tree object batch has unexpected trailing bytes.");
+      // Publish nothing until every frame and the finite process have passed.
+      batch.forEach((request, index) => request.resolve(values[index]!));
+    } catch (error) { batch.forEach(request => request.reject(error)); }
+    finally { active = false; if (queued.length) schedule(); }
+  };
+  const loadNativeObject = (sha: string, type: "blob" | "tree"): Promise<Buffer> => new Promise((resolve, reject) => {
+    queued.push({ sha, type, resolve, reject });
+    schedule();
+  });
   // One reader owns one pinned tree and one size policy. Only verified bytes
   // resolve successfully; sharing in-flight reads also avoids duplicate Git I/O.
   const readObject = (sha: string, type: "blob" | "tree" = "blob"): Promise<Buffer> => {
     const key = `${type}:${sha}`;
     const existing = objectReads.get(key);
     if (existing) return existing;
-    const pending = loadObject(sha, type);
+    // Injected runners retain their existing per-object command contract. This
+    // native-only choice is stable, never a fallback after a batch failure.
+    const pending = directoryLinks && run === runGitCommand ? loadNativeObject(sha, type) : loadObject(sha, type);
     objectReads.set(key, pending);
     void pending.catch(() => { if (objectReads.get(key) === pending) objectReads.delete(key); });
     return pending;

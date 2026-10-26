@@ -87,7 +87,7 @@ export interface CandidateCommandResult {
 
 export type CandidateCommandRunner = (
   command: readonly string[],
-  options: { readonly cwd: string; readonly captureBytes?: boolean },
+  options: { readonly cwd: string; readonly captureBytes?: boolean; readonly stdin?: string },
 ) => Promise<CandidateCommandResult>;
 
 /**
@@ -133,29 +133,37 @@ export const runGitCommand: CandidateCommandRunner = (command, options) =>
     const child = spawn(executable, args, {
       cwd: options.cwd,
       env: scrubbedEnvironment(),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     let stdout = "";
     let stderr = "";
+    let inputError: string | undefined;
     const chunks: Buffer[] = [];
-    if (!options.captureBytes) child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string | Buffer) => {
+    if (!options.captureBytes) child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string | Buffer) => {
       if (options.captureBytes) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       else stdout += chunk;
     });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => {
       stderr += chunk;
     });
     child.once("error", (error: Error) => {
       resolve({ exitCode: -1, stdout, stderr: error.message });
     });
+    if (options.stdin !== undefined) {
+      child.stdin!.once("error", (error: Error) => {
+        inputError = error.message;
+        child.kill("SIGKILL");
+      });
+      child.stdin!.end(options.stdin);
+    }
     // `close` rather than `exit`: it fires once the pipes are drained, so the
     // output is complete when the exit code is read.
     child.once("close", (code) => {
       const bytes = options.captureBytes ? Buffer.concat(chunks) : undefined;
-      resolve({ exitCode: code ?? -1, stdout: bytes?.toString("utf8") ?? stdout, stderr, ...(bytes === undefined ? {} : { stdoutBase64: bytes.toString("base64") }) });
+      resolve({ exitCode: inputError === undefined ? code ?? -1 : -1, stdout: bytes?.toString("utf8") ?? stdout, stderr: inputError ?? stderr, ...(bytes === undefined ? {} : { stdoutBase64: bytes.toString("base64") }) });
     });
   });
 
