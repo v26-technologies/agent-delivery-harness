@@ -5,7 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
 import { candidateTreeEvidenceReader, candidateTreeSourceReader } from "./portable-inputs.ts";
-import { runGitCommand, type CandidateCommandRunner } from "./candidate.ts";
+import { runGitCommand, runGitCommandBytes, type CandidateCommandRunner } from "./candidate.ts";
 import { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";
 import { captureScopedCheckInputs } from "./checks.ts";
 
@@ -95,6 +95,21 @@ it.each(["sha1", "sha256"])("batches native %s binary, aliases and metadata whil
   expect(await capture(read)).toEqual(await capture(old));
 });
 
+it("keeps native binary batches out of UTF8 and base64 text transport", async () => {
+  const f = fixture(), read = await candidateTreeSourceReader(f.root, f.tree);
+  const original = Buffer.prototype.toString;
+  const bodyEncodings: (BufferEncoding | undefined)[] = [];
+  const text = vi.spyOn(Buffer.prototype, "toString").mockImplementation(function (this: Buffer, ...args: unknown[]) {
+    const [encoding, start, end] = args as [BufferEncoding?, number?, number?];
+    if (this.length >= f.bytes.length && this.includes(f.bytes)) bodyEncodings.push(encoding);
+    return original.call(this, encoding, start, end);
+  });
+  let bytes: Uint8Array | null;
+  try { bytes = await read("input"); } finally { text.mockRestore(); }
+  expect(bytes!).toEqual(f.bytes);
+  expect(bodyEncodings).toEqual([]);
+});
+
 it("bounds native waves to eight and flushes a single request without waiting for peers", async () => {
   const f = fixture(); for (let i = 0; i < 19; i++) writeFileSync(path.join(f.root, `extra-${i}`), `unique ${i}`);
   // Keep the transport wrapper out of the pinned tree.
@@ -148,9 +163,23 @@ it("uses batching through compiled public kernel exports with the exported nativ
   const bundle = path.join(f.root, "kernel.mjs");
   await build({ entryPoints: [path.resolve("packages/kernel/src/index.ts")], outfile: bundle, bundle: true, platform: "node", format: "esm", logLevel: "silent" });
   const api = await import(pathToFileURL(bundle).href) as typeof import("./index.ts");
+  expect(api).not.toHaveProperty("runGitCommandBytes");
   const read = await api.candidateTreeSourceReader(f.root, f.tree, api.runGitCommand);
   expect(await read("input")).toEqual(f.bytes);
   expect(f.calls().filter(call => call.args[0] === "cat-file").map(call => call.args[1])).toEqual(["--batch"]);
+});
+
+it("drains exact binary chunks internally while preserving public text and base64 results", async () => {
+  const command = [process.execPath, "-e", "process.stdout.write(Buffer.from([0,255,128]));setTimeout(()=>{process.stdout.write(Buffer.from([10,195,169]));process.stderr.write('complete')},20)"];
+  const expected = Buffer.from([0, 255, 128, 10, 195, 169]);
+  const binary = await runGitCommandBytes(command, { cwd: tmpdir() });
+  expect(binary).toEqual({ exitCode: 0, stdout: expected, stderr: "complete" });
+  const publicResult = await runGitCommand(command, { cwd: tmpdir(), captureBytes: true });
+  expect(publicResult).toEqual({ exitCode: 0, stdout: expected.toString("utf8"), stdoutBase64: expected.toString("base64"), stderr: "complete" });
+  expect(await runGitCommandBytes([], { cwd: tmpdir() })).toEqual({ exitCode: -1, stdout: Buffer.alloc(0), stderr: "no command was given" });
+  expect(await runGitCommandBytes(["/definitely-missing-v2347-command"], { cwd: tmpdir() })).toMatchObject({ exitCode: -1, stdout: Buffer.alloc(0) });
+  const closed = await runGitCommandBytes([process.execPath, "-e", "process.stdin.destroy();process.exit(0)"], { cwd: tmpdir(), stdin: "x".repeat(2 * 1024 * 1024) });
+  expect(closed.exitCode).toBe(-1); expect(closed.stderr).not.toBe("");
 });
 
 it("passes finite stdin bytes and reports unstartable commands and stdin pipe failure", async () => {

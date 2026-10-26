@@ -47,3 +47,20 @@ Planning and selection remain separate costs. An initial comparison setup failed
 because the staged measurement tree belonged to its preserved clone rather than
 the integration checkout; retain the failed attempt and bind both object store
 and tree before interpreting timing.
+
+The finite batch path also needs a binary transport. The public command runner
+returns decoded UTF-8 and base64 for `captureBytes`; using it internally made
+one batch pass through chunks, concatenation, UTF-8, base64, base64 decoding and
+then verified frame copies. Keep that public result unchanged for embedders,
+but let the native batch parser consume the same collector's raw buffer. A
+binary-body conversion spy must fail against the old path, and exact binary
+chunks, finite stdin, start/pipe errors and the compiled package export surface
+remain pinned. Header decoding is still necessary; decoding complete binary
+bodies is not.
+
+This removes redundant transport allocations, not the reader-local verified
+object cache or caller-copy isolation. The cache remains reachable during one
+source hydration while its caller builds text. When that caller returns only a
+text snapshot and does not retain the reader, the SDK cache becomes collectible;
+that says nothing about when the runtime reclaims external memory or returns
+RSS. No end-to-end memory-limit cure follows from this allocation change alone.

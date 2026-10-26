@@ -5,7 +5,7 @@ import type { ScopedCheckPlan, ScopedCheckAttempt } from "./records.types.ts";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { BlockedError } from "./blockers.ts";
-import { runGitCommand, evaluateCandidateActivation, type CandidateCommandRunner } from "./candidate.ts";
+import { runGitCommand, runGitCommandBytes, evaluateCandidateActivation, type CandidateCommandRunner } from "./candidate.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
 import type { HarnessConfig } from "./config.ts";
 import { computePreparationFingerprint } from "./preparation.ts";
@@ -62,11 +62,11 @@ async function candidateTreeReader(rootDir: string, treeSha: string, run: Candid
     active = true;
     const batch = queued.splice(0, 8);
     try {
-      const result = await runGitCommand(["git", "cat-file", "--batch"], {
-        cwd: rootDir, captureBytes: true, stdin: batch.map(request => `${request.sha}\n`).join(""),
+      const result = await runGitCommandBytes(["git", "cat-file", "--batch"], {
+        cwd: rootDir, stdin: batch.map(request => `${request.sha}\n`).join(""),
       });
-      if (result.exitCode !== 0 || result.stdoutBase64 === undefined) refusal("A target-tree evidence input cannot be read.");
-      const output = Buffer.from(result.stdoutBase64!, "base64"), values: Buffer[] = [];
+      if (result.exitCode !== 0) refusal("A target-tree evidence input cannot be read.");
+      const output = result.stdout, values: Buffer[] = [];
       let offset = 0;
       for (const request of batch) {
         const end = output.indexOf(0x0a, offset);
