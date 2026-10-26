@@ -101,7 +101,7 @@ it("keeps native binary batches out of UTF8 and base64 text transport", async ()
   const bodyEncodings: (BufferEncoding | undefined)[] = [];
   const text = vi.spyOn(Buffer.prototype, "toString").mockImplementation(function (this: Buffer, ...args: unknown[]) {
     const [encoding, start, end] = args as [BufferEncoding?, number?, number?];
-    if (this.length > f.bytes.length && this.includes(f.bytes)) bodyEncodings.push(encoding);
+    if (this.length >= f.bytes.length && this.includes(f.bytes)) bodyEncodings.push(encoding);
     return original.call(this, encoding, start, end);
   });
   let bytes: Uint8Array | null;
@@ -176,7 +176,7 @@ it("drains exact binary chunks internally while preserving public text and base6
   expect(binary).toEqual({ exitCode: 0, stdout: expected, stderr: "complete" });
   const publicResult = await runGitCommand(command, { cwd: tmpdir(), captureBytes: true });
   expect(publicResult).toEqual({ exitCode: 0, stdout: expected.toString("utf8"), stdoutBase64: expected.toString("base64"), stderr: "complete" });
-  expect((await runGitCommandBytes([], { cwd: tmpdir() })).stdout).toEqual(Buffer.alloc(0));
+  expect(await runGitCommandBytes([], { cwd: tmpdir() })).toEqual({ exitCode: -1, stdout: Buffer.alloc(0), stderr: "no command was given" });
   expect(await runGitCommandBytes(["/definitely-missing-v2347-command"], { cwd: tmpdir() })).toMatchObject({ exitCode: -1, stdout: Buffer.alloc(0) });
   const closed = await runGitCommandBytes([process.execPath, "-e", "process.stdin.destroy();process.exit(0)"], { cwd: tmpdir(), stdin: "x".repeat(2 * 1024 * 1024) });
   expect(closed.exitCode).toBe(-1); expect(closed.stderr).not.toBe("");
