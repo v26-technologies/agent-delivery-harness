@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,7 +10,12 @@ import { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";
 import { captureScopedCheckInputs } from "./checks.ts";
 
 const roots: string[] = [];
-afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+// Observe real process launches without wrapping the native command runner.
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture(format = "sha1") {
   const root = mkdtempSync(path.join(tmpdir(), "native-batch-")); roots.push(root);
   const realGit = execFileSync("which", ["git"]).toString().trim();
@@ -31,6 +36,11 @@ function fixture(format = "sha1") {
   const wrapper = `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process');
 const args=process.argv.slice(2),mode=fs.readFileSync(${JSON.stringify(control)},'utf8');
 const input=fs.readFileSync(0);fs.appendFileSync(${JSON.stringify(trace)},JSON.stringify({args,input:input.toString()})+'\\n');
+if(mode==='hold'&&args[0]==='cat-file'&&args[1]==='--batch'){
+ const deadline=Date.now()+10000;while(!fs.existsSync(${JSON.stringify(control + ".release")})){
+  if(Date.now()>deadline)throw Error('Unreleased native fixture child');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
+ }
+}
 const r=cp.spawnSync(${JSON.stringify(realGit)},args,{input,maxBuffer:32*1024*1024});let output=r.stdout;
 if(args[0]==='cat-file'&&args[1]==='--batch'){
  const end=output.indexOf(10),header=output.subarray(0,end).toString(),fields=header.split(' ');
@@ -50,7 +60,7 @@ process.stdout.write(output);process.stderr.write(r.stderr);process.exitCode=pro
   writeFileSync(path.join(transport, "git"), wrapper, { mode: 0o755 });
   vi.stubEnv("PATH", transport + path.delimiter + process.env["PATH"]);
   const calls = () => readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { args: string[]; input: string });
-  return { root, git, tree, bytes, calls, mode: (mode: string) => writeFileSync(control, mode) };
+  return { root, git, tree, bytes, calls, mode: (mode: string) => writeFileSync(control, mode), release: () => writeFileSync(control + ".release", "") };
 }
 
 it.each(["sha1", "sha256"])("batches native %s binary, aliases and metadata while legacy runners keep their protocol", async format => {
@@ -95,6 +105,26 @@ it("bounds native waves to eight and flushes a single request without waiting fo
   const waves = f.calls().filter(call => call.args[1] === "--batch").map(call => call.input.trim().split("\n").length);
   expect(waves).toEqual([8, 8, 3, 1]);
 });
+
+it("keeps one native child active when a distinct request arrives during a held batch", async () => {
+  const f = fixture(); f.mode("hold");
+  const read = await candidateTreeSourceReader(f.root, f.tree), first = read("input");
+  const launches = () => vi.mocked(spawn).mock.calls.map((call, index) => ({ call, result: vi.mocked(spawn).mock.results[index]! }))
+    .filter(({ call }) => call[0] === "git" && Array.isArray(call[1]) && call[1][0] === "cat-file" && call[1][1] === "--batch");
+  let second: ReturnType<typeof read> | undefined;
+  try {
+    await vi.waitFor(() => expect(f.calls().filter(call => call.args[1] === "--batch")).toHaveLength(1), { timeout: 5000, interval: 10 });
+    second = read("exec");
+    // Drain scheduler microtasks while the first real child waits for release.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(launches()).toHaveLength(1);
+    expect(launches()[0]!.result.value.exitCode).toBeNull();
+  } finally {
+    f.release(); await Promise.allSettled([first, ...(second ? [second] : [])]);
+  }
+  expect(await first).toEqual(f.bytes); expect(await second).toEqual(Buffer.from("executable"));
+  expect(launches()).toHaveLength(2);
+}, 15000);
 
 it.each(["oid", "type", "non-ascii", "negative", "unsafe", "size-text", "header", "body", "hash", "delimiter", "trailing", "missing", "exit"])("rejects native batch %s faults, settles siblings and retries without cached failure", async mode => {
   const f = fixture(), read = await candidateTreeSourceReader(f.root, f.tree); f.mode(mode);
