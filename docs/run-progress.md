@@ -125,11 +125,20 @@ must not be added to their encompassing round totals.
 
 The candidate-facing command boundary reports `check`, `prepare`,
 `review-context`, `emit-review-evidence`, `submit-evidence`, `gate`, `record` and
-`verify`. On a v2 run, an invocation records a running activity against the
-candidate captured before execution and a matching completed, failed or
-interrupted observation when the boundary returns. Concurrent invocations have
-separate IDs; a changed current-run pointer cannot move their completion to a
-different run. The existing `command.completed` retains the exact exit outcome,
+`verify`. On a v2 run, these native commands report running against their
+first successful command-owned candidate capture. `check` and descriptors that
+do not opt in retain the boundary's eager capture. Progress reporting adds no
+extra capture to an opted-in command: every command capture remains fresh, with
+its before/after quiescence checks intact. Concurrent captures share only the
+progress-reporting promise, which each successful caller waits for; they never
+share candidate results. Reporting failures remain best effort.
+
+The boundary records a matching completed, failed or interrupted activity when
+it returns. Usage refusals and failures before a successful capture still record
+`command.completed`, without inventing a candidate activity. Concurrent
+invocations have separate IDs; a changed current-run pointer cannot move their
+completion to a different run. Legacy v1 runs retain completion-only reporting.
+The existing `command.completed` retains the exact exit outcome,
 duration and successful digest. A successful v2 `prepare` completion also carries
 `payload.preparation`, the product's actual check decision:
 

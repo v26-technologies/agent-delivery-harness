@@ -13,6 +13,7 @@ import { buildReviewContext, OutcomeError } from "../review-evidence.ts";
 const USAGE = "Usage: delivery-harness review-context [--json]";
 
 export const reviewContextCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "review-context",
   sourceId: "delivery-harness.cli.review-context",
   summary: "Show the reviewable-change context for the prepared candidate.",

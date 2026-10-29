@@ -63,7 +63,7 @@ import {
   type ProviderRailInvocationResult,
   type ProviderRailSession,
 } from "./provider-rails.ts";
-import { beginCommandObservation, type CommandObservation } from "./command-activity.ts";
+import { beginCommandObservation, observeCandidateCaptures, type CommandObservation } from "./command-activity.ts";
 
 // ── Exit codes ───────────────────────────────────────────────────────────────
 
@@ -142,6 +142,9 @@ export interface CommandContext {
 
 export interface CommandDescriptor {
   readonly name: string;
+  /** Opt in to progress from this command's fresh captures. Other descriptors
+   * retain the boundary's eager capture; this flag grants no candidate reuse. */
+  readonly capturesCandidate?: boolean;
   /** The blocker `source.id` this command stamps on failures it raises itself. */
   readonly sourceId: string;
   readonly summary: string;
@@ -491,11 +494,14 @@ async function runConfiguredCommand(
 
     let wiringPromise: Promise<RepoWiring> | undefined;
     const wire = (): Promise<RepoWiring> => {
-      wiringPromise ??= wireRepo(runtime.cwd, config);
+      wiringPromise ??= wireRepo(runtime.cwd, config).then(wiring =>
+        descriptor.capturesCandidate && observation?.needsCandidate
+          ? { ...wiring, captureCandidate: observeCandidateCaptures(wiring.captureCandidate, observation) }
+          : wiring);
       return wiringPromise;
     };
 
-    if (observation?.needsCandidate) {
+    if (observation?.needsCandidate && !descriptor.capturesCandidate) {
       try {
         const capture = await (await wire()).captureCandidate();
         if (capture.ok) await observation.start(capture.candidate.treeSha);

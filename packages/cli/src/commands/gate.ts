@@ -157,6 +157,7 @@ export async function runProviderBackedAdmission(context: CommandContext, option
 }
 
 export const gateCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "gate",
   sourceId: "delivery-harness.cli.gate",
   summary: "Evaluate the delivery gate for the current candidate.",

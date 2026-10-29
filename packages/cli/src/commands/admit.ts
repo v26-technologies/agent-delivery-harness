@@ -52,6 +52,7 @@ function invalidOutcome(message: string): CommandResult {
 }
 
 export const admitCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "admit",
   sourceId: "delivery-harness.cli.admit",
   summary: "Prepare and admit a concluded review outcome through the tracked record write.",

@@ -4,6 +4,7 @@ import { commandBlocker, type CommandDescriptor } from "../boundary.ts";
 import { emitReviewEvidence, OutcomeError } from "../review-evidence.ts";
 
 export const emitReviewEvidenceCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "emit-review-evidence",
   sourceId: "delivery-harness.cli.emit-review-evidence",
   summary: "Bind concluded review outcomes to their original prepared context.",

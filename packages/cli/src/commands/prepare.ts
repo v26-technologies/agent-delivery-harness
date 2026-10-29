@@ -24,6 +24,7 @@ import { CliInterruption, type CommandContext, type CommandDescriptor, type Comm
 const USAGE = "Usage: delivery-harness prepare [--refresh-record-neutral]";
 
 export const prepareCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "prepare",
   sourceId: "delivery-harness.cli.prepare",
   summary: "Run preparation checks; --refresh-record-neutral permits proven artifact-only receipt refresh.",
