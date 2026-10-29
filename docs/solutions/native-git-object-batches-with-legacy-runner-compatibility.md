@@ -9,7 +9,7 @@ A cold candidate-tree source reader previously launched a size command and a
 body command for every distinct object. Keeping an inventory Set removed linear
 membership work but left those process launches unchanged. The next bounded
 change batches demanded source objects through finite `git cat-file --batch`
-processes, at most eight objects per wave and one active child per reader.
+processes, at most thirty-two objects per wave and one active child per reader.
 
 The command port is also an embedding boundary. Explicitly injected runners
 must keep their existing command protocol; adding stdin support does not prove
@@ -30,7 +30,7 @@ buffers and path/mode/link resolution. Evidence keeps its pre-body size limit;
 source blobs may still exceed it. The wave bound limits object count, not total
 source bytes or retained memory.
 
-Enqueuing nineteen reads before the first flush proves the wave-size bound but
+Enqueuing sixty-seven reads before the first flush proves the wave-size bound but
 cannot prove the active-child bound. Removing the active scheduler guard still
 passed that test. Hold a real native child behind an explicit release signal,
 enqueue a distinct request during it, and observe actual launches after draining
@@ -64,3 +64,27 @@ source hydration while its caller builds text. When that caller returns only a
 text snapshot and does not retain the reader, the SDK cache becomes collectible;
 that says nothing about when the runtime reclaims external memory or returns
 RSS. No end-to-end memory-limit cure follows from this allocation change alone.
+
+
+## Match finite waves to existing demand
+
+An adopter already requesting32independent objects cannot fill the next wave
+until the active one completes. The original8-object ceiling serialized four
+Git processes for that demand. Raising the finite ceiling to32 removes process
+setup while keeping a single active child, immediate singleton flush and the
+same framing/hash verification before any result resolves. Injected runners,
+source/evidence size policy and per-reader cache lifetime remain unchanged.
+
+The regression now requests67unique objects: waves32/32/3, followed by a
+separate singleton. It failed against the original8-object ceiling, and the
+existing held-child test independently retains serialization. The larger count
+bound is not a source-byte or memory bound.
+
+The retained Athena base9f6e053149b21e07eeae9998b3bd37d4af626cd8 contains8,174paths
+and7,967distinct regular blobs. With raw persistence disabled and unchanged
+32-reader demand, the first source-bundle pair measured16.07s at8objects versus
+5.62s at32. Complete files and native link metadata match the retained baseline
+exactly. The reverse-order pair measured5.58s at32 then15.89s at8.
+These local cold source-phase measurements do not establish whole-gate
+performance or new reader qualification; packaged adoption is a separate
+consumer check.

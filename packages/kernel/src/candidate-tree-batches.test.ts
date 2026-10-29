@@ -110,15 +110,15 @@ it("keeps native binary batches out of UTF8 and base64 text transport", async ()
   expect(bodyEncodings).toEqual([]);
 });
 
-it("bounds native waves to eight and flushes a single request without waiting for peers", async () => {
-  const f = fixture(); for (let i = 0; i < 19; i++) writeFileSync(path.join(f.root, `extra-${i}`), `unique ${i}`);
+it("bounds native waves to thirty-two and flushes a single request without waiting for peers", async () => {
+  const f = fixture(); for (let i = 0; i < 67; i++) writeFileSync(path.join(f.root, `extra-${i}`), `unique ${i}`);
   // Keep the transport wrapper out of the pinned tree.
-  f.git("add", ...Array.from({ length: 19 }, (_, i) => `extra-${i}`)); const tree = f.git("write-tree").toString().trim();
+  f.git("add", ...Array.from({ length: 67 }, (_, i) => `extra-${i}`)); const tree = f.git("write-tree").toString().trim();
   const read = await candidateTreeSourceReader(f.root, tree);
-  expect(await Promise.all(Array.from({ length: 19 }, (_, i) => read(`extra-${i}`)))).toEqual(Array.from({ length: 19 }, (_, i) => Buffer.from(`unique ${i}`)));
+  expect(await Promise.all(Array.from({ length: 67 }, (_, i) => read(`extra-${i}`)))).toEqual(Array.from({ length: 67 }, (_, i) => Buffer.from(`unique ${i}`)));
   expect(await read("empty")).toEqual(Buffer.alloc(0));
   const waves = f.calls().filter(call => call.args[1] === "--batch").map(call => call.input.trim().split("\n").length);
-  expect(waves).toEqual([8, 8, 3, 1]);
+  expect(waves).toEqual([32, 32, 3, 1]);
 });
 
 it("keeps one native child active when a distinct request arrives during a held batch", async () => {
