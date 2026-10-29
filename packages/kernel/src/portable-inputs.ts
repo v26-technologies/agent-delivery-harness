@@ -60,7 +60,8 @@ async function candidateTreeReader(rootDir: string, treeSha: string, run: Candid
   const flush = async () => {
     scheduled = false;
     active = true;
-    const batch = queued.splice(0, 8);
+    // Amortize process setup while retaining finite waves and one active child.
+    const batch = queued.splice(0, 32);
     try {
       const result = await runGitCommandBytes(["git", "cat-file", "--batch"], {
         cwd: rootDir, stdin: batch.map(request => `${request.sha}\n`).join(""),
