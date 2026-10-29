@@ -233,6 +233,7 @@ async function runSpanRows(
 }
 
 export const verifyCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "verify",
   sourceId: "delivery-harness.cli.verify",
   summary: "Verify the tracked delivery record against the current candidate.",

@@ -1,6 +1,6 @@
 /** Best-effort CLI observations. No caller uses these results for admission. */
 import { randomUUID } from "node:crypto";
-import type { RunEventKind, RunPreparationObservation, WaiverPrompt } from "@agent-delivery-harness/kernel";
+import type { CaptureCandidate, RunEventKind, RunPreparationObservation, WaiverPrompt } from "@agent-delivery-harness/kernel";
 import { buildRunEvent, resolveRunSurface } from "./run-surface.ts";
 
 export interface CommandObservation {
@@ -11,6 +11,20 @@ export interface CommandObservation {
 }
 const absent: CommandObservation = { needsCandidate: false, start: async () => {}, prompt: prompt => prompt, finish: async () => {} };
 function outcome(code: number) { return code === 0 ? "ok" : code === 2 ? "usage" : code === 130 ? "interrupted" : "policy"; }
+
+/** Observe the first successful command capture; never reuse or replace a result. */
+export function observeCandidateCaptures(capture: CaptureCandidate, observation: CommandObservation): CaptureCandidate {
+  let start: Promise<void> | undefined;
+  return async () => {
+    const result = await capture();
+    if (result.ok) {
+      start ??= Promise.resolve().then(() => observation.start(result.candidate.treeSha))
+        .catch(() => { /* Progress reporting never changes capture or command outcomes. */ });
+      await start;
+    }
+    return result;
+  };
+}
 
 /** Pin the current run once, so a pointer change cannot split an invocation. */
 export async function beginCommandObservation(cwd: string, command: string): Promise<CommandObservation> {

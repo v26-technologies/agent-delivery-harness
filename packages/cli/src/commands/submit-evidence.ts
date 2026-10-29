@@ -45,6 +45,7 @@ function unknownFlagIn(args: readonly string[]): string | undefined {
 }
 
 export const submitEvidenceCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "submit-evidence",
   sourceId: "delivery-harness.cli.submit-evidence",
   summary: "Validate a provider manifest and publish its evidence records.",

@@ -60,6 +60,7 @@ function parseRetentionOptions(args: readonly string[]): RetentionOptions | unde
 }
 
 export const recordCommand: CommandDescriptor = {
+  capturesCandidate: true,
   name: "record",
   sourceId: "delivery-harness.cli.record",
   summary: "Write the tracked delivery record for an admitted gate.",
