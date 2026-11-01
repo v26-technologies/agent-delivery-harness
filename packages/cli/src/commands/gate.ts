@@ -30,7 +30,7 @@ async function providerAdmission(
   options: { readonly allowPrompt: boolean; readonly includeInjectedLiveResults: boolean },
   session?: ScopedChecks,
 ): Promise<AdmissionResult & { readonly observedLiveResults?: readonly LiveProviderResult[] }> {
-  const admit = async (input: Parameters<typeof runAdmission>[0], options: Parameters<typeof runAdmission>[1]) => runAdmission(input, { ...options, ...(session ? { scopedPlan: await session.plan(), readOutput: session.readOutput } : {}) });
+  const admit = async (input: Parameters<typeof runAdmission>[0], options: Parameters<typeof runAdmission>[1]) => runAdmission(input, { ...options, ...(session ? { scopedPlan: await session.plan(), readOutput: session.readOutput, resourceBindings: await session.resourceBindings() } : {}) });
   if (session) {
     await session.fenceNonReusable(context.config.providers.filter(p => p.check?.scope).map(p => p.id));
   }
@@ -57,6 +57,7 @@ async function providerAdmission(
 
   const liveResults: LiveProviderResult[] = options.includeInjectedLiveResults ? [...(context.liveResults ?? [])] : [];
   const attempted = new Set<string>();
+  const resourceCaptures = new Set<string>();
   const attemptBlockers: Blocker[] = [];
   let admission = await admit(input, admissionOptions);
   await session?.explainReuse((admission.decision?.resolutions ?? []).flatMap(r => r.kind === "satisfied_evidence" ? [r.providerId] : []));
@@ -72,13 +73,39 @@ async function providerAdmission(
         if (finding.code !== missingCode || finding.providerId === undefined || attempted.has(finding.providerId)) continue;
         const registration = context.config.providers.find((provider) => provider.id === finding.providerId);
         if (registration === undefined || (registration.command === undefined && registration.check === undefined) || !obligation.providers.includes(registration.id)) continue;
-        if (registration.check !== undefined && (obligation.freshness !== "exact_candidate" || !obligation.acceptedPayloadSpecs.includes("checks.passed/1") || admission.decision.resolutions.some(resolution => resolution.kind !== "satisfied_evidence" && resolution.kind !== "not_applicable" && resolution.kind !== "waived" && context.config.obligations.find(entry => entry.id === resolution.obligationId)?.acceptedPayloadSpecs.includes("review.green/1")))) continue;
+        if (registration.check !== undefined && (obligation.freshness !== "exact_candidate" || !obligation.acceptedPayloadSpecs.includes("checks.passed/1") || admission.decision.resolutions.some(resolution => resolution.kind !== "satisfied_evidence" && resolution.kind !== "not_applicable" && resolution.kind !== "waived" && context.config.obligations.find(entry => entry.id === resolution.obligationId)?.acceptedPayloadSpecs.some(spec => spec === "review.green/1" || spec === "review.green/2")))) continue;
         const entry = requested.get(registration.id) ?? { obligationIds: [], requiresEvidence: false, needsLiveResult: false };
         entry.obligationIds.push(obligation.id);
         entry.requiresEvidence ||= obligation.freshness === "exact_candidate";
         entry.needsLiveResult ||= obligation.freshness === "live";
         requested.set(registration.id, entry);
       }
+    }
+
+    // Resolve conditional DATA before any check closes the capture phase. The
+    // ordinary admission above already enforced preparation and selected review.
+    const resource = session && [...requested].find(([id, request]) => !resourceCaptures.has(id) && context.config.providers.find(p => p.id === id)?.check?.installedData && request.obligationIds.every(obligationId => context.config.obligations.find(o => o.id === obligationId)?.acceptedPayloadSpecs.includes("installed-data.applicable/1")));
+    if (resource && session) {
+      const [id, request] = resource;
+      resourceCaptures.add(id);
+      let applicable = false;
+      try { applicable = (await session.captureInstalledDataFor(id)).applicable; }
+      catch (error) {
+        if (context.signal?.aborted) throw error;
+        context.write(`resource fallback ${id}: ${error instanceof Error ? error.message : "capture unavailable"}`);
+      }
+      if (applicable) {
+        // Existing same-candidate applicability may now resolve with current facts.
+        admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
+        const unresolved = request.obligationIds.filter(id => admission.decision?.resolutions.some(row => row.obligationId === id && row.kind === "blocked"));
+        if (unresolved.length) await session.publishInstalledDataApplicability(id, unresolved);
+        attempted.add(id);
+        admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
+        continue;
+      }
+      // A cold or changed consumer executes on the same serial owned snapshot.
+      // Capture is complete first; the first configured selection guard still
+      // precedes every other check in the ordinary execution order below.
     }
 
     // A pool runs every requested scoped check at once; a single worker keeps the one-at-a-time loop below.
@@ -104,7 +131,7 @@ async function providerAdmission(
           if (!(error instanceof CheckSnapshotError)) throw error;
           attemptBlockers.push(scopedCheckBlocker(error));
         }
-      } else attemptBlockers.push(...await runDeclaredCheck(context, registration, request.obligationIds, admission.candidate, session ? { scopedPlan: await session.plan(), readOutput: session.readOutput } : {}));
+      } else attemptBlockers.push(...await runDeclaredCheck(context, registration, request.obligationIds, admission.candidate, session ? { scopedPlan: await session.plan(), readOutput: session.readOutput, resourceBindings: await session.resourceBindings() } : {}));
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }

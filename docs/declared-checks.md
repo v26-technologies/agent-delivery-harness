@@ -37,3 +37,67 @@ A check that declares a `scope` runs in a private snapshot of the prepared tree 
 A failed scoped check prints a failure report on standard output before its blocker: the failure code, the attempt id and the path of its retained `terminal.json`, the command that ran with its working directory — the profile's dependency command when setup failed — and its exit code with the last 40 lines of its output, after credential redaction. The same tail is kept in the retained attempt.
 
 A passed attempt is reused, by `prepare` and by `gate`, whenever the check's current input digest and profile digest both equal the attempt's. Reuse is never extended past a changed digest, because the digest is what binds the pass to what the check could observe. Two things move the profile digest even when no declared input changed. Every profile binds the selected base ref, tip and merge base, so a moved base reruns every check. A `gitContext: "full"` profile also binds the original HEAD commit and the whole prepared tree, because such a check can read any file and the history; any new commit, including an unrelated one, reruns it. Declare `gitContext: "none"` for a check that reads only its declared files to keep its pass across unrelated commits. A check run with a present credential that has no declared nonsecret identity is not reused across candidates.
+
+## Installed package DATA consumers
+
+A finite consumer that reads installed package data can opt into a separate
+applicability outcome. Keep its ordinary command and execution profile. Declare
+`check.installedData` with `version: "installed-data-consumer/1"`, a stable
+`consumerId`, finite `requests`, a scoped `source` definition and `guards` mapping
+qualified executable source paths to SHA-256 hashes. The source profile, cwd and
+environment must match the check. Every request issuer must be a guarded test;
+additional declared source files can be DATA whose changes restore execution
+without repinning executable guards. The adopter owns the complete input closure,
+including executable launcher/configuration authority and both source snapshots.
+
+A request has `version: "installed-package-data/1"`, `id`, snapshot-relative
+`issuer`, literal package name, `manifest: "package.json"`, explicit package-relative
+`files` and finite `directories: [{path, suffix}]`. Native require resolution must
+select the owned root installation through its exported manifest; nearer installs,
+links, escapes, unreadable inputs and exceeded limits refuse capture. Requested
+directories retain complete membership alongside selected binary bytes. Limits
+are 16 requests, 4,096 entries, 1,024 members per directory, 1 MiB of raw data and
+the shared 2 MiB portable artifact bound. There is no truncation fallback.
+
+Opted-in exact-candidate obligations accept both `checks.passed/1` and
+`installed-data.applicable/1`. Keeping `checks.passed/1` is mandatory: cold,
+changed or unavailable authority executes the actual consumer. V1 permits one
+resource provider, outside mechanical preparation and review/live obligations.
+A declaration without the applicability payload opt-in retains ordinary execution.
+
+An already accepted applicability observation can be reused for the same candidate
+and strict record-neutral transport without another capture/setup. Native reuse
+reconstructs its source/context, checks the current runtime observation, and
+rechecks latest native origin precedence. Any new source candidate still needs
+fresh installed-resource capture.
+
+Configuration import and preparation acquire no installed resources. After normal
+preparation and selected independent review, `gate` derives source/setup identity
+from immutable Git inputs and captures resources in its existing owned dependency
+snapshot. Cold execution shares that snapshot and retains a separate
+`resource-applicability/1` projection only after the command passes post-command
+verification. With parallel workers, the first requested check and the captured
+consumer run on the capture worker before the remaining checks enter the pool.
+Other workers retain independent snapshots.
+
+An unrelated HEAD can leave this qualified consumer's source/resources unchanged
+while its original full-Git input/profile remains stale. In that case the gate
+allocates no consumer attempt and emits the closed applicability payload
+`{verdict: "applicable", binding}`. Its `installed-data-binding/1` binding covers
+the current candidate, check definition, consumer declaration, source applicability,
+resource capture and original native execution. It travels separately as
+`resourceBinding`, with `resource-result.json` and `resource-proof.json` artifacts;
+it supplies no `checks.passed` claim. Native admission rechecks latest origin
+precedence, so a newer failed, running or unqualified attempt cannot borrow an
+older resource projection.
+
+Portable verification reconstructs the original full-Git identity, verifies
+original and current guarded source applicability, retained resource bytes,
+setup/runtime/release/policy context, original successful command diagnostics and
+outputs, and the current applicability binding. It reads Git and retained
+artifacts, without installing or reading the importing host's dependencies or
+attempt store. This retains the existing self-attested trust model: verification
+proves the retained native observation at its recorded boundary; it cannot observe
+later attempts in another host's private store. Missing independently reconstructed
+resource bindings refuse applicability. Ordinary check bindings and freshness
+rules remain in force for every ordinary passing-check claim.

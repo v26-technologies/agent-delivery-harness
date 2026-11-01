@@ -368,6 +368,7 @@ export const PROTECTED_CLASSES: readonly ProtectedClass[] = [
   // Config delegates the finite resource grammar here; protect that edge rather
   // than allow resource acquisition or ambient reads into policy validation.
   { id: "kernel-installed-data", path: "packages/kernel/src/installed-data-resources.ts", kind: "file", rules: ["d1"], status: "present", d1Allowlist: ["digest.ts", "portable-limits.ts"] },
+  { id: "kernel-installed-data-evidence", path: "packages/kernel/src/installed-data-evidence.ts", kind: "file", rules: ["d1"], status: "present", d1Allowlist: ["digest.ts", "installed-data-resources.ts"] },
   { id: "kernel-portable-limits", path: "packages/kernel/src/portable-limits.ts", kind: "file", rules: ["d1"], status: "present", d1Allowlist: [] },
 ];
 
@@ -403,6 +404,7 @@ export const D1_KERNEL_ALLOWLIST: readonly string[] = [
   "blockers.ts",
   "config.ts",
   "context.ts",
+  "installed-data-evidence.ts",
 ];
 
 /** Packages the kernel must never import from (rule a). */

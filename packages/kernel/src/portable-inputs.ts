@@ -1,6 +1,7 @@
+import { reconstructResourceApplicability } from "./installed-data-portable.ts";
 import { scopedCheckIdentity, type ScopedRuntimeObservation } from "./scoped-inputs.ts";
 import { digestCanonical } from "./digest.ts";
-import type { ScopedCheckPlan, ScopedCheckAttempt } from "./records.types.ts";
+import type { ResourceApplicabilityBinding, ScopedCheckPlan, ScopedCheckAttempt } from "./records.types.ts";
 /** Capture verifier inputs from the selected tree, never a synthetic CI checkout. */
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -175,6 +176,7 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
   const preparationFingerprint = await computePreparationFingerprint(rootDir, config, { readWiring });
   const evidenceContext = await capturePortableEvidenceContext(config, read, preparationFingerprint, candidate.deliverable.digest);
   const compiledPolicy = await readCompiledRepositoryPolicy(read);
+  const resourceBindings: Record<string, ResourceApplicabilityBinding> = {};
   let scopedPlan: ScopedCheckPlan | undefined;
   let bindingCandidate = candidate;
   if (config.providers.some(p => p.check?.scope)) {
@@ -190,10 +192,39 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
     const listing = await run(["git", "ls-tree", "-r", "--name-only", "-z", candidate.treeSha], { cwd: rootDir });
     if (listing.exitCode !== 0) throw new BlockedError([portableBlocker("portable_tree_unreadable", "Cannot enumerate scoped source inputs.")]);
     const checks: Record<string, ScopedCheckPlan["checks"][string]> = {};
+    const trees = new Map<string, Promise<{ inventory: readonly string[]; read: CandidateTreeInputReader }>>();
+    trees.set(candidate.treeSha, Promise.resolve({ inventory: listing.stdout.split("\0").filter(Boolean), read: readSource }));
+    const sourceTree = (sha: string) => {
+      let found = trees.get(sha);
+      if (!found) {
+        found = (async () => {
+          const list = await run(["git", "ls-tree", "-r", "--name-only", "-z", sha], { cwd: rootDir });
+          if (list.exitCode !== 0) throw new Error("Retained resource source tree is unreadable.");
+          return { inventory: list.stdout.split("\0").filter(Boolean), read: await candidateTreeSourceReader(rootDir, sha, run) };
+        })();
+        trees.set(sha, found);
+      }
+      return found;
+    };
     for (const provider of scopedProviders) {
       const evidence = record.claims.flatMap(c => [...(c.evidence ? [c.evidence] : []), ...(c.supportingEvidence ?? [])]).find(e => e.resolution.kind === "evidence" && e.resolution.providerId === provider.id);
       const portable = evidence?.resolution.kind === "evidence" ? evidence.resolution.portable : undefined;
       const contents = portableArtifactContents(portable?.artifacts);
+      if (evidence?.resolution.kind === "evidence" && evidence.resolution.resourceBinding !== undefined) {
+        try {
+          const rawProof = contents.artifacts.get("resource-proof.json");
+          if (!rawProof) throw new Error("Missing resource provenance");
+          const reconstructed = await reconstructResourceApplicability(config, provider, bindingCandidate, JSON.parse(rawProof), sourceTree, read);
+          if (digestCanonical(reconstructed.binding) !== digestCanonical(evidence.resolution.resourceBinding)) throw new Error("Resource binding changed");
+          resourceBindings[provider.id] = reconstructed.binding;
+          const identity = await scopedCheckIdentity(config, provider, listing.stdout.split("\0").filter(Boolean), readSource, reconstructed.observation, bindingCandidate, read);
+          // A complete current plan deliberately has no fresh passed attempt.
+          checks[provider.id] = { inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, reusable: identity.reusable, attempts: [] };
+          continue;
+        } catch {
+          throw new BlockedError([portableBlocker("portable_resource_inputs_invalid", `Provider ${provider.id}: retained resource provenance does not match current source, consumer or policy.`)]);
+        }
+      }
       const raw = contents.artifacts.get("scoped-inputs.json");
       if (!raw) throw new BlockedError([portableBlocker("portable_scoped_inputs_missing", "Scoped execution requires retained input observations and its originating attempt.")]);
       let mismatch = "retained observation";
@@ -253,6 +284,6 @@ export async function capturePortableVerificationInputs(rootDir: string, config:
       computeDeliverableIdentity({ rootDir, treeSha, config: validationConfig }, { run })));
     waiverCandidateMatches = approved === target;
   }
-  return { evidenceContext, checkBindings, projection, ...(compiledPolicy === null ? {} : { compiledPolicy }),
+  return { evidenceContext, checkBindings, resourceBindings, projection, ...(compiledPolicy === null ? {} : { compiledPolicy }),
     ...(waiverCandidateMatches === undefined ? {} : { waiverCandidateMatches }) };
 }

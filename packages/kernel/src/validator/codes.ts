@@ -49,7 +49,7 @@ export const REVIEW_GREEN_2 = "review.green/2";
 export const SUPPORTED_ENVELOPE_SPECS: readonly string[] = Object.freeze([DELIVERY_EVIDENCE_1]);
 
 /** Payload specs the validator implements, whatever a config accepts (ENV-14). */
-export const SUPPORTED_PAYLOAD_SPECS: readonly string[] = Object.freeze([REVIEW_GREEN_1, REVIEW_GREEN_2, "checks.passed/1"]);
+export const SUPPORTED_PAYLOAD_SPECS: readonly string[] = Object.freeze([REVIEW_GREEN_1, REVIEW_GREEN_2, "checks.passed/1", "installed-data.applicable/1"]);
 
 /**
  * The one attestation level `delivery-evidence/1` fully specifies (§7). The

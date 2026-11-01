@@ -826,3 +826,21 @@ describe("linked worktrees", () => {
     expect(there.record.workspaceId).not.toBe(here.record.workspaceId);
   }, 60_000);
 });
+
+
+describe("installed data record grammar", () => {
+  const resourceBinding = { version: "installed-data-binding/1", candidateDigest: "a".repeat(64), definitionDigest: "b".repeat(64), declarationDigest: "c".repeat(64), sourceApplicabilityDigest: "d".repeat(64), captureDigest: "e".repeat(64), originDigest: "f".repeat(64) };
+  it("roundtrips the closed resource variant and rejects extra, missing and invalid binding members", async () => {
+    const root = tempDir("resource-record");
+    const input = { ...EVIDENCE, resolution: { ...RESOLUTION, resourceBinding } };
+    const saved = await publishRecord(root, input as PublishRecordInput, { storageRoot: root });
+    expect(saved.record.resolution).toEqual(input.resolution);
+    await expect(publishRecord(root, { ...input, resolution: { ...input.resolution, checkBinding: { definitionDigest: "a".repeat(64), validationDigest: "b".repeat(64), policyDigest: "c".repeat(64), wiringFingerprint: "d".repeat(64), outputsDigest: "e".repeat(64) } } } as PublishRecordInput, { storageRoot: root })).rejects.toThrow();
+    for (const binding of [{ ...resourceBinding, extra: true }, { ...resourceBinding, version: "unknown" }, ...Object.keys(resourceBinding).filter(key => key !== "version").flatMap(key => {
+      const missing = { ...resourceBinding } as Record<string, unknown>; delete missing[key];
+      return [missing, { ...resourceBinding, [key]: "bad" }];
+    })]) {
+      await expect(publishRecord(tempDir("bad-resource-record"), { ...input, resolution: { ...input.resolution, resourceBinding: binding } } as PublishRecordInput, { storageRoot: tempDir("bad-resource-store") })).rejects.toThrow();
+    }
+  });
+});

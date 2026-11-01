@@ -13,19 +13,20 @@ const exec = promisify(execFile), roots:string[]=[];
 afterEach(async()=>{vi.restoreAllMocks();await Promise.all(roots.splice(0).map(dir=>rm(dir,{recursive:true,force:true})));});
 const resourceContext:InstalledDataResourceContext={setupRecipeDigest:digestCanonical('setup'),dependencyDigest:digestCanonical('deps'),runtimeDigest:digestCanonical('node'),releaseDigest:digestCanonical('release'),policyDigest:digestCanonical('policy')};
 const request={version:'installed-package-data/1' as const,id:'font',issuer:'packages/app/font.test.ts',package:'@fonts/demo',manifest:'package.json' as const,files:['wght.css'],directories:[{path:'files',suffix:'-normal.woff2'}]};
-async function fixture(installed = false) {
+async function fixture(installed = false, applicability = false) {
   const dir=await mkdtemp(path.join(tmpdir(),'scoped-resource-cli-'));roots.push(dir);
   const git=async(...args:string[])=>(await exec('git',args,{cwd:dir})).stdout.trim();
   await git('init','-q');await git('config','user.name','Test');await git('config','user.email','test@example.invalid');
   await mkdir(path.join(dir,'packages/app'),{recursive:true});await writeFile(path.join(dir,request.issuer),'export {};\n');await writeFile(path.join(dir,'harness.config.ts'),'export default {};\n');
+  if(installed) await writeFile(path.join(dir,'data.fixture'),'font-css');
   await git('add','.');await git('-c','commit.gpgsign=false','commit','-qm','base');await git('branch','origin/main');
   const setupCount=path.join(dir,'.git/setup-count'),commandCount=path.join(dir,'.git/command-count');
-  const setup=`const fs=require('fs');const root='node_modules/@fonts/demo';fs.mkdirSync(root+'/files',{recursive:true});fs.writeFileSync(root+'/package.json',JSON.stringify({name:'@fonts/demo',exports:{'./package.json':'./package.json'}}));fs.writeFileSync(root+'/wght.css','font-css');fs.writeFileSync(root+'/files/a-normal.woff2',Buffer.from([0,255,1]));fs.appendFileSync(${JSON.stringify(setupCount)},${JSON.stringify('setup\n')});`;
-  const provider={id:'check.font',findingCodes:[],check:{command:[process.execPath,'-e',`const fs=require('fs');fs.appendFileSync(${JSON.stringify(commandCount)},${JSON.stringify('command\n')});fs.writeFileSync('result.json','{}');`],timeoutMs:5000,outputs:['result.json'],scope:{version:'scoped-check/1',files:[request.issuer],memberships:[],tests:installed?[request.issuer]:[],cwd:'.',profile:'fixture',environment:[]},...(installed?{installedData:{version:'installed-data-consumer/1',consumerId:'font',requests:[request],source:{version:'scoped-check/1',files:[request.issuer],memberships:[],tests:[request.issuer],cwd:'.',profile:'fixture',environment:[]},guards:{[request.issuer]:sha256Hex('export {};\n')}}}:{})}};
-  const config=defineHarnessConfig({...base,preparationWiringPaths:['harness.config.ts'],preparationCommands:[],providers:[provider],obligations:[{...base.obligations[0]!,id:'font.passed',activation:{kind:'always'},providers:[provider.id],acceptedPayloadSpecs:['checks.passed/1'],humanWaiverAllowed:false,allowedResolutionKinds:['satisfied_evidence']}],scopedExecution:{version:'scoped-execution/1',mechanicalProviders:installed?[]:[provider.id],profiles:[{id:'fixture',gitContext:'full',dependencyInputs:[],mutableOutputs:['result.json'],credentialIdentities:{},dependencies:{command:[process.execPath,'-e',setup],timeoutMs:5000}}]}} as unknown as HarnessConfigInput);
-  const artifacts=path.join(dir,'.git/artifacts');await mkdir(artifacts);const errors:string[]=[];
-  const runtime:CliRuntime={cwd:dir,env:{PATH:process.env['PATH']!},stdinIsTTY:false,stdoutIsTTY:false,stdout:()=>{},stderr:s=>errors.push(s),loadConfig:async()=>config,artifacts:createArtifactsPort({runRootBase:artifacts})};
-  return {dir,git,config,runtime,errors,setupCount,commandCount};
+  const setup=`const fs=require('fs');const root='node_modules/@fonts/demo';fs.mkdirSync(root+'/files',{recursive:true});fs.writeFileSync(root+'/package.json',JSON.stringify({name:'@fonts/demo',exports:{'./package.json':'./package.json'}}));fs.writeFileSync(root+'/wght.css',fs.existsSync('data.fixture')?fs.readFileSync('data.fixture'):'font-css');fs.writeFileSync(root+'/files/a-normal.woff2',Buffer.from([0,255,1]));fs.appendFileSync(${JSON.stringify(setupCount)},${JSON.stringify('setup\n')});`;
+  const provider={id:'check.font',findingCodes:[],check:{command:[process.execPath,'-e',`const fs=require('fs');fs.appendFileSync(${JSON.stringify(commandCount)},${JSON.stringify('command\n')});fs.writeFileSync('result.json','{}');`],timeoutMs:5000,outputs:['result.json'],scope:{version:'scoped-check/1',files:installed?[request.issuer,'data.fixture']:[request.issuer],memberships:[],tests:installed?[request.issuer]:[],cwd:'.',profile:'fixture',environment:[]},...(installed?{installedData:{version:'installed-data-consumer/1',consumerId:'font',requests:[request],source:{version:'scoped-check/1',files:installed?[request.issuer,'data.fixture']:[request.issuer],memberships:[],tests:[request.issuer],cwd:'.',profile:'fixture',environment:[]},guards:{[request.issuer]:sha256Hex('export {};\n')}}}:{})}};
+  const config=defineHarnessConfig({...base,preparationWiringPaths:['harness.config.ts'],preparationCommands:[],providers:[provider],obligations:[{...base.obligations[0]!,id:'font.passed',activation:{kind:'always'},providers:[provider.id],acceptedPayloadSpecs:applicability?['checks.passed/1','installed-data.applicable/1']:['checks.passed/1'],humanWaiverAllowed:false,allowedResolutionKinds:['satisfied_evidence']}],scopedExecution:{version:'scoped-execution/1',mechanicalProviders:installed?[]:[provider.id],profiles:[{id:'fixture',gitContext:'full',dependencyInputs:[],mutableOutputs:['result.json'],credentialIdentities:{},dependencies:{command:[process.execPath,'-e',setup],timeoutMs:5000}}]}} as unknown as HarnessConfigInput);
+  const artifacts=path.join(dir,'.git/artifacts');await mkdir(artifacts);const errors:string[]=[],messages:string[]=[];
+  const runtime:CliRuntime={cwd:dir,env:{PATH:process.env['PATH']!},stdinIsTTY:false,stdoutIsTTY:false,stdout:s=>messages.push(s),stderr:s=>errors.push(s),loadConfig:async()=>config,artifacts:createArtifactsPort({runRootBase:artifacts})};
+  return {dir,git,config,runtime,errors,messages,setupCount,commandCount};
 }
 async function duringCreation(hook:(session:ScopedChecks)=>Promise<void>) {
   const create=ScopedChecks.create;let hookFailure:unknown;
@@ -37,6 +38,83 @@ async function duringCreation(hook:(session:ScopedChecks)=>Promise<void>) {
   return ()=>{if(hookFailure)throw hookFailure;};
 }
 describe('native scoped installed resources',()=>{
+  it('native gate emits applicability after unrelated HEAD without a fresh passed attempt or consumer command',async()=>{
+    const f=await fixture(true,true);
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    await expect(access(f.setupCount)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    await writeFile(path.join(f.dir,'helper.ts'),'export const unrelated = 1;');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated helper');
+    const countsBefore=await readFile(f.setupCount,'utf8');
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe(countsBefore);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    const terminals=(await readdir(path.join(f.dir,'.git'),{recursive:true})).filter(p=>p.endsWith('terminal.json'));
+    expect(terminals).toHaveLength(1);
+    expect(f.messages.some(s=>s.includes('consumer command omitted'))).toBe(true);
+    const manifests=(await readdir(path.join(f.dir,'.git/artifacts'),{recursive:true})).filter(p=>p.endsWith('manifest.json'));
+    const outcomes=await Promise.all(manifests.map(p=>readFile(path.join(f.dir,'.git/artifacts',p),'utf8').then(JSON.parse)));
+    expect(outcomes.some(m=>m.claims?.some((c:{payloadSpec:string})=>c.payloadSpec==='installed-data.applicable/1'))).toBe(true);
+    const transitions=[];
+    transitions.push({row:'root-helper',head:await f.git('rev-parse','HEAD'),tree:await f.git('rev-parse','HEAD^{tree}'),commands:(await readFile(f.commandCount,'utf8')).trim().split('\n').length});
+    for (const [row,file] of [['root-test-only','unrelated.test.ts'],['docs-only','unrelated.md']]) {
+      await writeFile(path.join(f.dir,file!),'unrelated source');await f.git('add',file!);await f.git('-c','commit.gpgsign=false','commit','-qm',row!);
+      const beforePreparation=await readFile(f.setupCount,'utf8');
+      expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+      expect(await readFile(f.setupCount,'utf8')).toBe(beforePreparation);
+      expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+      expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+      transitions.push({row,head:await f.git('rev-parse','HEAD'),tree:await f.git('rev-parse','HEAD^{tree}'),commands:1});
+    }
+    expect(await runCli(['record'],f.runtime),f.errors.join('\n')).toBe(0);
+    const beforeVerify=await readFile(f.setupCount,'utf8');
+    expect(await runCli(['verify'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe(beforeVerify);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    // DATA drift changes actual installed bytes without repinning executable guards.
+    await writeFile(path.join(f.dir,'data.fixture'),'changed font DATA');await f.git('add','data.fixture');await f.git('-c','commit.gpgsign=false','commit','-qm','changed resource DATA');
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\ncommand\n');
+    process.stdout.write(JSON.stringify({fixture:'native installed DATA gate/portable/restoration',transitions,restoredConsumerCommands:2,verificationAddedSetup:false,wholeCheckAttemptSynthesized:false})+'\n');
+
+  },120000);
+  it('same-candidate applicability record refresh reuses accepted capture without another setup',async()=>{
+    const f=await fixture(true,true);
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    await writeFile(path.join(f.dir,'unrelated.md'),'prose');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    const setups=await readFile(f.setupCount,'utf8');
+    expect(await runCli(['record'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe(setups);
+    expect(await runCli(['verify'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe(setups);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    await f.git('add','delivery');await f.git('-c','commit.gpgsign=false','commit','-qm','record transport');
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['verify'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe(setups);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+  },60000);
+  it('parallel gate keeps cold resource execution on its capture worker and shares setup with the first check',async()=>{
+    const f=await fixture(true,true),font=f.config.providers[0]!;
+    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e','setTimeout(()=>{},80)'],timeoutMs:5000,scope:font.check!.scope}};
+    const config=defineHarnessConfig({...f.config,providers:[peer,font],obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],scopedExecution:{...f.config.scopedExecution!,concurrency:2}});
+    const runtime={...f.runtime,loadConfig:async()=>config};
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe('setup\n');
+    await writeFile(path.join(f.dir,'parallel-unrelated.md'),'prose');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    expect(await readFile(f.setupCount,'utf8')).toBe('setup\nsetup\n');
+    expect(f.messages.some(s=>s.includes('consumer command omitted'))).toBe(true);
+  },60000);
   it('seeds only an actual passing native consumer and matches DATA across an unrelated commit while the whole check stays stale',async()=>{
     const f=await fixture(true);let originalInput:string|undefined;
     let verifyHook=await duringCreation(async session=>{

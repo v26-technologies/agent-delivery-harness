@@ -1240,3 +1240,10 @@ export {
 } from "./installed-data-resources.ts";
 
 export { isInstalledDataConsumerDefinition, type InstalledDataConsumerDefinition } from "./config.ts";
+
+export { isResourceApplicabilityBinding, validateResourceApplicabilityBinding, createResourceApplicabilityBinding } from "./installed-data-evidence.ts";
+export { captureInstalledDataBinding, InstalledDataSourceError, type InstalledDataSourceTree } from "./installed-data-source.ts";
+
+export type { ResourceApplicabilityBinding } from "./records.types.ts";
+
+export { reconstructResourceApplicability } from "./installed-data-portable.ts";

@@ -40,8 +40,8 @@ describe("envelope and payload spec tokens", () => {
     expect(REVIEW_GREEN_1).toBe("review.green/1");
     expect(REVIEW_GREEN_2).toBe("review.green/2");
     expect([...SUPPORTED_ENVELOPE_SPECS]).toEqual(["delivery-evidence/1"]);
-    // V26-1846 adds declared check evidence; historical review tokens retain their meaning.
-    expect([...SUPPORTED_PAYLOAD_SPECS]).toEqual(["review.green/1", "review.green/2", "checks.passed/1"]);
+    // V26-3028 adds opt-in resource applicability; existing execution/review tokens retain their meaning.
+    expect([...SUPPORTED_PAYLOAD_SPECS]).toEqual(["review.green/1", "review.green/2", "checks.passed/1", "installed-data.applicable/1"]);
     expect(DELIVERY_RECORD_VERSION).toBe("delivery-record/2");
   });
 });

@@ -1187,7 +1187,7 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
   if (resourceProviders.length > 1) findings.add("config_invalid_member", "providers", "installed data v1 supports one resource provider and setup");
   for (const provider of resourceProviders) {
     if (!isScopedExecution(scopedExecution) || scopedExecution.mechanicalProviders.includes(provider.id)) findings.add("config_invalid_member", "scopedExecution", "installed data requires a configured non-mechanical resource provider");
-    for (const obligation of obligations ?? []) if (obligation.providers.includes(provider.id) && (obligation.freshness !== "exact_candidate" || obligation.acceptedPayloadSpecs.length !== 1 || obligation.acceptedPayloadSpecs[0] !== "checks.passed/1")) findings.add("config_invalid_member", "obligations", "installed data providers support only exact-candidate checks.passed obligations");
+
   }
 
   const deliveryRecordPath =
@@ -1433,9 +1433,11 @@ function checkInvariants(findings: FindingList, config: HarnessConfig): void {
         findings.add("config_dangling_provider", `${at}.providers`, `names ${JSON.stringify(providerId)}, which no provider registration declares`);
       }
     }
-    if (obligation.providers.some(id => config.providers.find(provider => provider.id === id)?.check !== undefined) &&
-        (obligation.freshness !== "exact_candidate" || obligation.acceptedPayloadSpecs.length !== 1 || obligation.acceptedPayloadSpecs[0] !== "checks.passed/1")) {
-      findings.add("config_invalid_member", at, "declared checks require exact_candidate freshness and only checks.passed/1 payloads");
+    const checkProviders = obligation.providers.map(id => config.providers.find(provider => provider.id === id)).filter(provider => provider?.check !== undefined);
+    const permitsApplicability = obligation.providers.length > 0 && obligation.providers.every(id => config.providers.find(provider => provider.id === id)?.check?.installedData !== undefined);
+    if ((checkProviders.length > 0 && (obligation.freshness !== "exact_candidate" || new Set(obligation.acceptedPayloadSpecs).size !== obligation.acceptedPayloadSpecs.length || !obligation.acceptedPayloadSpecs.includes("checks.passed/1") || obligation.acceptedPayloadSpecs.some(spec => spec !== "checks.passed/1" && !(permitsApplicability && spec === "installed-data.applicable/1")))) ||
+        (obligation.acceptedPayloadSpecs.includes("installed-data.applicable/1") && !permitsApplicability)) {
+      findings.add("config_invalid_member", at, "declared checks require exact_candidate freshness, checks.passed fallback, and applicability only for opted-in installed-data consumers");
     }
     for (const groupId of obligation.activation.sensitiveGroupIds ?? []) {
       if (!sensitiveGroupIds.has(groupId)) {

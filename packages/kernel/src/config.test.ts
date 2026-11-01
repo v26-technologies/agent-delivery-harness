@@ -1103,3 +1103,12 @@ it('installed consumer rejects multiple resource providers mechanical preparatio
   expectOnly({...input,scopedExecution:{...input.scopedExecution,mechanicalProviders:['check.font']}},'config_invalid_member');
   for(const patch of [{freshness:'live'},{acceptedPayloadSpecs:['review.green/1']},{acceptedPayloadSpecs:['checks.passed/1','review.green/1']}])expectOnly({...input,obligations:[{...input.obligations[0]!,...patch}]},'config_invalid_member');
 });
+
+it('installed consumer applicability protocol requires cold checks fallback and rejects ordinary providers',()=>{
+ const input=installedConsumerInput();const specs=['checks.passed/1','installed-data.applicable/1'];
+ expect(define({...input,obligations:[{...input.obligations[0]!,acceptedPayloadSpecs:specs}]}).obligations[0]?.acceptedPayloadSpecs).toEqual(specs);
+ expectOnly({...input,obligations:[{...input.obligations[0]!,acceptedPayloadSpecs:['installed-data.applicable/1']}]},'config_invalid_member');
+ const {installedData,...check}=input.providers[0]!.check;
+ expectOnly({...input,providers:[{...input.providers[0]!,check}],obligations:[{...input.obligations[0]!,acceptedPayloadSpecs:specs}]},'config_invalid_member');
+ expect(codesFor({...input,providers:[{...input.providers[0]!,check}],obligations:[{...input.obligations[0]!,acceptedPayloadSpecs:['checks.passed/1','checks.passed/1']}]})).toEqual(expect.arrayContaining(['config_invalid_member','config_duplicate_id']));
+});

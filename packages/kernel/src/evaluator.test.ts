@@ -1299,3 +1299,32 @@ describe("the gate decision", () => {
     expect(decision.blockers).toEqual([]);
   });
 });
+
+
+describe("installed data applicability records", () => {
+  const resourceBinding = { version: "installed-data-binding/1" as const, candidateDigest: "a".repeat(64), definitionDigest: "b".repeat(64), declarationDigest: "c".repeat(64), sourceApplicabilityDigest: "d".repeat(64), captureDigest: "e".repeat(64), originDigest: "f".repeat(64) };
+  const check = { command: ["test"] as [string], timeoutMs: 1000, scope: { version: "scoped-check/1" as const, files: ["src/app.ts"], memberships: [], tests: [], cwd: ".", profile: "local", environment: [] } };
+  function fixture(spec = "installed-data.applicable/1") {
+    const original = testConfig();
+    const config = { ...original, providers: [{ id: "review.provider", findingCodes: ["review-incomplete"], check }], obligations: [{ ...obligation(), acceptedPayloadSpecs: [spec] }] };
+    const base = evidence();
+    if (base.resolution.kind !== "evidence") throw Error("fixture");
+    return { config, record: { ...base, resolution: { ...base.resolution, resourceBinding } } };
+  }
+  it("requires current resource authority independently of ordinary check bindings", () => {
+    const { config, record } = fixture();
+    expect(evaluate({ config, records: [record], resourceBindings: { "review.provider": resourceBinding } }).admitted).toBe(true);
+    expect(evaluate({ config, records: [record] }).admitted).toBe(false);
+    for (const key of Object.keys(resourceBinding).filter(key => key !== "version")) {
+      expect(evaluate({ config, records: [record], resourceBindings: { "review.provider": { ...resourceBinding, [key]: "0".repeat(64) } } }).admitted, key).toBe(false);
+    }
+  });
+  it("never transports resource evidence across candidate movement or substitutes it for check success", () => {
+    const { config, record } = fixture();
+    const moved = { ...record, candidateBinding: { ...record.candidateBinding, deliverableDigest: "0".repeat(64) } };
+    expect(evaluate({ config, records: [moved], resourceBindings: { "review.provider": resourceBinding } }).admitted).toBe(false);
+    expect(evaluate({ config: fixture("checks.passed/1").config, records: [record], resourceBindings: { "review.provider": resourceBinding } }).admitted).toBe(false);
+    const ordinary = { ...record, resolution: { ...record.resolution, resourceBinding: undefined, checkBinding: { definitionDigest: "a".repeat(64), validationDigest: "b".repeat(64), policyDigest: "c".repeat(64), wiringFingerprint: "d".repeat(64), outputsDigest: "e".repeat(64) } } };
+    expect(evaluate({ config, records: [ordinary], checkBindings: { "review.provider": ordinary.resolution.checkBinding }, resourceBindings: { "review.provider": resourceBinding } }).admitted).toBe(false);
+  });
+});

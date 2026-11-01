@@ -993,3 +993,19 @@ describe("the entry guard", () => {
     }
   }, 30_000);
 });
+
+
+describe("installed data applicability purity",()=>{
+ it("allows only the pure applicability evidence edge from validators",()=>{
+  expect(scan({"packages/kernel/src/installed-data-evidence.ts":"export const binding = 1;\n","packages/kernel/src/validator/envelope.ts":"import { binding } from '../installed-data-evidence.ts'; export const validate = () => binding;\n"})).toEqual([]);
+ });
+ it("refuses ambient filesystem in the applicability evidence helper",()=>{
+  expectFalsified("d1-kernel-purity",{"packages/kernel/src/installed-data-evidence.ts":"import { readFileSync } from 'node:fs'; export const binding = readFileSync('data');\n"},"packages/kernel/src/installed-data-evidence.ts");
+ });
+ it("refuses executable source capture imports from applicability evidence or validators",()=>{
+  for(const file of ["packages/kernel/src/installed-data-evidence.ts","packages/kernel/src/validator/envelope.ts"]){
+   const module=file.includes('/validator/')?'../installed-data-source.ts':'./installed-data-source.ts';
+   expectFalsified("d1-kernel-purity",{[file]:`import { captureInstalledDataBinding } from '${module}'; export const binding = captureInstalledDataBinding;\n`},file);
+  }
+ });
+});

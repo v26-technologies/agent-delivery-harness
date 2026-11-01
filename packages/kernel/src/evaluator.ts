@@ -224,6 +224,7 @@ export type ObligationResolution =
   | BlockedResolution;
 
 export interface EvaluateGateInput {
+  readonly resourceBindings?: Readonly<Record<string, import("./records.types.ts").ResourceApplicabilityBinding>>;
   readonly checkBindings?: Readonly<Record<string, import("./records.types.ts").CheckBinding>>;
   readonly config: HarnessConfig;
   readonly candidate: CandidateBinding;
@@ -574,7 +575,7 @@ function scanEvidence(input: EvaluateGateInput, obligation: ObligationPolicy): E
     }
     const check = input.config.providers.find(provider => provider.id === providerId)?.check;
     const expectedScoped = input.checkBindings?.[providerId];
-    const scoped = check?.scope !== undefined && expectedScoped?.scopedInputDigest !== undefined && record.resolution.checkBinding?.scopedInputDigest !== undefined &&
+    const scoped = record.resolution.resourceBinding === undefined && check?.scope !== undefined && expectedScoped?.scopedInputDigest !== undefined && record.resolution.checkBinding?.scopedInputDigest !== undefined &&
       record.candidateBinding.workspaceId === input.candidate.workspaceId && record.candidateBinding.identityToken === input.candidate.deliverable.identity;
     if (!scoped && !isRecordFreshForCandidate(input.config, record.candidateBinding, input.candidate)) {
       invalid.push(
@@ -585,7 +586,13 @@ function scanEvidence(input: EvaluateGateInput, obligation: ObligationPolicy): E
       );
       continue;
     }
-    if (input.config.providers.find(provider => provider.id === providerId)?.check !== undefined) {
+    if (record.resolution.resourceBinding !== undefined) {
+      const expected = input.resourceBindings?.[providerId];
+      if (!obligation.acceptedPayloadSpecs.includes("installed-data.applicable/1") || record.resolution.checkBinding !== undefined ||
+          expected === undefined || digestCanonical(expected) !== digestCanonical(record.resolution.resourceBinding)) continue;
+    } else if (obligation.acceptedPayloadSpecs.every(spec => spec === "installed-data.applicable/1")) {
+      continue;
+    } else if (input.config.providers.find(provider => provider.id === providerId)?.check !== undefined) {
       const expected = input.checkBindings?.[providerId];
       if (expected === undefined || record.resolution.checkBinding === undefined ||
           digestCanonical(expected) !== digestCanonical(record.resolution.checkBinding)) continue;
