@@ -33,6 +33,7 @@ import {
   deriveDeliveryRecordPath,
   emittableFindingCodes,
   matchesNeutralSet,
+  isInstalledDataConsumerDefinition,
   validateHarnessConfig,
   type HarnessConfig,
   type HarnessConfigInput,
@@ -1078,4 +1079,27 @@ it("rejects dependency namespace mutable outputs in scoped profiles", () => {
     expectOnly(invalid, "config_invalid_member");
     expect(() => define(invalid)).toThrow(BlockedError);
   }
+});
+
+function installedConsumerInput() {
+  const source={version:'scoped-check/1',files:['reader.ts'],tests:['font.test.ts'],memberships:[],cwd:'.',profile:'fixture',environment:[]};
+  const installedData={version:'installed-data-consumer/1',consumerId:'font',requests:[{version:'installed-package-data/1',id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json',files:['font.woff2'],directories:[]}],source,guards:{'reader.ts':'a'.repeat(64),'font.test.ts':'b'.repeat(64)}};
+  const base=validInput();return {...base,providers:[{id:'check.font',findingCodes:[PROVIDER_CODE],check:{command:['node','test.js'],timeoutMs:5000,scope:source,installedData}}],obligations:[{...base.obligations[0]!,id:'font.passed',providers:['check.font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1']}],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'fixture',gitContext:'full',dependencyInputs:[],mutableOutputs:[],credentialIdentities:{}}],mechanicalProviders:[] as string[]}};
+}
+it('installed consumer accepts one guarded scoped declaration and preserves field-absent legacy',()=>{
+  const input=installedConsumerInput();expect(isInstalledDataConsumerDefinition(input.providers[0]!.check.installedData)).toBe(true);expect(validateHarnessConfig(input),JSON.stringify(validateHarnessConfig(input))).toMatchObject({ok:true});expect(define(input).providers[0]?.check).toHaveProperty('installedData',input.providers[0]!.check.installedData);
+  const provider=input.providers[0]!;
+  const withData={...provider.check.installedData,source:{...provider.check.installedData.source,files:[...provider.check.installedData.source.files,'assets/cedi.woff2']}};
+  expect(define({...input,providers:[{...provider,check:{...provider.check,installedData:withData}}]}).providers[0]?.check?.installedData?.source.files).toContain('assets/cedi.woff2');
+  const {installedData,...check}=input.providers[0]!.check;expect(define({...input,providers:[{...input.providers[0]!,check}]}).providers[0]?.check).not.toHaveProperty('installedData');
+});
+it('installed consumer rejects malformed borrowed unguarded and mismatched declarations',()=>{
+  const input=installedConsumerInput();const provider=input.providers[0]!,declaration=provider.check.installedData;
+  for(const patch of [{version:'unknown'},{consumerId:'x'.repeat(129)},{extra:true},{guards:{}},{guards:{...declaration.guards,'other.ts':'a'.repeat(64)}},{guards:{'reader.ts':'a'.repeat(64)}},{guards:{...declaration.guards,'reader.ts':'BAD'}},{requests:[{...declaration.requests[0]!,issuer:'other.test.ts'}]},{requests:[{...declaration.requests[0]!,files:['../outside']}]},{source:{...declaration.source,profile:'other'}},{source:{...declaration.source,cwd:'app'}},{source:{...declaration.source,environment:[{name:'FLAG',kind:'flag'}]}}])expectOnly({...input,providers:[{...provider,check:{...provider.check,installedData:{...declaration,...patch}}}]},'config_invalid_member');
+  const {scope,...check}=provider.check;expectOnly({...input,providers:[{...provider,check}]},'config_invalid_member');
+});
+it('installed consumer rejects multiple resource providers mechanical preparation and live review obligations',()=>{
+  const input=installedConsumerInput();expectOnly({...input,providers:[...input.providers,{...input.providers[0]!,id:'check.second'}]},'config_invalid_member');
+  expectOnly({...input,scopedExecution:{...input.scopedExecution,mechanicalProviders:['check.font']}},'config_invalid_member');
+  for(const patch of [{freshness:'live'},{acceptedPayloadSpecs:['review.green/1']},{acceptedPayloadSpecs:['checks.passed/1','review.green/1']}])expectOnly({...input,obligations:[{...input.obligations[0]!,...patch}]},'config_invalid_member');
 });

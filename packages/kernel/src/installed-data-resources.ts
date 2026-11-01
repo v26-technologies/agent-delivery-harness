@@ -260,16 +260,21 @@ export function createResourceApplicabilityProjection(input: ProjectionInput): R
   if (Buffer.byteLength(JSON.stringify(projection)) > INSTALLED_DATA_LIMITS.serializedBytes) fail("installed_data_limit_exceeded", "Applicability projection exceeds artifact size limit.");
   return projection;
 }
+/** Closed portable validation only; native origin attestation remains the host's job. */
+export function validateResourceApplicabilityProjection(value: unknown): ResourceApplicabilityProjection {
+  if (!keys(value, ["version", "origin", "consumerId", "declarationDigest", "sourceApplicabilityDigest", "capture", "digest"]) || value.version !== "resource-applicability/1") fail("installed_data_capture_invalid", "Malformed resource applicability projection.");
+  const { version: _version, digest, ...input } = value;
+  const validated = createResourceApplicabilityProjection(input as unknown as ProjectionInput);
+  if (validated.digest !== digest) fail("installed_data_capture_invalid", "Resource applicability digest mismatch.");
+  return validated;
+}
 /** Equality is only resource/source applicability, NEVER passing check evidence.
  * Native caller attests the store and source applicability; these pure functions
  * cannot authenticate self-authored JSON or establish setup ownership.
  */
 export function matchResourceApplicabilityProjection(projection: unknown, current: ResourceApplicabilityCurrent): { applicable: boolean; reasons: string[] } {
   try {
-    if (!keys(projection, ["version", "origin", "consumerId", "declarationDigest", "sourceApplicabilityDigest", "capture", "digest"]) || projection.version !== "resource-applicability/1") fail("installed_data_capture_invalid", "Malformed resource applicability projection.");
-    const { version: _version, digest, ...input } = projection;
-    const validated = createResourceApplicabilityProjection(input as unknown as ProjectionInput);
-    if (validated.digest !== digest) fail("installed_data_capture_invalid", "Resource applicability digest mismatch.");
+    const validated = validateResourceApplicabilityProjection(projection);
     validateOrigin(current.originAttempt);
     if (digestCanonical(current.originAttempt) !== digestCanonical(validated.origin)) return { applicable: false, reasons: ["installed_data_origin_changed"] };
     const capture = validateInstalledDataResourceCapture(current.capture);

@@ -43,7 +43,7 @@ export async function scopedCheckIdentity(config: HarnessConfig, provider: Provi
     credentialIdentities: Object.fromEntries(credentials.filter(name => profile.credentialIdentities[name] !== undefined).map(name => [name, profile.credentialIdentities[name]])) };
   // The executor injects Git base context, so even unchanged source can execute
   // differently after the base moves. Recompute this from the selected candidate.
-  const runtimeDigest = digestCanonical({ runtime: observation.runtimeDigest, base: candidate.base, ...(profile.gitContext === "none" ? {} : { headSha: candidate.headSha, treeSha: candidate.treeSha }) });
+  const runtimeDigest = digestCanonical({ runtime: observation.runtimeDigest, base: candidate.base, ...(profile.gitContext === "none" ? {} : { headSha: candidate.headSha, treeSha: candidate.treeSha }), ...(provider.check?.installedData ? { installedData: provider.check.installedData } : {}) });
   const profileDigest = digestCanonical({ profile: relevantProfile, runtimeDigest, dependencyDigest, releaseDigest, policyDigest });
   const capture = await captureScopedCheckInputs(scope, { listFiles: async () => inventory.filter(file => file !== output), readFile: read, readMetadata: read.metadata, command: provider.check!.command, timeoutMs: provider.check!.timeoutMs,
     runtimeDigest, dependencyDigest, releaseDigest, policyDigest, environment, credentialIdentity: name => observation.credentials[name]?.identity ?? null });

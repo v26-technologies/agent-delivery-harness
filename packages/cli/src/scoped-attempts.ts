@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { digestCanonical, type ScopedCheckAttempt } from "@agent-delivery-harness/kernel";
+import { digestCanonical, validateResourceApplicabilityProjection, type ResourceApplicabilityProjection, type ScopedCheckAttempt } from "@agent-delivery-harness/kernel";
 import { CheckSnapshotError } from "./check-snapshot.ts";
 import type { RecordedScopedAttemptDiagnostic } from "./scoped-diagnostics.ts";
 export interface AttemptPayload {
@@ -11,9 +11,27 @@ export interface AttemptPayload {
   readonly dependencyDigest?: string;
   readonly log?: string;
   readonly diagnostic?: RecordedScopedAttemptDiagnostic;
+  /** Native successful origin binding is checked before retention and on every load. */
+  readonly resourceApplicability?: ResourceApplicabilityProjection;
 }
-export interface StoredAttempt { readonly attempt: ScopedCheckAttempt; readonly payload?: AttemptPayload }
+export interface StoredAttempt { readonly attempt: ScopedCheckAttempt; readonly payload?: AttemptPayload; readonly executionHeadSha?: string }
 const corrupt = () => new CheckSnapshotError("check_attempt_corrupt", "Scoped check attempt history is missing, corrupt or inconsistent.");
+const gitSha = (value: unknown): value is string => typeof value === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
+/** Shape validation alone is not authority: bind to the native running allocation. */
+function validateResourceOrigin(row: StoredAttempt): void {
+  if (row.executionHeadSha !== undefined && !gitSha(row.executionHeadSha)) throw corrupt();
+  const resource = row.payload?.resourceApplicability;
+  if (resource === undefined) return;
+  if (row.attempt.status !== "passed" || !row.executionHeadSha) throw corrupt();
+  try {
+    const projection = validateResourceApplicabilityProjection(resource);
+    const attempt = row.attempt;
+    const origin = { providerId: attempt.providerId, runId: attempt.origin.runId, attemptId: attempt.attemptId,
+      generation: attempt.generation, inputDigest: attempt.inputDigest, profileDigest: attempt.profileDigest,
+      source: { headSha: row.executionHeadSha, treeSha: attempt.origin.candidate.treeSha }, status: "passed", superseded: false };
+    if (digestCanonical(projection.origin) !== digestCanonical(origin)) throw corrupt();
+  } catch { throw corrupt(); }
+}
 export class AttemptStore {
   readonly root: string;
   constructor(root: string) { this.root = root; }
@@ -24,7 +42,8 @@ export class AttemptStore {
     if (names.some(n => !/^[1-9][0-9]*$/.test(n) || !Number.isSafeInteger(Number(n)))) throw corrupt();
     return names.map(Number).sort((a, b) => a - b);
   }
-  async allocate(input: Omit<ScopedCheckAttempt, "attemptId" | "generation" | "status">): Promise<ScopedCheckAttempt> {
+  async allocate(input: Omit<ScopedCheckAttempt, "attemptId" | "generation" | "status">, options: { readonly executionHeadSha?: string } = {}): Promise<ScopedCheckAttempt> {
+    if (options.executionHeadSha !== undefined && !gitSha(options.executionHeadSha)) throw corrupt();
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     let generation = Math.max(0, ...await this.generations()) + 1;
     for (;;) {
@@ -32,7 +51,7 @@ export class AttemptStore {
       try { await mkdir(dir, { mode: 0o700 }); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") { generation++; continue; } throw error; }
       const attempt: ScopedCheckAttempt = { ...input, generation, attemptId: randomUUID(), status: "running" };
-      await this.publish(path.join(dir, "running.json"), { attempt });
+      await this.publish(path.join(dir, "running.json"), { attempt, ...(options.executionHeadSha !== undefined ? { executionHeadSha: options.executionHeadSha } : {}) });
       return attempt;
     }
   }
@@ -47,9 +66,12 @@ export class AttemptStore {
   }
   async finish(attempt: ScopedCheckAttempt, status: "passed" | "failed" | "interrupted", payload: AttemptPayload): Promise<void> {
     const rows = await this.read();
-    const running = rows.find(row => row.attempt.generation === attempt.generation)?.attempt;
-    if (running?.status !== "running" || digestCanonical(running) !== digestCanonical(attempt)) throw corrupt();
-    await this.publish(this.terminalPath(attempt), { attempt: { ...attempt, status }, payload });
+    const running = rows.find(row => row.attempt.generation === attempt.generation);
+    if (running?.attempt.status !== "running" || digestCanonical(running.attempt) !== digestCanonical(attempt)) throw corrupt();
+    const terminal: StoredAttempt = { attempt: { ...attempt, status }, payload,
+      ...(running.executionHeadSha !== undefined ? { executionHeadSha: running.executionHeadSha } : {}) };
+    validateResourceOrigin(terminal);
+    await this.publish(this.terminalPath(attempt), terminal);
   }
   terminalPath(attempt: ScopedCheckAttempt): string { return path.join(this.root, String(attempt.generation), "terminal.json"); }
   private async load(file: string): Promise<StoredAttempt> {
@@ -66,6 +88,7 @@ export class AttemptStore {
         !candidate || ![candidate.treeSha, candidate.deliverableDigest, candidate.identityToken, candidate.baseRef,
           candidate.baseTipSha, candidate.mergeBaseSha, candidate.workspaceId].every(nonempty)) throw corrupt();
     if (row.payload?.durationMs !== undefined && (typeof row.payload.durationMs !== "number" || !Number.isFinite(row.payload.durationMs) || row.payload.durationMs < 0)) throw corrupt();
+    validateResourceOrigin(row);
     return row;
   }
   async read(): Promise<StoredAttempt[]> {
@@ -78,7 +101,7 @@ export class AttemptStore {
         let terminal: StoredAttempt | undefined;
         try { terminal = await this.load(path.join(dir, "terminal.json")); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        if (terminal && (terminal.attempt.status === "running" || digestCanonical({ ...terminal.attempt, status: "running" }) !== digestCanonical(start.attempt))) throw corrupt();
+        if (terminal && (terminal.executionHeadSha !== start.executionHeadSha || terminal.attempt.status === "running" || digestCanonical({ ...terminal.attempt, status: "running" }) !== digestCanonical(start.attempt))) throw corrupt();
         rows.push(terminal ?? start);
       }
       return rows;

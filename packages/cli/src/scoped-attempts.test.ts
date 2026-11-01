@@ -46,3 +46,86 @@ it.each(["version", "providerId", "attemptId", "generation", "inputDigest", "pro
   row.digest = digestCanonical(row.entry); await writeFile(file, JSON.stringify(row));
   await expect(store.read()).rejects.toMatchObject({ code: "check_attempt_corrupt" });
 });
+
+const executionHeadSha = "d".repeat(40);
+async function projectionFor(attempt:ScopedCheckAttempt) {
+  const { captureInstalledDataResources, createResourceApplicabilityProjection, digestCanonical } = await import("@agent-delivery-harness/kernel");
+  const bytes=new TextEncoder().encode('{}');
+  const capture=await captureInstalledDataResources([{version:'installed-package-data/1',id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json',files:['font.woff2'],directories:[]}],{setupRecipeDigest:digestCanonical('setup'),dependencyDigest:digestCanonical('deps'),runtimeDigest:digestCanonical('node'),releaseDigest:digestCanonical('release'),policyDigest:digestCanonical('policy')},{
+    resolve:async()=>({mode:'require',packageRoot:'node_modules/font',manifestPath:'node_modules/font/package.json',search:[{path:'node_modules/font',kind:'directory'}]}),
+    stat:async p=>({kind:p.endsWith('package.json')||p.endsWith('font.woff2')?'file':'directory',physicalPath:p,linkTarget:null}),readFile:async()=>bytes,listDirectory:async()=>[],
+  });
+  return createResourceApplicabilityProjection({origin:{providerId:attempt.providerId,runId:attempt.origin.runId,attemptId:attempt.attemptId,generation:attempt.generation,inputDigest:attempt.inputDigest,profileDigest:attempt.profileDigest,source:{headSha:executionHeadSha,treeSha:attempt.origin.candidate.treeSha},status:'passed',superseded:false},consumerId:'font-consumer',declarationDigest:digestCanonical('request'),sourceApplicabilityDigest:digestCanonical('source'),capture});
+}
+async function resourceStore() {
+  const root=await mkdtemp(path.join(tmpdir(),'scoped-resource-attempt-'));dirs.push(root);return new AttemptStore(root);
+}
+it('resource applicability retains allocator HEAD and successful projection while preserving older history',async()=>{
+  const store=await resourceStore();const attempt=await store.allocate(input,{executionHeadSha});
+  expect((await store.read())[0]?.executionHeadSha).toBe(executionHeadSha);
+  const projection=await projectionFor(attempt);await store.finish(attempt,'passed',{outputs:[],resourceApplicability:projection});
+  await store.allocate(input);
+  const rows=await store.read();expect(rows[0]?.executionHeadSha).toBe(executionHeadSha);expect(rows[0]?.payload?.resourceApplicability).toEqual(projection);expect(rows[1]?.attempt.status).toBe('running');
+});
+it('resource applicability cannot seed from failed interrupted or legacy missing-HEAD attempts',async()=>{
+  for(const status of ['failed','interrupted'] as const){
+    const store=await resourceStore();const attempt=await store.allocate(input,{executionHeadSha});
+    await expect(store.finish(attempt,status,{outputs:[],resourceApplicability:await projectionFor(attempt)})).rejects.toMatchObject({code:'check_attempt_corrupt'});
+    expect((await store.read())[0]?.attempt.status).toBe('running');
+  }
+  const store=await resourceStore();const legacy=await store.allocate(input);
+  await expect(store.finish(legacy,'passed',{outputs:[],resourceApplicability:await projectionFor(legacy)})).rejects.toMatchObject({code:'check_attempt_corrupt'});
+  await store.finish(legacy,'passed',{outputs:[]});expect((await store.read())[0]?.payload?.resourceApplicability).toBeUndefined();expect((await store.read())[0]?.executionHeadSha).toBeUndefined();
+});
+it('resource applicability refuses portable digest and byte tampering on finish and load',async()=>{
+  const { digestCanonical }=await import('@agent-delivery-harness/kernel');const { readFile }=await import('node:fs/promises');
+  for(const phase of ['finish','load']) {
+    const store=await resourceStore();const attempt=await store.allocate(input,{executionHeadSha});const projection=await projectionFor(attempt);
+    if(phase==='finish') {
+      await expect(store.finish(attempt,'passed',{outputs:[],resourceApplicability:{...projection,digest:'e'.repeat(64)}})).rejects.toMatchObject({code:'check_attempt_corrupt'});
+      const substituted={...projection,origin:{...projection.origin,providerId:'other'}};
+      const {digest,...body}=substituted;substituted.digest=digestCanonical(body);
+      await expect(store.finish(attempt,'passed',{outputs:[],resourceApplicability:substituted})).rejects.toMatchObject({code:'check_attempt_corrupt'});
+    } else {
+      await store.finish(attempt,'passed',{outputs:[],resourceApplicability:projection});
+      const file=store.terminalPath(attempt),row=JSON.parse(await readFile(file,'utf8'));
+      const p=row.entry.payload.resourceApplicability;
+      p.capture.resources[0].entries.find((e:any)=>e.path.endsWith('font.woff2')).bytesBase64='Yg==';
+      const {digest:oldCapture,...captureBody}=p.capture;p.capture.digest=digestCanonical(captureBody);
+      const {digest:oldProjection,...projectionBody}=p;p.digest=digestCanonical(projectionBody);
+      row.digest=digestCanonical(row.entry);await writeFile(file,JSON.stringify(row));
+      await expect(store.read()).rejects.toMatchObject({code:'check_attempt_corrupt'});
+    }
+  }
+});
+it.each(['providerId','runId','attemptId','generation','inputDigest','profileDigest','source.treeSha','source.headSha'])('resource applicability rejects native origin %s substitution with refreshed checksums',async member=>{
+  const { digestCanonical }=await import('@agent-delivery-harness/kernel');const { readFile }=await import('node:fs/promises');
+  const store=await resourceStore();const attempt=await store.allocate(input,{executionHeadSha});await store.finish(attempt,'passed',{outputs:[],resourceApplicability:await projectionFor(attempt)});
+  const file=store.terminalPath(attempt),row=JSON.parse(await readFile(file,'utf8')),projection=row.entry.payload.resourceApplicability;
+  const keys=member.split('.'),last=keys.pop()!;const target=keys.reduce((v,k)=>v[k],projection.origin);
+  target[last]=member==='generation'?2:member.endsWith('Sha')?'e'.repeat(40):member.endsWith('Digest')?'e'.repeat(64):'substitute';
+  const {digest,...body}=projection;projection.digest=digestCanonical(body);row.digest=digestCanonical(row.entry);await writeFile(file,JSON.stringify(row));
+  await expect(store.read()).rejects.toMatchObject({code:'check_attempt_corrupt'});
+});
+it('resource applicability rejects running positive facts and terminal HEAD drift independent of projection',async()=>{
+  const { digestCanonical }=await import('@agent-delivery-harness/kernel');const { readFile }=await import('node:fs/promises');
+  for(const mode of ['running-positive','terminal-head']) {
+    const store=await resourceStore();const attempt=await store.allocate(input,{executionHeadSha});
+    if(mode==='terminal-head')await store.finish(attempt,'passed',{outputs:[]});
+    const file=mode==='terminal-head'?store.terminalPath(attempt):path.join(store.root,String(attempt.generation),'running.json'),row=JSON.parse(await readFile(file,'utf8'));
+    if(mode==='terminal-head')row.entry.executionHeadSha='e'.repeat(40);else row.entry.payload={outputs:[],resourceApplicability:await projectionFor(attempt)};
+    row.digest=digestCanonical(row.entry);await writeFile(file,JSON.stringify(row));await expect(store.read()).rejects.toMatchObject({code:'check_attempt_corrupt'});
+  }
+});
+
+it('resource applicability rejects loaded failed interrupted or missing-native-HEAD positives',async()=>{
+  const { digestCanonical }=await import('@agent-delivery-harness/kernel');const { readFile }=await import('node:fs/promises');
+  for(const status of ['failed','interrupted','missing-head']) {
+    const store=await resourceStore();const attempt=await store.allocate(input,status==='missing-head'?{}:{executionHeadSha});
+    await store.finish(attempt,'passed',{outputs:[],...(status==='missing-head'?{}:{resourceApplicability:await projectionFor(attempt)})});
+    const file=store.terminalPath(attempt),row=JSON.parse(await readFile(file,'utf8'));
+    if(status==='missing-head')row.entry.payload.resourceApplicability=await projectionFor(attempt);else row.entry.attempt.status=status;
+    row.digest=digestCanonical(row.entry);await writeFile(file,JSON.stringify(row));
+    await expect(store.read()).rejects.toMatchObject({code:'check_attempt_corrupt'});
+  }
+});

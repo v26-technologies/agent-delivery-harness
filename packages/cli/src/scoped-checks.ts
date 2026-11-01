@@ -3,11 +3,12 @@ import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { computeDeliverableIdentity, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
-  normalizeInstalledDataResourceRequests, type InstalledDataResourceRequest, type InstalledDataResourceContext, type InstalledDataResourceCapture,
+  createResourceApplicabilityProjection, matchResourceApplicabilityProjection, type InstalledDataAttemptOrigin, type InstalledDataResourceRequest, normalizeInstalledDataResourceRequests, type InstalledDataResourceContext, type InstalledDataResourceCapture,
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
 import { AttemptStore, type AttemptPayload, type StoredAttempt } from "./scoped-attempts.ts";
 import { CheckSnapshotError, createCheckSnapshot, executionPath, type CheckSnapshot, type SnapshotRequest } from "./check-snapshot.ts";
+import { captureInstalledDataBinding, type InstalledDataSourceTree } from "./scoped-installed-data.ts";
 import { captureOwnedInstalledDataResources } from "./installed-data-resources.ts";
 import { redactScopedStreams, scopedCommandDiagnostic, scopedDependencyDiagnostic, scopedDiagnosticFailure, type RecordedScopedAttemptDiagnostic } from "./scoped-diagnostics.ts";
 export function scopedCandidate(candidate: CandidateBinding): RecordCandidateBinding {
@@ -55,6 +56,9 @@ export class ScopedChecks {
   private readonly capturing = oneAtATime();
   private captureTail: Promise<unknown> = Promise.resolve();
   private capturePhaseOpen = true;
+  private candidateSource!: InstalledDataSourceTree;
+  private sourceFrames?: Promise<{ base: InstalledDataSourceTree; candidate: InstalledDataSourceTree }>;
+  private readonly installed = new Map<string, { binding: Awaited<ReturnType<typeof captureInstalledDataBinding>>; capture: InstalledDataResourceCapture; snapshot: CheckSnapshot }>();
   private readonly owned = new Map<string, Awaited<ReturnType<AttemptStore["allocate"]>>>();
   private readonly stores = new Map<string, AttemptStore>();
   private readonly identities = new Map<string, Awaited<ReturnType<typeof scopedCheckIdentity>>>();
@@ -81,6 +85,7 @@ export class ScopedChecks {
     const listing = await runGitCommand(["git", "ls-tree", "-r", "--name-only", "-z", candidate.treeSha], { cwd: context.rootDir });
     if (listing.exitCode !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Cannot enumerate the prepared source tree.");
     const inventory = listing.stdout.split("\0").filter(Boolean);
+    session.candidateSource = { inventory, read };
     const validationConfig = { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral };
     const validationTrees = new Map<string, Promise<string>>();
     const validation = (treeSha: string) => {
@@ -151,7 +156,7 @@ export class ScopedChecks {
     // attempt executes this candidate and must bind its actual source tree.
     const identity = this.executionIdentities.get(id)!;
     this.identities.set(id, identity);
-    const attempt = await this.locked(() => this.stores.get(id)!.allocate({ version: "scoped-attempt/1", providerId: id, inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, origin: { candidate: scopedCandidate(this.candidate), runId: this.runId } }));
+    const attempt = await this.locked(() => this.stores.get(id)!.allocate({ version: "scoped-attempt/1", providerId: id, inputDigest: identity.inputDigest, profileDigest: identity.profileDigest, origin: { candidate: scopedCandidate(this.candidate), runId: this.runId } }, { executionHeadSha: this.candidate.headSha }));
     this.owned.set(id, attempt); return attempt;
   }
   async explainReuse(admitted: readonly string[]): Promise<void> {
@@ -249,28 +254,64 @@ export class ScopedChecks {
     }
     return { snapshot, sharedOutputs };
   }
-  /** Native resource facts only: no command allocation, pass or submission. */
-  captureInstalledData(providerId: string, requests: readonly InstalledDataResourceRequest[], context: InstalledDataResourceContext): Promise<InstalledDataResourceCapture> {
+  private scheduleCapture<T>(task: () => Promise<T>): Promise<T> {
     if (!this.capturePhaseOpen) return Promise.reject(new CheckSnapshotError("installed_data_capture_closed", "Resource capture must finish before execution or cleanup begins."));
+    const accepted = this.capturing(task);
+    this.captureTail = accepted.catch(() => undefined);
+    return accepted;
+  }
+  private async sourceTrees() {
+    return this.sourceFrames ??= (async () => {
+      const tree = async (sha: string): Promise<InstalledDataSourceTree> => {
+        const listing = await runGitCommand(["git", "ls-tree", "-r", "--name-only", "-z", sha], { cwd: this.context.rootDir });
+        if (listing.exitCode !== 0) throw new CheckSnapshotError("installed_data_source_unqualified", "Cannot enumerate installed resource source inputs.");
+        return { inventory: listing.stdout.split("\0").filter(Boolean), read: await candidateTreeSourceReader(this.context.rootDir, sha) };
+      };
+      return { base: await tree(this.candidate.base.mergeBaseSha), candidate: this.candidateSource };
+    })();
+  }
+  private async captureResourceFacts(providerId: string, requests: readonly InstalledDataResourceRequest[], context: InstalledDataResourceContext) {
     const provider = this.context.config.providers.find(p => p.id === providerId);
     const profile = this.context.config.scopedExecution?.profiles.find(p => p.id === provider?.check?.scope?.profile);
-    if (!provider?.check?.scope || !profile || !this.identities.has(providerId)) return Promise.reject(new CheckSnapshotError("scoped_executor_required", "Installed resources require an already configured scoped provider and profile."));
-    const task = this.capturing(async () => {
-      const normalized = normalizeInstalledDataResourceRequests(requests);
-      const lane = this.serial;
-      try {
-        const { snapshot } = await this.acquireSnapshot(profile, lane);
-        return await captureOwnedInstalledDataResources(snapshot, normalized, context, this.context.signal ? { signal: this.context.signal } : {});
-      } catch (error) {
-        const key = setupKey(profile), damaged = lane.snapshots.get(key);
-        // Keep a failed cleanup in the pool so final cleanup can retry it.
-        await damaged?.cleanup();
-        lane.snapshots.delete(key);
-        throw error;
-      }
+    if (!provider?.check?.scope || !profile || !this.identities.has(providerId)) throw new CheckSnapshotError("scoped_executor_required", "Installed resources require an already configured scoped provider and profile.");
+    const normalized = normalizeInstalledDataResourceRequests(requests), lane = this.serial;
+    try {
+      const { snapshot } = await this.acquireSnapshot(profile, lane);
+      const capture = await captureOwnedInstalledDataResources(snapshot, normalized, context, this.context.signal ? { signal: this.context.signal } : {});
+      return { capture, snapshot };
+    } catch (error) {
+      const key = setupKey(profile), damaged = lane.snapshots.get(key);
+      // Keep a failed cleanup in the pool so final cleanup can retry it.
+      await damaged?.cleanup();
+      lane.snapshots.delete(key);
+      throw error;
+    }
+  }
+  /** Native resource facts only: caller-supplied context never seeds applicability. */
+  captureInstalledData(providerId: string, requests: readonly InstalledDataResourceRequest[], context: InstalledDataResourceContext): Promise<InstalledDataResourceCapture> {
+    return this.scheduleCapture(async () => (await this.captureResourceFacts(providerId, requests, context)).capture);
+  }
+  /** Derive authority from the configured consumer and immutable native source frames.
+   * Matching resources do not make the prior full-Git check attempt current. */
+  captureInstalledDataFor(providerId: string) {
+    return this.scheduleCapture(async () => {
+      const provider = this.context.config.providers.find(p => p.id === providerId);
+      if (!provider?.check?.installedData || !this.observations.has(providerId)) throw new CheckSnapshotError("installed_data_source_unqualified", "A configured installed data consumer is required.");
+      const binding = await captureInstalledDataBinding(this.context.config, provider, this.candidate, this.observations.get(providerId)!, await this.sourceTrees(), await candidateTreeEvidenceReader(this.context.rootDir, this.candidate.treeSha));
+      const { capture, snapshot } = await this.captureResourceFacts(providerId, binding.declaration.requests, binding.context);
+      this.installed.set(providerId, { binding: structuredClone(binding), capture: structuredClone(capture), snapshot });
+      // A newer running, failed or unqualified pass fences older successful history.
+      const latest = (await this.locked(() => this.stores.get(providerId)!.read())).at(-1);
+      const origin = latest && this.resourceOrigin(latest);
+      const match = matchResourceApplicabilityProjection(latest?.payload?.resourceApplicability, { consumerId: binding.declaration.consumerId, declarationDigest: binding.declarationDigest, sourceApplicabilityDigest: binding.sourceApplicabilityDigest, capture, originAttempt: origin ?? null });
+      return { capture, ...match };
     });
-    this.captureTail = task.catch(() => undefined);
-    return task;
+  }
+  private resourceOrigin(row: StoredAttempt): InstalledDataAttemptOrigin | undefined {
+    if (row.attempt.status !== "passed" || !row.executionHeadSha) return undefined;
+    const a = row.attempt;
+    return { providerId: a.providerId, runId: a.origin.runId, attemptId: a.attemptId, generation: a.generation, inputDigest: a.inputDigest, profileDigest: a.profileDigest,
+      source: { headSha: row.executionHeadSha, treeSha: a.origin.candidate.treeSha }, status: "passed", superseded: false };
   }
   private async closeCapturePhase(): Promise<void> {
     this.capturePhaseOpen = false;
@@ -311,6 +352,13 @@ export class ScopedChecks {
       const outputs = await captureCheckOutputSnapshots(snapshot.rootDir, check.outputs ?? []);
       if (!outputs || outputs.some(o => secrets.some(secret => Buffer.from(o.base64, "base64").includes(Buffer.from(secret))))) throw new CheckSnapshotError("check_output_missing", "A retained output is absent, corrupt, escaped or contains credential bytes.");
       payload = { ...payload, outputs, diagnostic: { ...diagnostic, phase: "complete" } };
+      const installed = this.installed.get(provider.id);
+      // Only the same owned snapshot that supplied the facts can seed a pass.
+      if (installed?.snapshot === snapshot) payload = { ...payload, resourceApplicability: createResourceApplicabilityProjection({
+        origin: this.resourceOrigin({ attempt: { ...attempt, status: "passed" }, executionHeadSha: this.candidate.headSha })!,
+        consumerId: installed.binding.declaration.consumerId, declarationDigest: installed.binding.declarationDigest,
+        sourceApplicabilityDigest: installed.binding.sourceApplicabilityDigest, capture: installed.capture,
+      }) };
       await store.finish(attempt, "passed", payload); terminal = true;
       const scopedPlan = await this.plan();
       const wiring = await this.context.wire();
@@ -324,7 +372,7 @@ export class ScopedChecks {
       for (const [index, output] of outputs.entries()) await write(`check-output-${index}.json`, { path: output.path, base64: output.base64 }, "check-output");
       const claim = { verdict: "green", exitCode: 0, binding };
       await write("check-result.json", { providerId: provider.id, runId, finalPassId, ...claim }, "check-result");
-      await write("scoped-inputs.json", { observation: this.observations.get(provider.id), attempt: { ...attempt, status: "passed" }, durationMs: payload.durationMs, dependencyDigest: payload.dependencyDigest }, "scoped-inputs");
+      await write("scoped-inputs.json", { observation: this.observations.get(provider.id), attempt: { ...attempt, status: "passed" }, durationMs: payload.durationMs, dependencyDigest: payload.dependencyDigest, ...(payload.resourceApplicability ? { resourceApplicability: payload.resourceApplicability } : {}) }, "scoped-inputs");
       const c = this.candidate;
       const manifest = { spec: "delivery-evidence/1", provider: { id: provider.id, runId, finalPassId }, candidate: { vcs: "git", treeSha: c.treeSha, headSha: c.headSha, deliverable: c.deliverable, base: c.base, workspaceId: c.workspaceId }, runHistory: [{ preparedTreeSha: c.treeSha, evaluatedInPassId: finalPassId }], artifacts, attestation: { level: "self", signatures: [] }, recordedAt: new Date().toISOString(), claims: obligationIds.map(obligation => ({ obligation, payloadSpec: "checks.passed/1", payload: claim })) };
       const manifestPath = path.join(allocation.runRoot.path, "manifest.json"); await this.context.artifacts.writeTextFile(manifestPath, JSON.stringify(manifest));

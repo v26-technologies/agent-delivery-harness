@@ -1226,6 +1226,7 @@ export {
   normalizeInstalledDataResourceRequests,
   captureInstalledDataResources,
   validateInstalledDataResourceCapture,
+  validateResourceApplicabilityProjection,
   createResourceApplicabilityProjection,
   matchResourceApplicabilityProjection,
   InstalledDataResourceError,
@@ -1234,4 +1235,8 @@ export {
   type InstalledDataResourceContext,
   type InstalledDataResourcePorts,
   type InstalledDataResourceCapture,
+  type ResourceApplicabilityProjection,
+  type InstalledDataAttemptOrigin,
 } from "./installed-data-resources.ts";
+
+export { isInstalledDataConsumerDefinition, type InstalledDataConsumerDefinition } from "./config.ts";

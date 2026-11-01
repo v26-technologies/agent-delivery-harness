@@ -545,6 +545,17 @@ describe("rule d1 — true purity", () => {
     expect(findings[0]?.message).toContain("no sibling allowance");
   });
 
+  it("allows config's installed resource grammar while retaining its transitive purity boundary", () => {
+    const config = `import { normalizeInstalledDataResourceRequests } from "./installed-data-resources.ts";\nexport const defineHarnessConfig = (): unknown => normalizeInstalledDataResourceRequests([]);\n`;
+    const resource = `import { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";\nexport const normalizeInstalledDataResourceRequests = (v: unknown): unknown => [v, MAX_PORTABLE_ARTIFACT_BYTES];\n`;
+    const files = {"packages/kernel/src/config.ts": config,"packages/kernel/src/installed-data-resources.ts":resource,"packages/kernel/src/portable-limits.ts": "export const MAX_PORTABLE_ARTIFACT_BYTES = 1;\n"};
+    expect(rules(scan(files))).not.toContain("d1-kernel-purity");
+    for (const file of ["installed-data-resources.ts","portable-limits.ts"]) {
+      const findings=scan({...files,[`packages/kernel/src/${file}`]:`import { readFileSync } from "node:fs";\nexport const hidden = (): unknown => readFileSync("host");\n`});
+      expect(findings.some(f=>f.rule==="d1-kernel-purity" && f.file.endsWith(file))).toBe(true);
+    }
+  });
+
   it("gives context.ts no sibling allowance at the kernel root", () => {
     expectFalsified(
       "d1-kernel-purity",
