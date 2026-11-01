@@ -1221,3 +1221,17 @@ export type { ScopedExecutionDefinition, ScopedExecutionProfile } from "./config
 export { scopedCheckIdentity, type ScopedRuntimeObservation } from "./scoped-inputs.ts";
 
 export { reconciliationActions, runActionReconciliationError, type ReconciliationAction } from "./spine/run-action-reconciliation.ts";
+
+export {
+  normalizeInstalledDataResourceRequests,
+  captureInstalledDataResources,
+  validateInstalledDataResourceCapture,
+  createResourceApplicabilityProjection,
+  matchResourceApplicabilityProjection,
+  InstalledDataResourceError,
+  INSTALLED_DATA_LIMITS,
+  type InstalledDataResourceRequest,
+  type InstalledDataResourceContext,
+  type InstalledDataResourcePorts,
+  type InstalledDataResourceCapture,
+} from "./installed-data-resources.ts";

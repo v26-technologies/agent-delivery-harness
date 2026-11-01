@@ -3,10 +3,12 @@ import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { computeDeliverableIdentity, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
+  normalizeInstalledDataResourceRequests, type InstalledDataResourceRequest, type InstalledDataResourceContext, type InstalledDataResourceCapture,
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
 import { AttemptStore, type AttemptPayload, type StoredAttempt } from "./scoped-attempts.ts";
-import { CheckSnapshotError, createCheckSnapshot, executionPath, type CheckSnapshot } from "./check-snapshot.ts";
+import { CheckSnapshotError, createCheckSnapshot, executionPath, type CheckSnapshot, type SnapshotRequest } from "./check-snapshot.ts";
+import { captureOwnedInstalledDataResources } from "./installed-data-resources.ts";
 import { redactScopedStreams, scopedCommandDiagnostic, scopedDependencyDiagnostic, scopedDiagnosticFailure, type RecordedScopedAttemptDiagnostic } from "./scoped-diagnostics.ts";
 export function scopedCandidate(candidate: CandidateBinding): RecordCandidateBinding {
   return { treeSha: candidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: candidate.workspaceId };
@@ -49,6 +51,10 @@ export class ScopedChecks {
   private readonly locked = oneAtATime();
   /** Evidence submission captures the candidate through the author's Git index, which one writer may hold. */
   private readonly publishing = oneAtATime();
+  /** Resource discovery is a pre-execution phase on the serial worker only. */
+  private readonly capturing = oneAtATime();
+  private captureTail: Promise<unknown> = Promise.resolve();
+  private capturePhaseOpen = true;
   private readonly owned = new Map<string, Awaited<ReturnType<AttemptStore["allocate"]>>>();
   private readonly stores = new Map<string, AttemptStore>();
   private readonly identities = new Map<string, Awaited<ReturnType<typeof scopedCheckIdentity>>>();
@@ -220,7 +226,58 @@ export class ScopedChecks {
     return requests.flatMap(r => failures.has(r.provider.id) ? [failures.get(r.provider.id)!] : []);
   }
   async submitMechanical(): Promise<void> { for (const submit of this.submissions) await submit(); this.submissions.length = 0; }
+  /** One acquisition path preserves setup sharing, output ownership and worker isolation. */
+  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"]): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[] }> {
+    const key = setupKey(profile);
+    // Every scoped check's profile sharing this setup may write its own outputs in the shared tree;
+    // only those profiles passed the overlap refusal in create().
+    const sharedOutputs = [...new Set(this.context.config.scopedExecution!.profiles
+      .filter(p => setupKey(p) === key && this.context.config.providers.some(q => q.check?.scope?.profile === p.id)).flatMap(p => p.mutableOutputs))];
+    let snapshot = lane.snapshots.get(key);
+    if (!snapshot) {
+      // A single worker retains only consecutive same-setup reuse; durable outputs no longer
+      // need the private tree. A pool keeps each worker's snapshots until cleanup().
+      if (this.concurrency === 1) for (const [previousKey, previous] of lane.snapshots) {
+        await previous.cleanup();
+        lane.snapshots.delete(previousKey);
+      }
+      snapshot = await createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
+        onPhase: (phase, durationMs) => this.phaseWriters.get(lane.snapshots)?.(phase, durationMs),
+        ...(onDependencyResult ? { onDependencyResult } : {}),
+      });
+      lane.snapshots.set(key, snapshot);
+    }
+    return { snapshot, sharedOutputs };
+  }
+  /** Native resource facts only: no command allocation, pass or submission. */
+  captureInstalledData(providerId: string, requests: readonly InstalledDataResourceRequest[], context: InstalledDataResourceContext): Promise<InstalledDataResourceCapture> {
+    if (!this.capturePhaseOpen) return Promise.reject(new CheckSnapshotError("installed_data_capture_closed", "Resource capture must finish before execution or cleanup begins."));
+    const provider = this.context.config.providers.find(p => p.id === providerId);
+    const profile = this.context.config.scopedExecution?.profiles.find(p => p.id === provider?.check?.scope?.profile);
+    if (!provider?.check?.scope || !profile || !this.identities.has(providerId)) return Promise.reject(new CheckSnapshotError("scoped_executor_required", "Installed resources require an already configured scoped provider and profile."));
+    const task = this.capturing(async () => {
+      const normalized = normalizeInstalledDataResourceRequests(requests);
+      const lane = this.serial;
+      try {
+        const { snapshot } = await this.acquireSnapshot(profile, lane);
+        return await captureOwnedInstalledDataResources(snapshot, normalized, context, this.context.signal ? { signal: this.context.signal } : {});
+      } catch (error) {
+        const key = setupKey(profile), damaged = lane.snapshots.get(key);
+        // Keep a failed cleanup in the pool so final cleanup can retry it.
+        await damaged?.cleanup();
+        lane.snapshots.delete(key);
+        throw error;
+      }
+    });
+    this.captureTail = task.catch(() => undefined);
+    return task;
+  }
+  private async closeCapturePhase(): Promise<void> {
+    this.capturePhaseOpen = false;
+    await this.captureTail;
+  }
   async execute(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission = false, lane: Lane = this.serial): Promise<void> {
+    await this.closeCapturePhase();
     const started = Date.now(), check = provider.check!, profile = this.context.config.scopedExecution!.profiles.find(p => p.id === check.scope!.profile)!;
     const attempt = this.owned.get(provider.id) ?? await this.allocate(provider.id);
     this.phaseWriters.set(lane.snapshots, (phase, durationMs) => lane.write(`snapshot ${provider.id}: attempt ${attempt.attemptId}; ${phase} ${Math.round(durationMs)}ms`));
@@ -230,25 +287,8 @@ export class ScopedChecks {
     const store = this.stores.get(provider.id)!;
     const secrets = check.scope!.environment.filter(e => e.kind === "credential").map(e => this.context.env[e.name]).filter((v): v is string => !!v);
     try {
-      const key = setupKey(profile);
-      // Every scoped check's profile sharing this setup may write its own outputs in the shared tree;
-      // only those profiles passed the overlap refusal in create().
-      const sharedOutputs = [...new Set(this.context.config.scopedExecution!.profiles
-        .filter(p => setupKey(p) === key && this.context.config.providers.some(q => q.check?.scope?.profile === p.id)).flatMap(p => p.mutableOutputs))];
-      let snapshot = lane.snapshots.get(key);
-      if (!snapshot) {
-        // A single worker retains only consecutive same-setup reuse; durable outputs no longer
-        // need the private tree. A pool keeps each worker's snapshots until cleanup().
-        if (this.concurrency === 1) for (const [previousKey, previous] of lane.snapshots) {
-          await previous.cleanup();
-          lane.snapshots.delete(previousKey);
-        }
-        snapshot = await createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
-          onPhase: (phase, durationMs) => this.phaseWriters.get(lane.snapshots)?.(phase, durationMs),
-          onDependencyResult: (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; },
-        });
-        lane.snapshots.set(key, snapshot);
-      }
+      const { snapshot, sharedOutputs } = await this.acquireSnapshot(profile, lane,
+        (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; });
       diagnostic = { ...diagnostic, phase: "pre-command-verification" };
       // A sibling or dependency setup cannot supply this command's result, and
       // another profile's outputs are not this profile's to read or write.
@@ -313,6 +353,7 @@ export class ScopedChecks {
     }
   }
   async cleanup(): Promise<void> {
+    await this.closeCapturePhase();
     for (const snapshots of this.workers) { for (const snapshot of snapshots.values()) await snapshot.cleanup(); snapshots.clear(); }
   }
 }

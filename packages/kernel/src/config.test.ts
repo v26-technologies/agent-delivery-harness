@@ -1062,3 +1062,20 @@ describe("the falsification table", () => {
 // A compile-time check that the exported config type is what the readers see.
 const _typeWitness: (config: HarnessConfig) => string = (config) => config.gateId;
 void _typeWitness;
+
+it("rejects dependency namespace mutable outputs in scoped profiles", () => {
+  const input = {
+    ...validInput(),
+    scopedExecution: {
+      version: "scoped-execution/1",
+      mechanicalProviders: [],
+      profiles: [{ id: "installed-data", gitContext: "full", dependencyInputs: [], mutableOutputs: ["reports/font-result.json"], credentialIdentities: {} }],
+    },
+  };
+  expect(define(input).scopedExecution?.profiles[0]?.mutableOutputs).toEqual(["reports/font-result.json"]);
+  for (const output of ["node_modules", "node_modules/", "node_modules/@fonts/demo/wght.css", "node_modules/@fonts/demo/files/", "packages/app/node_modules", "packages/app/node_modules/@fonts/demo/files/"]) {
+    const invalid = { ...input, scopedExecution: { ...input.scopedExecution, profiles: [{ ...input.scopedExecution.profiles[0]!, mutableOutputs: [output] }] } };
+    expectOnly(invalid, "config_invalid_member");
+    expect(() => define(invalid)).toThrow(BlockedError);
+  }
+});
