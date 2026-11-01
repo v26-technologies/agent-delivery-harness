@@ -46,7 +46,7 @@ import {
 import { canonicalize } from "./canonical.ts";
 import { digestCanonical } from "./digest.ts";
 import type { CandidateBinding } from "./candidate.types.ts";
-import type { EvidenceRecord, RecordCandidateBinding, WaiverResolution, PortableEvidenceContext, CheckBinding } from "./records.types.ts";
+import type { EvidenceRecord, RecordCandidateBinding, WaiverResolution, PortableEvidenceContext, CheckBinding, ResourceApplicabilityBinding } from "./records.types.ts";
 import { effectiveHostedChecksPolicy, verifyCompiledPolicy, type CompiledPolicy } from "./policy/compile.ts";
 import { isHostedCheckExemption, isHostedCheckInstant, type HostedCheckExemption } from "./policy/document.ts";
 // TYPE ONLY, DELIBERATELY. The row is echoed, never evaluated, so this module
@@ -647,6 +647,7 @@ export interface VerifyDeliveryRecordOptions {
   readonly evidenceContext?: PortableEvidenceContext;
   readonly projection?: EvaluateGateInput["projection"];
   readonly executionContext?: EvaluateGateInput["context"];
+  readonly resourceBindings?: Readonly<Record<string, ResourceApplicabilityBinding>>;
   readonly checkBindings?: Readonly<Record<string, CheckBinding>>;
   /** Fresh caller-observed results; never reconstructed from a recorded live claim. */
   readonly liveResults?: EvaluateGateInput["liveResults"];
@@ -1074,7 +1075,7 @@ function verifyRecordEvidence(config: HarnessConfig, record: DeliveryRecord, opt
       }
       const resolution = evidence.resolution;
       const eb = evidence.candidateBinding;
-      const scoped = config.providers.some(p => p.id === resolution.providerId && p.check?.scope !== undefined) &&
+      const scoped = resolution.resourceBinding === undefined && config.providers.some(p => p.id === resolution.providerId && p.check?.scope !== undefined) &&
         resolution.checkBinding?.scopedInputDigest !== undefined && options.checkBindings?.[resolution.providerId]?.scopedInputDigest !== undefined &&
         digestCanonical(resolution.checkBinding) === digestCanonical(options.checkBindings[resolution.providerId]);
       if (evidence.schemaVersion !== 1 || evidence.recordId !== computeRecordId(evidence.workspaceId, evidence) || evidence.workspaceId !== eb.workspaceId ||
@@ -1084,12 +1085,15 @@ function verifyRecordEvidence(config: HarnessConfig, record: DeliveryRecord, opt
           BINDING_FIELDS.filter(field => scoped ? field === "workspaceId" || field === "identityToken" : field !== "treeSha").some(field => eb[field] !== b[field])) {
         blockers.push(portableBlocker("portable_claim_binding", "The claim differs from its original accepted evidence binding.")); continue;
       }
-      blockers.push(...verifyPortableEvidence(config, resolution.portable!, eb, options.evidenceContext, options.checkBindings));
+      blockers.push(...verifyPortableEvidence(config, resolution.portable!, eb, options.evidenceContext, options.checkBindings, options.resourceBindings));
       const manifest = resolution.portable!.manifest;
       if (!isRecord(manifest) || !isRecord(manifest["provider"]) || !Array.isArray(manifest["claims"]) ||
           resolution.manifestDigest !== computeManifestDigest(manifest) || manifest["provider"]["id"] !== resolution.providerId ||
           manifest["provider"]["runId"] !== resolution.runId || manifest["provider"]["finalPassId"] !== resolution.finalPassId ||
-          !manifest["claims"].some(value => isRecord(value) && value["obligation"] === claim.obligationId)) {
+          !manifest["claims"].some(value => isRecord(value) && value["obligation"] === claim.obligationId &&
+            (resolution.resourceBinding === undefined ? value["payloadSpec"] !== "installed-data.applicable/1" :
+              value["payloadSpec"] === "installed-data.applicable/1" && isRecord(value["payload"]) &&
+              digestCanonical(value["payload"]["binding"]) === digestCanonical(resolution.resourceBinding)))) {
         blockers.push(portableBlocker("portable_manifest_binding", "The accepted manifest does not substantiate this claim.")); continue;
       }
       records.push(evidence);
@@ -1105,6 +1109,7 @@ function verifyRecordEvidence(config: HarnessConfig, record: DeliveryRecord, opt
     base: { ref: b.baseRef, tipSha: b.baseTipSha, mergeBaseSha: b.mergeBaseSha }, workspaceId: b.workspaceId },
     projection: options.projection, context: options.executionContext, records,
     ...(options.checkBindings === undefined ? {} : { checkBindings: options.checkBindings }),
+    ...(options.resourceBindings === undefined ? {} : { resourceBindings: options.resourceBindings }),
     ...(options.liveResults === undefined ? {} : { liveResults: options.liveResults }),
   });
   for (const actual of decision.resolutions) {

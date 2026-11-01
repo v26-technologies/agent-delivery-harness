@@ -30,7 +30,7 @@ async function providerAdmission(
   options: { readonly allowPrompt: boolean; readonly includeInjectedLiveResults: boolean },
   session?: ScopedChecks,
 ): Promise<AdmissionResult & { readonly observedLiveResults?: readonly LiveProviderResult[] }> {
-  const admit = async (input: Parameters<typeof runAdmission>[0], options: Parameters<typeof runAdmission>[1]) => runAdmission(input, { ...options, ...(session ? { scopedPlan: await session.plan(), readOutput: session.readOutput } : {}) });
+  const admit = async (input: Parameters<typeof runAdmission>[0], options: Parameters<typeof runAdmission>[1]) => runAdmission(input, { ...options, ...(session ? { scopedPlan: await session.plan(), readOutput: session.readOutput, resourceBindings: await session.resourceBindings() } : {}) });
   if (session) {
     await session.fenceNonReusable(context.config.providers.filter(p => p.check?.scope).map(p => p.id));
   }
@@ -72,7 +72,7 @@ async function providerAdmission(
         if (finding.code !== missingCode || finding.providerId === undefined || attempted.has(finding.providerId)) continue;
         const registration = context.config.providers.find((provider) => provider.id === finding.providerId);
         if (registration === undefined || (registration.command === undefined && registration.check === undefined) || !obligation.providers.includes(registration.id)) continue;
-        if (registration.check !== undefined && (obligation.freshness !== "exact_candidate" || !obligation.acceptedPayloadSpecs.includes("checks.passed/1") || admission.decision.resolutions.some(resolution => resolution.kind !== "satisfied_evidence" && resolution.kind !== "not_applicable" && resolution.kind !== "waived" && context.config.obligations.find(entry => entry.id === resolution.obligationId)?.acceptedPayloadSpecs.includes("review.green/1")))) continue;
+        if (registration.check !== undefined && (obligation.freshness !== "exact_candidate" || !obligation.acceptedPayloadSpecs.includes("checks.passed/1") || admission.decision.resolutions.some(resolution => resolution.kind !== "satisfied_evidence" && resolution.kind !== "not_applicable" && resolution.kind !== "waived" && context.config.obligations.find(entry => entry.id === resolution.obligationId)?.acceptedPayloadSpecs.some(spec => spec === "review.green/1" || spec === "review.green/2")))) continue;
         const entry = requested.get(registration.id) ?? { obligationIds: [], requiresEvidence: false, needsLiveResult: false };
         entry.obligationIds.push(obligation.id);
         entry.requiresEvidence ||= obligation.freshness === "exact_candidate";
@@ -104,7 +104,7 @@ async function providerAdmission(
           if (!(error instanceof CheckSnapshotError)) throw error;
           attemptBlockers.push(scopedCheckBlocker(error));
         }
-      } else attemptBlockers.push(...await runDeclaredCheck(context, registration, request.obligationIds, admission.candidate, session ? { scopedPlan: await session.plan(), readOutput: session.readOutput } : {}));
+      } else attemptBlockers.push(...await runDeclaredCheck(context, registration, request.obligationIds, admission.candidate, session ? { scopedPlan: await session.plan(), readOutput: session.readOutput, resourceBindings: await session.resourceBindings() } : {}));
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }

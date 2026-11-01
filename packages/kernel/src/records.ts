@@ -1,3 +1,4 @@
+import { isResourceApplicabilityBinding } from "./installed-data-evidence.ts";
 import { recordIdentity, computeRecordId } from "./record-identity.ts";
 /**
  * The git-private, content-addressed evidence record store.
@@ -403,7 +404,10 @@ function parseResolution(value: unknown): EvidenceRecord["resolution"] {
   if (!isRecordObject(value)) throw new RecordShapeError("malformed_shape", "resolution must be an object");
   const kind = value["kind"];
   if (kind === "evidence") {
-    requireExactMembers(value, [...EVIDENCE_MEMBERS, ...(value["checkBinding"] === undefined ? [] : ["checkBinding"]), ...(value["portable"] === undefined ? [] : ["portable"])], "resolution");
+    requireExactMembers(value, [...EVIDENCE_MEMBERS, ...(value["checkBinding"] === undefined ? [] : ["checkBinding"]), ...(value["resourceBinding"] === undefined ? [] : ["resourceBinding"]), ...(value["portable"] === undefined ? [] : ["portable"])], "resolution");
+    if (value["resourceBinding"] !== undefined && (!isResourceApplicabilityBinding(value["resourceBinding"]) || value["checkBinding"] !== undefined)) {
+      throw new RecordShapeError("malformed_shape", "resourceBinding requires a closed installed-data binding without checkBinding");
+    }
     if (value["checkBinding"] !== undefined) {
       const binding = value["checkBinding"];
       const members = ["definitionDigest", "validationDigest", "policyDigest", "wiringFingerprint", "outputsDigest"];

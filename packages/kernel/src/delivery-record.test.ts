@@ -1031,3 +1031,32 @@ describe("selectDeliveryRecordForIdentity", () => {
     expect(selected).toBeUndefined();
   });
 });
+
+
+describe("installed data portable record propagation", () => {
+  it("requires matching current resource authority through record verification and rejects claim substitution", () => {
+    const source = { version: "scoped-check/1" as const, files: [], tests: ["font.test.ts"], memberships: [], cwd: ".", profile: "font", environment: [] };
+    const installedData = { version: "installed-data-consumer/1" as const, consumerId: "font", source, guards: { "font.test.ts": "a".repeat(64) }, requests: [{ version: "installed-package-data/1" as const, id: "font", issuer: "font.test.ts", package: "font", manifest: "package.json" as const, files: ["font.woff2"], directories: [] }] };
+    const original = makeConfig();
+    const config = { ...original, providers: [{ id: "p.reviewer", findingCodes: [], check: { command: ["node"] as [string], timeoutMs: 1000, scope: source, installedData } }], obligations: original.obligations.map(row => ({ ...row, acceptedPayloadSpecs: ["checks.passed/1", "installed-data.applicable/1"] })) };
+    const resourceBinding = { version: "installed-data-binding/1" as const, candidateDigest: digestCanonical(RECORD_BINDING), definitionDigest: "b".repeat(64), declarationDigest: "c".repeat(64), sourceApplicabilityDigest: "d".repeat(64), captureDigest: "e".repeat(64), originDigest: "f".repeat(64) };
+    const old = evidenceRecord("review.green", "unused", "unused", config);
+    if (old.resolution.kind !== "evidence" || !old.resolution.portable) throw Error("fixture");
+    const provider = { id: "p.reviewer", version: "1", runId: "run-1", finalPassId: "pass-2" };
+    const payload = { verdict: "applicable", binding: resourceBinding };
+    const bytes = JSON.stringify({ providerId: provider.id, runId: provider.runId, finalPassId: provider.finalPassId, ...payload });
+    const manifest = { ...(old.resolution.portable.manifest as Record<string, unknown>), artifacts: [{ path: "resource-result.json", role: "resource-result", sha256: sha256Hex(bytes) }], claims: [{ obligation: "review.green", payloadSpec: "installed-data.applicable/1", payload }] };
+    const evidence = { ...old, resolution: { ...old.resolution, resourceBinding, manifestDigest: digestManifest(manifest), portable: { ...old.resolution.portable, manifest, artifacts: { "resource-result.json": Buffer.from(bytes).toString("base64") } } } };
+    const built = buildDeliveryRecord({ config, decision: admittedDecision([evidenceResolution("review.green", evidence.recordId)]), evidenceRecords: [evidence] });
+    expect(built.ok).toBe(true);
+    if (!built.ok) throw Error(JSON.stringify(built));
+    const options = { resourceBindings: { "p.reviewer": resourceBinding } };
+    expect(verifyDeliveryRecord(config, built.record, RECOMPUTED, FRESH_BASE, options).ok).toBe(true);
+    expect(verifyDeliveryRecord(config, built.record, RECOMPUTED, FRESH_BASE).ok).toBe(false);
+    expect(verifyDeliveryRecord(config, built.record, RECOMPUTED, FRESH_BASE, { resourceBindings: { "p.reviewer": { ...resourceBinding, captureDigest: "0".repeat(64) } } }).ok).toBe(false);
+    const changedEvidence = { ...evidence, resolution: { ...evidence.resolution, resourceBinding: { ...resourceBinding, captureDigest: "0".repeat(64) } } };
+    const changed = buildDeliveryRecord({ config, decision: admittedDecision([evidenceResolution("review.green", changedEvidence.recordId)]), evidenceRecords: [changedEvidence] });
+    if (!changed.ok) throw Error(JSON.stringify(changed));
+    expect(verifyDeliveryRecord(config, changed.record, RECOMPUTED, FRESH_BASE, options).ok).toBe(false);
+  });
+});

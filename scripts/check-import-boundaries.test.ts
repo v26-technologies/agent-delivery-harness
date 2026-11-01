@@ -545,6 +545,17 @@ describe("rule d1 — true purity", () => {
     expect(findings[0]?.message).toContain("no sibling allowance");
   });
 
+  it("allows config's installed resource grammar while retaining its transitive purity boundary", () => {
+    const config = `import { normalizeInstalledDataResourceRequests } from "./installed-data-resources.ts";\nexport const defineHarnessConfig = (): unknown => normalizeInstalledDataResourceRequests([]);\n`;
+    const resource = `import { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";\nexport const normalizeInstalledDataResourceRequests = (v: unknown): unknown => [v, MAX_PORTABLE_ARTIFACT_BYTES];\n`;
+    const files = {"packages/kernel/src/config.ts": config,"packages/kernel/src/installed-data-resources.ts":resource,"packages/kernel/src/portable-limits.ts": "export const MAX_PORTABLE_ARTIFACT_BYTES = 1;\n"};
+    expect(rules(scan(files))).not.toContain("d1-kernel-purity");
+    for (const file of ["installed-data-resources.ts","portable-limits.ts"]) {
+      const findings=scan({...files,[`packages/kernel/src/${file}`]:`import { readFileSync } from "node:fs";\nexport const hidden = (): unknown => readFileSync("host");\n`});
+      expect(findings.some(f=>f.rule==="d1-kernel-purity" && f.file.endsWith(file))).toBe(true);
+    }
+  });
+
   it("gives context.ts no sibling allowance at the kernel root", () => {
     expectFalsified(
       "d1-kernel-purity",
@@ -981,4 +992,20 @@ describe("the entry guard", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+
+describe("installed data applicability purity",()=>{
+ it("allows only the pure applicability evidence edge from validators",()=>{
+  expect(scan({"packages/kernel/src/installed-data-evidence.ts":"export const binding = 1;\n","packages/kernel/src/validator/envelope.ts":"import { binding } from '../installed-data-evidence.ts'; export const validate = () => binding;\n"})).toEqual([]);
+ });
+ it("refuses ambient filesystem in the applicability evidence helper",()=>{
+  expectFalsified("d1-kernel-purity",{"packages/kernel/src/installed-data-evidence.ts":"import { readFileSync } from 'node:fs'; export const binding = readFileSync('data');\n"},"packages/kernel/src/installed-data-evidence.ts");
+ });
+ it("refuses executable source capture imports from applicability evidence or validators",()=>{
+  for(const file of ["packages/kernel/src/installed-data-evidence.ts","packages/kernel/src/validator/envelope.ts"]){
+   const module=file.includes('/validator/')?'../installed-data-source.ts':'./installed-data-source.ts';
+   expectFalsified("d1-kernel-purity",{[file]:`import { captureInstalledDataBinding } from '${module}'; export const binding = captureInstalledDataBinding;\n`},file);
+  }
+ });
 });

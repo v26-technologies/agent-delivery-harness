@@ -104,6 +104,7 @@ export interface AdmissionInput {
 }
 
 export interface AdmissionOptions extends RecordStorageOptions {
+  readonly resourceBindings?: Readonly<Record<string, import("./records.types.ts").ResourceApplicabilityBinding>>;
   readonly scopedPlan?: import("./records.types.ts").ScopedCheckPlan;
   readonly readOutput?: (repoPath: string, providerId: string) => Promise<Uint8Array>;
   /** How the candidate is observed. Injected: the adapter owns no repository dependency. */
@@ -214,6 +215,7 @@ function blocked(partial: Omit<AdmissionResult, "admitted" | "blockers"> & { rea
 // ── Record mapping ───────────────────────────────────────────────────────────
 
 interface MappedStore {
+  readonly resourceBindings?: Readonly<Record<string, import("./records.types.ts").ResourceApplicabilityBinding>>;
   readonly checkBindings: Readonly<Record<string, import("./records.types.ts").CheckBinding>>;
   readonly records: readonly EvidenceRecord[];
   readonly unreadable: readonly UnreadableRecordInput[];
@@ -246,7 +248,7 @@ async function mapStore(input: AdmissionInput, options: AdmissionOptions, candid
       // input/profile/attempt binding is checked there; legacy evidence retains
       // the strict candidate filter.
       const providerId = record.resolution.kind === "evidence" ? record.resolution.providerId : undefined;
-      const scoped = providerId !== undefined &&
+      const scoped = record.resolution.kind === "evidence" && record.resolution.resourceBinding === undefined && providerId !== undefined &&
         input.config.providers.some(p => p.id === providerId && p.check?.scope !== undefined) &&
         record.candidateBinding.workspaceId === candidate.workspaceId && record.candidateBinding.identityToken === candidate.deliverable.identity;
       const appliesToCandidate = scoped || isRecordFreshForCandidate(input.config, record.candidateBinding, candidate);
@@ -261,7 +263,7 @@ async function mapStore(input: AdmissionInput, options: AdmissionOptions, candid
     }
   }
 
-  return { records, unreadable, checkBindings: await captureCheckBindings(input.rootDir, input.config, candidate, options) };
+  return { records, unreadable, ...(options.resourceBindings === undefined ? {} : { resourceBindings: options.resourceBindings }), checkBindings: await captureCheckBindings(input.rootDir, input.config, candidate, options) };
 }
 
 // ── Evaluation ───────────────────────────────────────────────────────────────
@@ -282,6 +284,7 @@ function gateInput(
     context: input.context,
     records,
     checkBindings: store.checkBindings,
+    ...(store.resourceBindings === undefined ? {} : { resourceBindings: store.resourceBindings }),
     unreadable: store.unreadable,
     ...(input.liveResults === undefined ? {} : { liveResults: input.liveResults }),
     invocationWaiverRecordIds,

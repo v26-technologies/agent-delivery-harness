@@ -27,15 +27,17 @@
 import { mkdir, mkdtemp, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createArtifactsPort, isSafeRelativePath } from "./artifacts.ts";
 import { GATE_STRUCTURAL_FINDING_CODES, type Blocker, type NonEmptyTuple } from "./blockers.ts";
 import type { CandidateCapture, CapturedCandidate } from "./candidate.types.ts";
 import { DELIVERABLE_TREE_V1_NARRATION_SET, defineHarnessConfig, type HarnessConfig } from "./config.ts";
-import { manifestDigest, sha256Hex } from "./digest.ts";
+import { digestCanonical, manifestDigest, sha256Hex } from "./digest.ts";
 import { publishPreparationReceipt } from "./preparation.ts";
 import { compareSubmissionCandidate, submitManifest, type SubmissionOptions, type SubmissionOutcome } from "./recorder.ts";
 import { validateManifest } from "./validator/envelope.ts";
+import { verifyPortableEvidence } from "./portable-evidence.ts";
+import * as checkCapture from "./checks.ts";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -1070,5 +1072,47 @@ describe("the submitted file", () => {
     const target = path.join(test.runRoot, "manifest.json");
     await writeFile(target, "[]", "utf8");
     expect(codesOf(await test.submit(target))).toContain("malformed_field");
+  });
+});
+
+
+describe("installed data evidence propagation", () => {
+  it("retains resource authority separately and requires the current native map", async () => {
+    const test = await scenario();
+    const source = { version: "scoped-check/1" as const, files: [], tests: ["font.test.ts"], memberships: [], cwd: ".", profile: "font", environment: [] };
+    const installedData = { version: "installed-data-consumer/1" as const, consumerId: "font", source, guards: { "font.test.ts": hex64("reader") }, requests: [{ version: "installed-package-data/1" as const, id: "font", issuer: "font.test.ts", package: "font", manifest: "package.json" as const, files: ["font.woff2"], directories: [] }] };
+    const config = { ...CONFIG, providers: [{ id: PROVIDER_ID, findingCodes: [], check: { command: ["node"] as [string], timeoutMs: 1000, scope: source, installedData } }], obligations: CONFIG.obligations.map(row => ({ ...row, acceptedPayloadSpecs: ["checks.passed/1", "installed-data.applicable/1"] })) };
+    // This propagation fixture supplies no passing check attempt. The ordinary
+    // Git-backed check capture has its own sensors; neither validator is mocked.
+    const capture = vi.spyOn(checkCapture, "captureCheckBindings").mockResolvedValue({});
+    try {
+    await publishPreparationReceipt(test.rootDir, { config, candidate: CAPTURED }, { storageRoot: test.storageRoot });
+    const candidate = { treeSha: TREE, deliverableDigest: DELIVERABLE, identityToken: IDENTITY, baseRef: "origin/main", baseTipSha: TIP, mergeBaseSha: MERGE_BASE, workspaceId: WORKSPACE_ID };
+    const binding = { version: "installed-data-binding/1" as const, candidateDigest: digestCanonical(candidate), definitionDigest: "b".repeat(64), declarationDigest: "c".repeat(64), sourceApplicabilityDigest: "d".repeat(64), captureDigest: "e".repeat(64), originDigest: "f".repeat(64) };
+    const payload = { verdict: "applicable", binding };
+    const result = JSON.stringify({ providerId: PROVIDER_ID, runId: RUN_ID, finalPassId: FINAL_PASS, ...payload });
+    await test.writeArtifact("resource-result.json", result);
+    const manifest = manifestFor({ artifacts: [{ path: "resource-result.json", role: "resource-result", sha256: sha256Hex(result) }], claims: [{ obligation: "review.green", payloadSpec: "installed-data.applicable/1", payload }] });
+    const manifestPath = await test.writeManifest(manifest);
+    const absent = await test.submit(manifestPath, { config });
+    expect(absent.status).toBe("rejected");
+    expect(await test.recordCount()).toBe(0);
+    const outcome = await test.submit(manifestPath, { config, resourceBindings: { [PROVIDER_ID]: binding } });
+    expect(outcome.status, JSON.stringify(outcome)).toBe("accepted");
+    if (outcome.status !== "accepted") throw Error(JSON.stringify(outcome));
+    const resolution = outcome.records[0]!.record.resolution;
+    expect(resolution.kind).toBe("evidence");
+    if (resolution.kind !== "evidence") throw Error("expected evidence");
+    expect(resolution.resourceBinding).toEqual(binding);
+    expect(resolution.checkBinding).toBeUndefined();
+    expect(resolution.portable?.manifest).toEqual(manifest);
+    const portable = resolution.portable!;
+    expect(verifyPortableEvidence(config, portable, candidate, portable.context, undefined, { [PROVIDER_ID]: binding })).toEqual([]);
+    expect(verifyPortableEvidence(config, portable, candidate, portable.context)).not.toEqual([]);
+    for (const key of Object.keys(binding).filter(key => key !== "version")) {
+      expect(verifyPortableEvidence(config, portable, candidate, portable.context, undefined, { [PROVIDER_ID]: { ...binding, [key]: "0".repeat(64) } }), key).not.toEqual([]);
+    }
+    expect(verifyPortableEvidence(config, portable, candidate, { ...portable.context, preparationFingerprint: "0".repeat(64) }, undefined, { [PROVIDER_ID]: binding })).not.toEqual([]);
+    } finally { capture.mockRestore(); }
   });
 });

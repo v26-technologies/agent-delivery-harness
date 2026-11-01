@@ -78,6 +78,8 @@
  *                               gate evaluator, so the local gate can never be
  *                               more permissive than CI
  */
+import { normalizeInstalledDataResourceRequests, type InstalledDataResourceRequest } from "./installed-data-resources.ts";
+import { digestCanonical } from "./digest.ts";
 import { createBlocker, GATE_STRUCTURAL_FINDING_CODES, type Blocker, BlockedError, type NonEmptyTuple, type Remediation } from "./blockers.ts";
 
 // ── Closed vocabularies ────────────────────────────────────────────────────
@@ -201,7 +203,7 @@ export interface ProviderRegistration {
   /** Optional stdio provider-rail executable, expressed as argv and never a shell string. */
   readonly command?: NonEmptyTuple<string>;
   /** Deterministic bounded check executed by the product, not a provider protocol. */
-  readonly check?: { readonly command: NonEmptyTuple<string>; readonly timeoutMs: number; readonly outputs?: readonly string[]; readonly scope?: ScopedCheckDefinition };
+  readonly check?: { readonly command: NonEmptyTuple<string>; readonly timeoutMs: number; readonly outputs?: readonly string[]; readonly scope?: ScopedCheckDefinition; readonly installedData?: InstalledDataConsumerDefinition };
 }
 
 /** Explicit opt-in. Lists are repository-relative; memberships are directory prefixes. */
@@ -223,6 +225,25 @@ export function isScopedCheckDefinition(value: unknown): value is ScopedCheckDef
   return paths(value["files"]) && paths(value["tests"]) && paths(value["memberships"], true) &&
     (value["cwd"] === "." || safePath(value["cwd"])) && typeof value["profile"] === "string" && /^[a-zA-Z0-9_.-]+$/.test(value["profile"]) &&
     Array.isArray(env) && env.every(e => isRecord(e) && Object.keys(e).sort().join(",") === "kind,name" && typeof e["name"] === "string" && /^[A-Z_][A-Z0-9_]*$/.test(e["name"]) && !/^(?:GIT_|DELIVERY_CHECK_)/.test(e["name"]) && !["PATH", "HOME", "TMPDIR", "TMP", "TEMP"].includes(e["name"]) && (e["kind"] === "flag" || e["kind"] === "credential")) && new Set(env.map(e => e.name)).size === env.length;
+}
+
+/** Guarded source applicability declaration; this field alone grants no omission. */
+export interface InstalledDataConsumerDefinition {
+  readonly version: "installed-data-consumer/1";
+  readonly consumerId: string;
+  readonly requests: readonly InstalledDataResourceRequest[];
+  readonly source: ScopedCheckDefinition;
+  readonly guards: Readonly<Record<string, string>>;
+}
+export function isInstalledDataConsumerDefinition(value: unknown): value is InstalledDataConsumerDefinition {
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "consumerId,guards,requests,source,version" || value["version"] !== "installed-data-consumer/1" || typeof value["consumerId"] !== "string" || !/^[a-zA-Z0-9_.-]{1,128}$/.test(value["consumerId"]) || !isScopedCheckDefinition(value["source"]) || !isRecord(value["guards"])) return false;
+  const source = value["source"], guards = value["guards"];
+  const paths = [...new Set([...source.files, ...source.tests])].sort();
+  if (Object.keys(guards).length === 0 || Object.keys(guards).some(file => !paths.includes(file)) || !Object.values(guards).every(hash => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))) return false;
+  try {
+    const requests = normalizeInstalledDataResourceRequests(value["requests"]);
+    return requests.every(request => source.tests.includes(request.issuer) && Object.hasOwn(guards, request.issuer));
+  } catch { return false; }
 }
 
 /** Supported private executor profiles; old runtimes reject this opt-in. */
@@ -1025,7 +1046,7 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
           const value = entry["check"];
           if (!isRecord(value)) { findings.add("config_invalid_member", `${at}.check`, "must be an object"); sound = false; }
           else {
-            checkClosed(findings, `${at}.check`, value, ["command", "timeoutMs", "outputs", "scope"]);
+            checkClosed(findings, `${at}.check`, value, ["command", "timeoutMs", "outputs", "scope", "installedData"]);
             const argv = value["command"], timeout = value["timeoutMs"], outputs = value["outputs"];
             if (!Array.isArray(argv) || argv.length === 0 || typeof argv[0] !== "string" || argv[0].trim().length === 0 || argv.some(v => typeof v !== "string" || v.includes("\0")) ||
                 typeof timeout !== "number" || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 3600000 ||
@@ -1035,6 +1056,12 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
             if (value["scope"] !== undefined) {
               if (!isScopedCheckDefinition(value["scope"])) { findings.add("config_invalid_member", `${at}.check.scope`, "requires the supported scoped-check/1 contract"); sound = false; }
               else if (check !== undefined) check = { ...check, scope: value["scope"] };
+            }
+            if (value["installedData"] !== undefined) {
+              const resource = value["installedData"];
+              if (!isInstalledDataConsumerDefinition(resource) || !check?.scope || resource.source.profile !== check.scope.profile || resource.source.cwd !== check.scope.cwd || digestCanonical(resource.source.environment) !== digestCanonical(check.scope.environment)) {
+                findings.add("config_invalid_member", `${at}.check.installedData`, "requires a guarded installed-data consumer matching the actual scoped execution context"); sound = false;
+              } else check = { ...check, installedData: resource };
             }
             if (command !== undefined) { findings.add("config_invalid_member", at, "command and check are mutually exclusive"); sound = false; }
           }
@@ -1154,6 +1181,13 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
       const read = array.map((entry, index) => readObligation(findings, `obligations[${index}]`, entry));
       if (read.every((entry): entry is ObligationPolicy => entry !== undefined)) obligations = read;
     }
+  }
+
+  const resourceProviders = (providers ?? []).filter(provider => provider.check?.installedData);
+  if (resourceProviders.length > 1) findings.add("config_invalid_member", "providers", "installed data v1 supports one resource provider and setup");
+  for (const provider of resourceProviders) {
+    if (!isScopedExecution(scopedExecution) || scopedExecution.mechanicalProviders.includes(provider.id)) findings.add("config_invalid_member", "scopedExecution", "installed data requires a configured non-mechanical resource provider");
+
   }
 
   const deliveryRecordPath =
@@ -1399,9 +1433,11 @@ function checkInvariants(findings: FindingList, config: HarnessConfig): void {
         findings.add("config_dangling_provider", `${at}.providers`, `names ${JSON.stringify(providerId)}, which no provider registration declares`);
       }
     }
-    if (obligation.providers.some(id => config.providers.find(provider => provider.id === id)?.check !== undefined) &&
-        (obligation.freshness !== "exact_candidate" || obligation.acceptedPayloadSpecs.length !== 1 || obligation.acceptedPayloadSpecs[0] !== "checks.passed/1")) {
-      findings.add("config_invalid_member", at, "declared checks require exact_candidate freshness and only checks.passed/1 payloads");
+    const checkProviders = obligation.providers.map(id => config.providers.find(provider => provider.id === id)).filter(provider => provider?.check !== undefined);
+    const permitsApplicability = obligation.providers.length > 0 && obligation.providers.every(id => config.providers.find(provider => provider.id === id)?.check?.installedData !== undefined);
+    if ((checkProviders.length > 0 && (obligation.freshness !== "exact_candidate" || new Set(obligation.acceptedPayloadSpecs).size !== obligation.acceptedPayloadSpecs.length || !obligation.acceptedPayloadSpecs.includes("checks.passed/1") || obligation.acceptedPayloadSpecs.some(spec => spec !== "checks.passed/1" && !(permitsApplicability && spec === "installed-data.applicable/1")))) ||
+        (obligation.acceptedPayloadSpecs.includes("installed-data.applicable/1") && !permitsApplicability)) {
+      findings.add("config_invalid_member", at, "declared checks require exact_candidate freshness, checks.passed fallback, and applicability only for opted-in installed-data consumers");
     }
     for (const groupId of obligation.activation.sensitiveGroupIds ?? []) {
       if (!sensitiveGroupIds.has(groupId)) {

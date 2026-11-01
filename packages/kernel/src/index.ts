@@ -1221,3 +1221,29 @@ export type { ScopedExecutionDefinition, ScopedExecutionProfile } from "./config
 export { scopedCheckIdentity, type ScopedRuntimeObservation } from "./scoped-inputs.ts";
 
 export { reconciliationActions, runActionReconciliationError, type ReconciliationAction } from "./spine/run-action-reconciliation.ts";
+
+export {
+  normalizeInstalledDataResourceRequests,
+  captureInstalledDataResources,
+  validateInstalledDataResourceCapture,
+  validateResourceApplicabilityProjection,
+  createResourceApplicabilityProjection,
+  matchResourceApplicabilityProjection,
+  InstalledDataResourceError,
+  INSTALLED_DATA_LIMITS,
+  type InstalledDataResourceRequest,
+  type InstalledDataResourceContext,
+  type InstalledDataResourcePorts,
+  type InstalledDataResourceCapture,
+  type ResourceApplicabilityProjection,
+  type InstalledDataAttemptOrigin,
+} from "./installed-data-resources.ts";
+
+export { isInstalledDataConsumerDefinition, type InstalledDataConsumerDefinition } from "./config.ts";
+
+export { isResourceApplicabilityBinding, validateResourceApplicabilityBinding, createResourceApplicabilityBinding } from "./installed-data-evidence.ts";
+export { captureInstalledDataBinding, InstalledDataSourceError, type InstalledDataSourceTree } from "./installed-data-source.ts";
+
+export type { ResourceApplicabilityBinding } from "./records.types.ts";
+
+export { reconstructResourceApplicability } from "./installed-data-portable.ts";

@@ -4,7 +4,7 @@ import { digestCanonical, sha256Hex } from "./digest.ts";
 import type { HarnessConfig } from "./config.ts";
 import { recordOutputConfiguration } from "./record-output.ts";
 import type { ArtifactObservation, ArtifactsPort } from "./artifacts.types.ts";
-import type { PortableEvidence, PortableEvidenceContext, RecordCandidateBinding, CheckBinding } from "./records.types.ts";
+import type { PortableEvidence, PortableEvidenceContext, RecordCandidateBinding, CheckBinding, ResourceApplicabilityBinding } from "./records.types.ts";
 import { readWorkflowRelease, resolveReviewCharters, type ReviewInputReader } from "./review-inputs.ts";
 import { validateReviewedContext, parseReviewOutcome, reviewerLists, deriveTelemetry, type ReviewContextDocument } from "./review-outcome.ts";
 import { REVIEW_GREEN_1, REVIEW_GREEN_2 } from "./validator/codes.ts";
@@ -87,7 +87,7 @@ export function portableArtifactContents(value: unknown): { readonly artifacts: 
 }
 
 /** The same manifest validator, with a portable artifact reader supplying ENV-11 and RG-4 bytes. */
-export function verifyPortableEvidence(config: HarnessConfig, portable: PortableEvidence, binding: RecordCandidateBinding, expected: PortableEvidenceContext, checkBindings?: Readonly<Record<string, CheckBinding>>): readonly Blocker[] {
+export function verifyPortableEvidence(config: HarnessConfig, portable: PortableEvidence, binding: RecordCandidateBinding, expected: PortableEvidenceContext, checkBindings?: Readonly<Record<string, CheckBinding>>, resourceBindings?: Readonly<Record<string, ResourceApplicabilityBinding>>): readonly Blocker[] {
   const blockers: Blocker[] = [];
   if (!isRecord(portable) || portable.version !== "portable-evidence/1" || Object.keys(portable).sort().join(",") !== "artifacts,context,manifest,version" ||
       Buffer.byteLength(JSON.stringify(portable), "utf8") > MAX_PORTABLE_EVIDENCE_BYTES) return [portableBlocker("portable_evidence_invalid", "The portable evidence is missing, unsupported or oversized.")];
@@ -107,7 +107,7 @@ export function verifyPortableEvidence(config: HarnessConfig, portable: Portable
     if (rejection !== null) blockers.push(portableBlocker(rejection.code, rejection.message));
   }
   const candidate = isRecord(portable.manifest) && isRecord(portable.manifest["candidate"]) ? portable.manifest["candidate"] : {};
-  const validation = validateManifest(portable.manifest, { config, prepared: true, artifactContents: read.artifacts, ...(checkBindings === undefined ? {} : { checkBindings }),
+  const validation = validateManifest(portable.manifest, { config, prepared: true, artifactContents: read.artifacts, ...(checkBindings === undefined ? {} : { checkBindings }), ...(resourceBindings === undefined ? {} : { resourceBindings }),
     currentCandidate: { vcs: "git", treeSha: binding.treeSha, ...(candidate["headSha"] === undefined ? {} : { headSha: candidate["headSha"] }),
       deliverable: { digest: binding.deliverableDigest, identity: binding.identityToken },
       base: { ref: binding.baseRef, tipSha: binding.baseTipSha, mergeBaseSha: binding.mergeBaseSha }, workspaceId: binding.workspaceId } });

@@ -56,6 +56,17 @@ export interface RecordCandidateBinding {
  * the record *says*, and two records that disagree about it on one identity are
  * the conflict SUB-4 exists to reject.
  */
+/** Current native authority for an installed-data applicability claim. */
+export interface ResourceApplicabilityBinding {
+  readonly version: "installed-data-binding/1";
+  readonly candidateDigest: string;
+  readonly definitionDigest: string;
+  readonly declarationDigest: string;
+  readonly sourceApplicabilityDigest: string;
+  readonly captureDigest: string;
+  readonly originDigest: string;
+}
+
 export interface CheckBinding {
   readonly definitionDigest: string;
   readonly validationDigest: string;
@@ -101,6 +112,7 @@ export interface EvidenceResolution {
   /** Stamped from the accepted manifest (SUB-4). */
   readonly manifestDigest: string;
   readonly checkBinding?: CheckBinding;
+  readonly resourceBinding?: ResourceApplicabilityBinding;
   /** Accepted original evidence retained before its temporary run root disappears. */
   readonly portable?: PortableEvidence;
 }

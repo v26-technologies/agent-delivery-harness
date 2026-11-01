@@ -37,7 +37,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { GATE_STRUCTURAL_FINDING_CODES } from "./blockers.ts";
 import { CANDIDATE_VCS, type CandidateCapture, type CapturedCandidate, type ReviewActivationProjection } from "./candidate.types.ts";
 import { defineHarnessConfig, type HarnessConfig, type HarnessConfigInput, type ObligationPolicy } from "./config.ts";
@@ -47,6 +47,8 @@ import { publishPreparationReceipt } from "./preparation.ts";
 import { discoverRecords, publishRecord, resolveRecordStorage } from "./records.ts";
 import type { RecordCandidateBinding } from "./records.types.ts";
 import { runAdmission, type AdmissionOptions, type AdmissionResult } from "./admission.ts";
+import * as checkCapture from "./checks.ts";
+import { digestCanonical } from "./digest.ts";
 
 const run = promisify(execFile);
 
@@ -568,5 +570,30 @@ describe("admission: store hygiene", () => {
     // Only the receipt leaf exists; no records leaf was created.
     const contents = readdirSync(storage.storageRoot);
     expect(contents).not.toContain("records");
+  });
+});
+
+
+describe("installed data admission propagation", () => {
+  it("uses only the current invocation resource map and retains ordinary candidate freshness", async () => {
+    const repo = await tempRepo(), workspaceId = await storeWorkspaceId(repo), candidate = capturedCandidate(workspaceId);
+    const original = testConfig([obligation({ id: "review.green", freshness: "exact_candidate", providers: ["rev"], humanWaiverAllowed: false, waivableCodes: [] })]);
+    const source = { version: "scoped-check/1" as const, files: [], tests: ["font.test.ts"], memberships: [], cwd: ".", profile: "font", environment: [] };
+    const installedData = { version: "installed-data-consumer/1" as const, consumerId: "font", source, guards: { "font.test.ts": "a".repeat(64) }, requests: [{ version: "installed-package-data/1" as const, id: "font", issuer: "font.test.ts", package: "font", manifest: "package.json" as const, files: ["font.woff2"], directories: [] }] };
+    const config = { ...original, providers: [{ id: "rev", findingCodes: [], check: { command: ["node"] as [string], timeoutMs: 1000, scope: source, installedData } }], obligations: original.obligations.map(row => ({ ...row, acceptedPayloadSpecs: ["checks.passed/1", "installed-data.applicable/1"] })) };
+    const resourceBinding = { version: "installed-data-binding/1" as const, candidateDigest: digestCanonical(recordBinding(candidate)), definitionDigest: "b".repeat(64), declarationDigest: "c".repeat(64), sourceApplicabilityDigest: "d".repeat(64), captureDigest: "e".repeat(64), originDigest: "f".repeat(64) };
+    await prepare(repo, config, candidate);
+    await publishRecord(repo, { gateId: config.gateId, obligationId: "review.green", candidateBinding: recordBinding(candidate), resolution: { kind: "evidence", providerId: "rev", runId: "run-1", finalPassId: "pass-1", manifestDigest: "f".repeat(64), resourceBinding } });
+    // No ordinary passing check attempt exists in this invocation.
+    const capture = vi.spyOn(checkCapture, "captureCheckBindings").mockResolvedValue({});
+    try {
+      const input = { rootDir: repo, config, context: HUMAN };
+      expect((await runAdmission(input, baseOptions(candidate))).admitted).toBe(false);
+      expect((await runAdmission(input, baseOptions(candidate, { resourceBindings: { rev: resourceBinding } }))).admitted).toBe(true);
+      expect((await runAdmission(input, baseOptions(candidate, { resourceBindings: { rev: { ...resourceBinding, captureDigest: "0".repeat(64) } } }))).admitted).toBe(false);
+      const moved = { ...candidate, deliverable: { ...candidate.deliverable, digest: "0".repeat(64) } };
+      await prepare(repo, config, moved);
+      expect((await runAdmission(input, baseOptions(moved, { resourceBindings: { rev: resourceBinding } }))).admitted).toBe(false);
+    } finally { capture.mockRestore(); }
   });
 });

@@ -89,6 +89,7 @@ export interface ExpectedProviderAttempt {
 }
 
 export interface SubmissionOptions extends RecordStorageOptions {
+  readonly resourceBindings?: Readonly<Record<string, import("./records.types.ts").ResourceApplicabilityBinding>>;
   readonly scopedPlan?: import("./records.types.ts").ScopedCheckPlan;
   readonly readOutput?: (repoPath: string, providerId: string) => Promise<Uint8Array>;
   /**
@@ -545,6 +546,7 @@ export async function submitManifest(input: SubmissionInput, options: Submission
     prepared: captured !== null,
     artifactContents,
     checkBindings,
+    ...(options.resourceBindings === undefined ? {} : { resourceBindings: options.resourceBindings }),
   });
   if (!validation.ok) rejections.push(...validation.rejections);
 
@@ -558,7 +560,7 @@ export async function submitManifest(input: SubmissionInput, options: Submission
   try {
     const context = await capturePortableEvidenceContext(input.config, repositoryEvidenceReader(input.rootDir, artifacts), preparationFingerprint!, captured!.deliverable.digest);
     const portable = retainPortableEvidence(validation.manifest, observations, context);
-    const blockers = verifyPortableEvidence(input.config, portable, recordBinding(validation.manifest), context, checkBindings);
+    const blockers = verifyPortableEvidence(input.config, portable, recordBinding(validation.manifest), context, checkBindings, options.resourceBindings);
     if (blockers.length > 0) return blockedOutcome(blockers);
     return publishClaims(input, options, validation.manifest, portable);
   } catch (error) {
@@ -723,6 +725,7 @@ async function publishClaims(
       finalPassId: manifest.provider.finalPassId,
       manifestDigest: digest,
       ...(claim.payloadSpec === "checks.passed/1" ? { checkBinding: claim.payload["binding"] as unknown as import("./records.types.ts").CheckBinding } : {}),
+      ...(claim.payloadSpec === "installed-data.applicable/1" ? { resourceBinding: claim.payload["binding"] as unknown as import("./records.types.ts").ResourceApplicabilityBinding } : {}),
       portable,
     },
   }));
