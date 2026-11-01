@@ -4,7 +4,7 @@ export const snapshotInventoryWorker = String.raw`
 import { lstat, readFile, readdir, readlink, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-const { root, outputs, excludeDependencies, forbidGit, includeSource } = JSON.parse(process.env.DELIVERY_SNAPSHOT_REQUEST);
+const { root, outputs, excludeDependencies, forbidGit, includeSource, absentInputs = [] } = JSON.parse(process.env.DELIVERY_SNAPSHOT_REQUEST);
 const entries = [];
 const sourceEntries = [];
 const record = (relative, tuple) => {
@@ -16,6 +16,28 @@ const inside = target => {
   return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
 };
 const escape = () => { throw { code: 'check_snapshot_escape' }; };
+const resolveMissing = async target => {
+  const suffix = [];
+  for (;;) {
+    try { return path.join(await realpath(target), ...suffix); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || target === root || !inside(target)) throw error;
+      suffix.unshift(path.basename(target)); target = path.dirname(target);
+    }
+  }
+};
+const protectOutputAlias = (relative, resolved) => {
+  for (const output of outputs) {
+    const o = output.replace(/\/$/, '');
+    const effective = relative === o || relative.startsWith(o + '/') ? resolved : o.startsWith(relative + '/') ? path.join(resolved, o.slice(relative.length + 1)) : null;
+    if (effective === null) continue;
+    const name = path.relative(root, effective).normalize('NFC').toLowerCase();
+    for (const absent of absentInputs) {
+      const a = absent.normalize('NFC').toLowerCase();
+      if (name === a || name.startsWith(a + '/') || a.startsWith(name + '/')) throw { code: 'check_snapshot_drift' };
+    }
+  }
+};
 const walk = async (relative, mutable = false) => {
   if (relative === '.git' || (excludeDependencies && relative.split('/').includes('node_modules'))) return;
   // Mutable paths are excluded from the digest, never from the link/type walk.
@@ -27,6 +49,10 @@ const walk = async (relative, mutable = false) => {
     if (path.isAbsolute(target) || !inside(path.resolve(path.dirname(absolute), target))) escape();
     try { if (!inside(await realpath(absolute))) escape(); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (absentInputs.length && outputs.some(output => {
+      const o = output.replace(/\/$/, '');
+      return relative === o || relative.startsWith(o + '/') || o.startsWith(relative + '/');
+    })) protectOutputAlias(relative, await resolveMissing(absolute));
     if (!mutable) record(relative, [relative, 'link', target]);
   } else if (stat.isDirectory()) {
     for (const name of (await readdir(absolute)).sort()) await walk(relative ? relative + '/' + name : name, mutable);
@@ -35,6 +61,15 @@ const walk = async (relative, mutable = false) => {
   } else escape();
 };
 try {
+  for (const absent of absentInputs) {
+    let relative = '';
+    for (const part of absent.split('/')) {
+      relative = relative ? relative + '/' + part : part;
+      const info = await lstat(path.join(root, relative)).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (info === null) break;
+      if (info.isSymbolicLink() || relative === absent || !info.isDirectory()) throw { code: 'check_snapshot_drift' };
+    }
+  }
   if (forbidGit && await lstat(path.join(root, '.git')).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) throw { code: 'check_snapshot_drift' };
   await walk('');
   // Tuples contain only arrays, strings and permission integers: JSON.stringify

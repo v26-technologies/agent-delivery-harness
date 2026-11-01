@@ -26,6 +26,27 @@ async function fixture() {
   const run = async (...args: string[]) => { out.length = 0; err.length = 0; return runCli(args, runtime); };
   return { dir, git, run, out, err, env, get config() { return config; }, runtime, setConfig: (v: HarnessConfigInput) => { config = defineHarnessConfig(v); } };
 }
+it.each([1,2])("finite physical source separates same-setup envelopes and private outputs at concurrency %s",async concurrency=>{
+  const f=await fixture();f.env['FAIL']='0';
+  await writeFile(path.join(f.dir,'a.txt'),'alpha');await writeFile(path.join(f.dir,'b.txt'),'beta');
+  await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','two finite sources');
+  const providers=f.config.providers.map((provider,index)=>{
+    const own=index===0?'a.txt':'b.txt',other=index===0?'b.txt':'a.txt',output=`result-${index===0?'a':'b'}.json`;
+    return {...provider,check:{...provider.check!,physicalSource:{version:'physical-source/1' as const,files:[own],absentInputs:['startup.cjs']},
+      command:[process.execPath,'-e',`const fs=require('fs');if(fs.existsSync(${JSON.stringify(other)})||fs.existsSync('source.txt')||fs.existsSync('.git'))throw Error('wrong shared projection');fs.writeFileSync(${JSON.stringify(output)},fs.readFileSync(${JSON.stringify(own)}));`] as [string,...string[]],
+      scope:{...provider.check!.scope!,files:[own]}}};
+  });
+  f.setConfig({...f.config,providers,scopedExecution:{...f.config.scopedExecution!,concurrency,mechanicalProviders:['check.a','check.b']}});
+  const snapshots=await import('./check-snapshot.ts'),create=snapshots.createCheckSnapshot,roots:string[]=[];
+  const observer=vi.spyOn(snapshots,'createCheckSnapshot').mockImplementation(async input=>{const snapshot=await create(input);roots.push(snapshot.rootDir);return snapshot;});
+  try{
+    expect(await f.run('prepare'),f.err.join('\n')).toBe(0);
+    expect(roots).toHaveLength(2);expect(new Set(roots).size).toBe(2);
+    expect(await f.run('gate'),f.err.join('\n')).toBe(0);
+    expect(await f.run('record'),f.err.join('\n')).toBe(0);
+    expect(await f.run('verify'),f.err.join('\n')).toBe(0);
+  }finally{observer.mockRestore();}
+},60000);
 it.each([1, 2])("forwards existing snapshot phase timings with the active check and attempt at concurrency %s", async concurrency => {
   const f = await fixture(); f.env["FAIL"] = "0";
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, concurrency, mechanicalProviders: ["check.a", "check.b"], profiles: f.config.scopedExecution!.profiles.map(profile => ({ ...profile,

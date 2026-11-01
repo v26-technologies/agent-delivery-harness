@@ -7,6 +7,7 @@ import type { CandidateTreeInputReader } from "./portable-inputs.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
 import type { ScopedRuntimeObservation } from "./scoped-inputs.ts";
 import type { InstalledDataResourceContext } from "./installed-data-resources.ts";
+import { capturePhysicalSource } from "./physical-source.ts";
 export class InstalledDataSourceError extends Error {
   readonly code = "installed_data_source_unqualified";
 }
@@ -41,8 +42,10 @@ export async function captureInstalledDataBinding(
     if (bytes === null || !["100644", "100755"].includes(metadata.mode ?? "") || metadata.links.length) throw refuse();
     dependencies.push({file,sha256:sha256Hex(bytes),metadata});
   }
+  const physicalSource = provider.check.physicalSource;
+  const physical = physicalSource ? await Promise.all([source.base, source.candidate].map(tree => capturePhysicalSource(physicalSource, tree.read).then(value => value.identity))).catch(() => { throw refuse(); }) : undefined;
   const context: InstalledDataResourceContext = {
-    setupRecipeDigest: digestCanonical({...profile,dependencyInputs:[...profile.dependencyInputs].sort(),mutableOutputs:[...profile.mutableOutputs].sort()}),
+    setupRecipeDigest: digestCanonical({...profile,dependencyInputs:[...profile.dependencyInputs].sort(),mutableOutputs:[...profile.mutableOutputs].sort(), ...(physical ? { physicalSource: physical } : {})}),
     dependencyDigest: digestCanonical({inputs:dependencies,setup:profile.dependencies ?? null}),
     runtimeDigest: observation.runtimeDigest,
     releaseDigest: digestCanonical(await readWorkflowRelease(readEvidence)),

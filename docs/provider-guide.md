@@ -444,3 +444,45 @@ never by time: narration-only changes (paths in the config's `reviewNeutral`
 set) do not stale your review, while any change to the deliverable does. Base
 movement stales evidence. There is nothing a provider can do to refresh stale
 evidence except review the new candidate — which is the point.
+
+## Finite physical source for scoped checks
+
+A qualified check may opt into `check.physicalSource` with the closed shape
+`{version: "physical-source/1", files: [...], absentInputs: [...]}`. This is
+physical execution authority, separate from `scope` reuse inputs and
+`installedData.source` applicability. Without the field, materialization and
+Git behavior remain unchanged. The opt-in requires a `gitContext: "none"`
+profile; Git-dependent or unqualified tools keep the complete private tree.
+
+Declare exact candidate files covering the consumer and its configuration,
+startup, resolver, DATA and setup closure. Include every dependency input and
+test member. Paths must be unique and unambiguous, with at most 1024 combined
+file/absence entries. Materialized source is bounded to 8 MiB per file and
+64 MiB total. Candidate symlinks and linked ancestors are refused, including
+internal links to omitted targets. Tracked dependency files cannot be physical
+source. Files come from the immutable prepared candidate, preserving bytes and
+executable modes; author worktree files and installations supply no authority.
+
+Required absences are checked against that candidate and protected throughout
+setup, resource observation and execution. Mutable outputs cannot overlap an
+absence or its ancestors/descendants. Output permissions do not waive absence,
+link or type checks. Verification still walks the entire resulting source and
+installed dependency tree; finite mode does not filter dependency verification.
+Different source envelopes cannot share an incomplete execution tree solely
+because their setup commands match. Cancellation and cleanup retain ownership
+of the snapshot and reader processes.
+
+The complete physical declaration and candidate bytes/modes/absences bind
+scoped and portable identities. A finite installed-DATA consumer's whole-check
+attempt remains candidate-bound even without physical Git: an unchanged setup
+recipe does not prove unchanged installed bytes. A new candidate re-enters
+native resource observation; matching resource evidence may omit the command,
+while changed DATA restores it. Same-candidate record verification does not
+reacquire dependencies. Builtin-only checks can separately qualify no setup;
+Git-none alone grants neither setup omission nor a smaller dependency runtime.
+
+This capability does not prove an adopter's source closure, qualify its command,
+or establish latency. The adopter must select it only for a supported exact
+closure, preserving ordinary fallback for unknown effects or changed authority.
+Malformed explicit configuration fails closed rather than silently running an
+incomplete tree.

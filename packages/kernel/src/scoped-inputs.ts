@@ -7,6 +7,7 @@ import { readWorkflowRelease, type ReviewInputReader } from "./review-inputs.ts"
 import type { CandidateTreeInputReader } from "./portable-inputs.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
 import { BlockedError, createBlocker } from "./blockers.ts";
+import { capturePhysicalSource } from "./physical-source.ts";
 const invalid = (code: string, summary: string) => new BlockedError([createBlocker({ code, source: { kind: "command", id: "delivery-harness.scoped-inputs" }, summary,
   remediations: [{ id: "repair-scoped-inputs", kind: "manual_action", summary: "Restore the declared dependency inputs or correct the execution profile, then prepare again." }] })]);
 export interface ScopedRuntimeObservation {
@@ -38,12 +39,22 @@ export async function scopedCheckIdentity(config: HarnessConfig, provider: Provi
   const dependencyDigest = digestCanonical({ inputs: dependencyInputs, setup: profile.dependencies ?? null });
   const releaseDigest = digestCanonical(await readWorkflowRelease(readEvidence));
   const policyDigest = digestCanonical(config.obligations.filter(o => o.providers.includes(provider.id)).map(o => ({ ...o, providers: [provider.id] })));
+  const physicalSource = provider.check?.physicalSource;
+  let physicalIdentity: Awaited<ReturnType<typeof capturePhysicalSource>>["identity"] | undefined;
+  if (physicalSource) {
+    try { physicalIdentity = (await capturePhysicalSource(physicalSource, read)).identity; }
+    catch { throw invalid("check_identity_invalid", "Physical source bytes, modes or protected absences are unavailable or unsafe."); }
+  }
   const relevantProfile = { ...profile,
+    ...(physicalIdentity ? { physicalSource: physicalIdentity } : {}),
     mutableOutputs: profile.mutableOutputs.filter(m => provider.check!.outputs?.some(o => m.endsWith("/") ? o.startsWith(m) : o === m)),
     credentialIdentities: Object.fromEntries(credentials.filter(name => profile.credentialIdentities[name] !== undefined).map(name => [name, profile.credentialIdentities[name]])) };
   // The executor injects Git base context, so even unchanged source can execute
   // differently after the base moves. Recompute this from the selected candidate.
-  const runtimeDigest = digestCanonical({ runtime: observation.runtimeDigest, base: candidate.base, ...(profile.gitContext === "none" ? {} : { headSha: candidate.headSha, treeSha: candidate.treeSha }), ...(provider.check?.installedData ? { installedData: provider.check.installedData } : {}) });
+  // A finite installed-resource consumer still needs fresh native resource
+  // capture on a new candidate; source equality must not promote its old whole
+  // attempt and bypass that bootstrap. Applicability remains a separate proof.
+  const runtimeDigest = digestCanonical({ runtime: observation.runtimeDigest, base: candidate.base, ...(profile.gitContext === "none" && !(physicalSource && provider.check?.installedData) ? {} : { headSha: candidate.headSha, treeSha: candidate.treeSha }), ...(provider.check?.installedData ? { installedData: provider.check.installedData } : {}) });
   const profileDigest = digestCanonical({ profile: relevantProfile, runtimeDigest, dependencyDigest, releaseDigest, policyDigest });
   const capture = await captureScopedCheckInputs(scope, { listFiles: async () => inventory.filter(file => file !== output), readFile: read, readMetadata: read.metadata, command: provider.check!.command, timeoutMs: provider.check!.timeoutMs,
     runtimeDigest, dependencyDigest, releaseDigest, policyDigest, environment, credentialIdentity: name => observation.credentials[name]?.identity ?? null });

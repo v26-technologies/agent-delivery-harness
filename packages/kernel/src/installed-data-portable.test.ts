@@ -13,7 +13,27 @@ function tree(bytes:Map<string,string>,linked=new Set<string>()):InstalledDataSo
  const read=Object.assign(async(p:string)=>bytes.has(p)?new TextEncoder().encode(bytes.get(p)!):null,{metadata:async(p:string)=>({mode:bytes.has(p)?'100644':null,links:linked.has(p)?[{path:p,target:'other'}]:[]})}) as CandidateTreeInputReader;
  return{inventory:[...bytes.keys()],read};
 }
-async function fixture(order?:'request-ids'|'files'|'directories'|'combined'){
+describe('finite physical source portable identity',()=>{
+ it('reconstructs an unrelated candidate with unchanged physical authority',async()=>{
+  const f=await fixture(undefined,true);
+  await expect(f.reconstruct()).resolves.toHaveProperty('binding');
+  const current=await f.trees(currentTree);
+  const identity=await scopedCheckIdentity(f.config,f.provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+  expect(identity.inputDigest).not.toBe(f.identity.inputDigest);
+ });
+ it.each(['envelope','absence','present-absence','physical-link','physical-bytes'])('refuses changed finite authority: %s',async mode=>{
+  const f=await fixture(undefined,true),physical=f.provider.check!.physicalSource!;
+  if(mode==='present-absence')f.maps.get(currentTree)!.set('startup.cjs','injected');
+  if(mode==='physical-link')f.links.get(currentTree)!.add('package.json');
+  if(mode==='physical-bytes')f.maps.get(currentTree)!.set('package.json','changed manifest');
+  if(mode==='envelope'||mode==='absence'){
+   const changed={...f.provider,check:{...f.provider.check!,physicalSource:{...physical,...(mode==='envelope'?{files:[...physical.files,'root.ts']}:{absentInputs:[...physical.absentInputs,'other.cjs']})}}};
+   const config={...f.config,providers:[changed]};
+   await expect(reconstructResourceApplicability(config,changed,f.candidate,f.proof,f.trees,f.readEvidence)).rejects.toThrow();
+  }else await expect(f.reconstruct()).rejects.toThrow();
+ });
+});
+async function fixture(order?:'request-ids'|'files'|'directories'|'combined',finite=false){
  const bytes=new Map([['font.test.ts','test'],['reader.ts','reader'],['asset.bin','data'],['package.json','{}'],['root.ts','old']]);
  const maps=new Map([[baseTree,new Map(bytes)],[originalTree,new Map(bytes)],[currentTree,new Map([...bytes].map(([p,s])=>[p,p==='root.ts'?'unrelated change':s]))]]);
  const links=new Map([...maps.keys()].map(key=>[key,new Set<string>()]));
@@ -23,8 +43,8 @@ async function fixture(order?:'request-ids'|'files'|'directories'|'combined'){
  const request:InstalledDataResourceRequest={version:'installed-package-data/1',id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json',files:order==='files'||order==='combined'?['z.woff2','a.woff2']:['font.woff2'],directories:order==='directories'||order==='combined'?[{path:'z-fonts',suffix:'-normal.woff2'},{path:'a-fonts',suffix:'-normal.woff2'}]:[]};
  const requests=order==='request-ids'||order==='combined'?[{...request,id:'z-font'},{...request,id:'a-font'}]:[request];
  const installedData={version:'installed-data-consumer/1' as const,consumerId:'font',requests,source,guards:{'reader.ts':sha256Hex('reader'),'font.test.ts':sha256Hex('test')}};
- const provider={id:'font',findingCodes:[],check:{command:['node','test.js'],timeoutMs:1000,scope:source,outputs:['result.json'],installedData}} as ProviderRegistration;
- const config={deliveryRecordPath:'delivery/record.json',providers:[provider],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'font',gitContext:'full',dependencyInputs:['package.json'],dependencies:{command:['node','setup'],timeoutMs:1000},mutableOutputs:['result.json'],credentialIdentities:{}}],mechanicalProviders:[]},obligations:[{id:'font.passed',providers:['font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1','installed-data.applicable/1']}]} as unknown as HarnessConfig;
+ const provider={id:'font',findingCodes:[],check:{command:['node','test.js'],timeoutMs:1000,scope:source,outputs:['result.json'],installedData,...(finite?{physicalSource:{version:'physical-source/1',files:['font.test.ts','reader.ts','asset.bin','package.json'],absentInputs:['startup.cjs']}}:{})}} as ProviderRegistration;
+ const config={deliveryRecordPath:'delivery/record.json',providers:[provider],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'font',gitContext:finite?'none':'full',dependencyInputs:['package.json'],dependencies:{command:['node','setup'],timeoutMs:1000},mutableOutputs:['result.json'],credentialIdentities:{}}],mechanicalProviders:[]},obligations:[{id:'font.passed',providers:['font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1','installed-data.applicable/1']}]} as unknown as HarnessConfig;
  const observation={version:'scoped-runtime/1' as const,runtimeDigest:hash('node'),flags:{},credentials:{}};
  const original={headSha:sha('d'),treeSha:originalTree,deliverable:{digest:hash('old'),identity:'git-tree/v1'},base:{ref:'origin/main',tipSha:baseTree,mergeBaseSha:baseTree},workspaceId:'workspace'} as unknown as CapturedCandidate;
  const candidate={...original,headSha:sha('e'),treeSha:currentTree,deliverable:{...original.deliverable,digest:hash('current')}};

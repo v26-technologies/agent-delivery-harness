@@ -203,7 +203,41 @@ export interface ProviderRegistration {
   /** Optional stdio provider-rail executable, expressed as argv and never a shell string. */
   readonly command?: NonEmptyTuple<string>;
   /** Deterministic bounded check executed by the product, not a provider protocol. */
-  readonly check?: { readonly command: NonEmptyTuple<string>; readonly timeoutMs: number; readonly outputs?: readonly string[]; readonly scope?: ScopedCheckDefinition; readonly installedData?: InstalledDataConsumerDefinition };
+  readonly check?: { readonly command: NonEmptyTuple<string>; readonly timeoutMs: number; readonly outputs?: readonly string[]; readonly scope?: ScopedCheckDefinition; readonly installedData?: InstalledDataConsumerDefinition; readonly physicalSource?: PhysicalSourceDefinition };
+}
+
+/** Explicit physical materialization authority, independent of reuse input scope. */
+export interface PhysicalSourceDefinition {
+  readonly version: "physical-source/1";
+  readonly files: readonly string[];
+  readonly absentInputs: readonly string[];
+}
+export function isPhysicalSourceDefinition(value: unknown): value is PhysicalSourceDefinition {
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "absentInputs,files,version" || value["version"] !== "physical-source/1") return false;
+  const files = value["files"], absent = value["absentInputs"];
+  if (!Array.isArray(files) || !files.length || !Array.isArray(absent) || files.length + absent.length > 1024) return false;
+  const paths = [...files, ...absent];
+  if (paths.some(p => typeof p !== "string" || !p.length || p.length > 4096 || /[\\\x00-\x1f\x7f]/.test(p) || p.startsWith("/") || /^[A-Za-z]:/.test(p) || p.split("/").some(s => !s || s === "." || s === ".." || s.toLowerCase() === ".git"))) return false;
+  const aliases = new Map<string, string>();
+  for (const file of paths as string[]) {
+    let prefix = "";
+    for (const segment of file.split("/")) {
+      prefix = prefix ? `${prefix}/${segment}` : segment;
+      const folded = prefix.normalize("NFC").toLowerCase(), previous = aliases.get(folded);
+      if (previous !== undefined && previous !== prefix) return false;
+      aliases.set(folded, prefix);
+    }
+  }
+  const folded = paths.map(p => (p as string).normalize("NFC").toLowerCase());
+  if (files.some(p => (p as string).split("/").some(segment => segment.toLowerCase() === "node_modules"))) return false;
+  return new Set(folded).size === folded.length && !folded.some((p, i) => folded.some((q, j) => i !== j && q.startsWith(`${p}/`)));
+}
+/** Absence is protected even when a mutable output would otherwise hide bytes. */
+export function physicalSourceOutputOverlap(source: PhysicalSourceDefinition, outputs: readonly string[]): boolean {
+  return source.absentInputs.some(absent => outputs.some(output => {
+    const a = absent.normalize("NFC").toLowerCase(), o = output.replace(/\/$/, "").normalize("NFC").toLowerCase();
+    return a === o || a.startsWith(`${o}/`) || o.startsWith(`${a}/`);
+  }));
 }
 
 /** Explicit opt-in. Lists are repository-relative; memberships are directory prefixes. */
@@ -1046,7 +1080,7 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
           const value = entry["check"];
           if (!isRecord(value)) { findings.add("config_invalid_member", `${at}.check`, "must be an object"); sound = false; }
           else {
-            checkClosed(findings, `${at}.check`, value, ["command", "timeoutMs", "outputs", "scope", "installedData"]);
+            checkClosed(findings, `${at}.check`, value, ["command", "timeoutMs", "outputs", "scope", "installedData", "physicalSource"]);
             const argv = value["command"], timeout = value["timeoutMs"], outputs = value["outputs"];
             if (!Array.isArray(argv) || argv.length === 0 || typeof argv[0] !== "string" || argv[0].trim().length === 0 || argv.some(v => typeof v !== "string" || v.includes("\0")) ||
                 typeof timeout !== "number" || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 3600000 ||
@@ -1062,6 +1096,11 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
               if (!isInstalledDataConsumerDefinition(resource) || !check?.scope || resource.source.profile !== check.scope.profile || resource.source.cwd !== check.scope.cwd || digestCanonical(resource.source.environment) !== digestCanonical(check.scope.environment)) {
                 findings.add("config_invalid_member", `${at}.check.installedData`, "requires a guarded installed-data consumer matching the actual scoped execution context"); sound = false;
               } else check = { ...check, installedData: resource };
+            }
+            if (value["physicalSource"] !== undefined) {
+              if (!isPhysicalSourceDefinition(value["physicalSource"]) || !check?.scope) {
+                findings.add("config_invalid_member", `${at}.check.physicalSource`, "requires a finite physical-source/1 scoped declaration"); sound = false;
+              } else check = { ...check, physicalSource: value["physicalSource"] };
             }
             if (command !== undefined) { findings.add("config_invalid_member", at, "command and check are mutually exclusive"); sound = false; }
           }
@@ -1131,10 +1170,18 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
   const additionalReviewLenses = input["additionalReviewLenses"] === undefined ? undefined : readAdditionalReviewLenses(findings, input["additionalReviewLenses"]);
 
   const scopedExecution = input["scopedExecution"];
+  if (providers?.some(provider => provider.check?.physicalSource) && !isScopedExecution(scopedExecution)) findings.add("config_invalid_member", "physicalSource", "finite source requires an explicit scoped execution profile");
   if (scopedExecution !== undefined && !isScopedExecution(scopedExecution)) findings.add("config_invalid_member", "scopedExecution", "requires the supported scoped-execution/1 profiles");
   if (isScopedExecution(scopedExecution)) {
     for (const provider of providers ?? []) {
       if (provider.check?.scope && !scopedExecution.profiles.some(p => p.id === provider.check!.scope!.profile)) findings.add("config_invalid_member", "scopedExecution.profiles", "every scoped check requires its declared execution profile");
+      const source = provider.check?.physicalSource;
+      if (source) {
+        const profile = scopedExecution.profiles.find(p => p.id === provider.check!.scope!.profile);
+        if (profile?.gitContext !== "none" || physicalSourceOutputOverlap(source, [...profile.mutableOutputs, ...provider.check!.outputs ?? []]) ||
+            profile.dependencyInputs.some(file => !source.files.includes(file)) || provider.check!.scope!.tests.some(file => !source.files.includes(file)))
+          findings.add("config_invalid_member", "physicalSource", "finite source requires Git-none, included dependency/test inputs and protected absences disjoint from outputs");
+      }
     }
     if (scopedExecution.mechanicalProviders.some(id => !providers?.some(p => p.id === id && p.check?.scope))) findings.add("config_invalid_member", "scopedExecution.mechanicalProviders", "mechanical providers must name scoped check providers");
   }
