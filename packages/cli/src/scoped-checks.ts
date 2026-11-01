@@ -296,7 +296,11 @@ export class ScopedChecks {
     if (!provider?.check?.scope || !profile || !this.identities.has(providerId)) throw new CheckSnapshotError("scoped_executor_required", "Installed resources require an already configured scoped provider and profile.");
     const normalized = normalizeInstalledDataResourceRequests(requests);
     try {
-      const { snapshot } = await this.acquireSnapshot(profile, lane);
+      const { snapshot, sharedOutputs } = await this.acquireSnapshot(profile, lane);
+      // Prior checks have already retained their outputs. Resource observation
+      // reads immutable package DATA, so remove permitted mutable products first
+      // and retain the observer's strict source/dependency verification.
+      for (const output of sharedOutputs) await rm(path.join(snapshot.rootDir, output), { recursive: true, force: true });
       const capture = await captureOwnedInstalledDataResources(snapshot, normalized, context, this.context.signal ? { signal: this.context.signal } : {});
       return { capture, snapshot };
     } catch (error) {

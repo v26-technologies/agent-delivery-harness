@@ -81,7 +81,10 @@ verification. With parallel workers, the first requested check and the captured
 consumer run on the capture worker before the remaining checks enter the pool.
 Other workers retain independent snapshots. Worker-local ordering keeps capture,
 applicability publication or cold execution together; cleanup drains accepted
-work before removing snapshots. Serial setup eviction remains unchanged.
+work before removing snapshots. Serial setup eviction remains unchanged. Before observing resources, the worker
+clears shared profiles' permitted mutable outputs; prior checks' retained output
+evidence remains available. The observer still verifies the full immutable
+source/dependency snapshot before and after capture.
 
 An unrelated HEAD can leave this qualified consumer's source/resources unchanged
 while its original full-Git input/profile remains stale. In that case the gate

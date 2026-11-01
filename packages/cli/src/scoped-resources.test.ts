@@ -102,12 +102,17 @@ describe('native scoped installed resources',()=>{
   },60000);
   it('parallel gate keeps cold resource execution on its capture worker and shares setup with the first check',async()=>{
     const f=await fixture(true,true),font=f.config.providers[0]!;
-    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e','setTimeout(()=>{},80)'],timeoutMs:5000,scope:font.check!.scope}};
-    const config=defineHarnessConfig({...f.config,providers:[peer,font],obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],scopedExecution:{...f.config.scopedExecution!,concurrency:2}});
+    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',"const fs=require('fs');fs.writeFileSync('result.json','peer allowed cache');fs.writeFileSync('peer.json','peer retained');"],timeoutMs:5000,outputs:['peer.json'],scope:font.check!.scope}};
+    const config=defineHarnessConfig({...f.config,providers:[peer,font],obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],scopedExecution:{...f.config.scopedExecution!,concurrency:2,profiles:f.config.scopedExecution!.profiles.map(p=>({...p,mutableOutputs:[...p.mutableOutputs,'peer.json']}))}});
     const runtime={...f.runtime,loadConfig:async()=>config};
     expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
     expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
     expect(await readFile(f.setupCount,'utf8')).toBe('setup\n');
+    const terminalPaths=(await readdir(path.join(f.dir,'.git'),{recursive:true})).filter(p=>p.endsWith('terminal.json'));
+    const terminalRows=await Promise.all(terminalPaths.map(p=>readFile(path.join(f.dir,'.git',p),'utf8').then(JSON.parse)));
+    expect(terminalRows.find(r=>r.entry.attempt.providerId==='check.font')?.entry.payload.resourceApplicability).toBeDefined();
+    expect(terminalRows.find(r=>r.entry.attempt.providerId==='check.peer')?.entry.payload.outputs).toContainEqual({path:'peer.json',base64:Buffer.from('peer retained').toString('base64'),sha256:sha256Hex('peer retained')});
+
     await writeFile(path.join(f.dir,'parallel-unrelated.md'),'prose');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');
     expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
     expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
