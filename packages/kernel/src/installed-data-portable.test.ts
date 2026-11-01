@@ -2,7 +2,7 @@ import {describe,expect,it} from 'vitest';
 import {digestCanonical,sha256Hex} from './digest.ts';
 import {reconstructResourceApplicability} from './installed-data-portable.ts';
 import {captureInstalledDataBinding,type InstalledDataSourceTree} from './installed-data-source.ts';
-import {captureInstalledDataResources,createResourceApplicabilityProjection} from './installed-data-resources.ts';
+import {captureInstalledDataResources,createResourceApplicabilityProjection,type InstalledDataResourceRequest} from './installed-data-resources.ts';
 import {scopedCheckIdentity} from './scoped-inputs.ts';
 import type {CapturedCandidate} from './candidate.types.ts';
 import type {HarnessConfig,ProviderRegistration} from './config.ts';
@@ -13,15 +13,16 @@ function tree(bytes:Map<string,string>,linked=new Set<string>()):InstalledDataSo
  const read=Object.assign(async(p:string)=>bytes.has(p)?new TextEncoder().encode(bytes.get(p)!):null,{metadata:async(p:string)=>({mode:bytes.has(p)?'100644':null,links:linked.has(p)?[{path:p,target:'other'}]:[]})}) as CandidateTreeInputReader;
  return{inventory:[...bytes.keys()],read};
 }
-async function fixture(){
+async function fixture(order?:'request-ids'|'files'|'directories'|'combined'){
  const bytes=new Map([['font.test.ts','test'],['reader.ts','reader'],['asset.bin','data'],['package.json','{}'],['root.ts','old']]);
  const maps=new Map([[baseTree,new Map(bytes)],[originalTree,new Map(bytes)],[currentTree,new Map([...bytes].map(([p,s])=>[p,p==='root.ts'?'unrelated change':s]))]]);
  const links=new Map([...maps.keys()].map(key=>[key,new Set<string>()]));
  const trees=async(key:string)=>{const files=maps.get(key);if(!files)throw Error('unknown immutable tree');return tree(files,links.get(key)!);};
  const release=new Map<string,string>();const readEvidence=async(p:string)=>release.has(p)?new TextEncoder().encode(release.get(p)!):null;
  const source={version:'scoped-check/1' as const,files:['reader.ts','asset.bin'],tests:['font.test.ts'],memberships:[],cwd:'.',profile:'font',environment:[]};
- const request={version:'installed-package-data/1' as const,id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json' as const,files:['font.woff2'],directories:[]};
- const installedData={version:'installed-data-consumer/1' as const,consumerId:'font',requests:[request],source,guards:{'reader.ts':sha256Hex('reader'),'font.test.ts':sha256Hex('test')}};
+ const request:InstalledDataResourceRequest={version:'installed-package-data/1',id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json',files:order==='files'||order==='combined'?['z.woff2','a.woff2']:['font.woff2'],directories:order==='directories'||order==='combined'?[{path:'z-fonts',suffix:'-normal.woff2'},{path:'a-fonts',suffix:'-normal.woff2'}]:[]};
+ const requests=order==='request-ids'||order==='combined'?[{...request,id:'z-font'},{...request,id:'a-font'}]:[request];
+ const installedData={version:'installed-data-consumer/1' as const,consumerId:'font',requests,source,guards:{'reader.ts':sha256Hex('reader'),'font.test.ts':sha256Hex('test')}};
  const provider={id:'font',findingCodes:[],check:{command:['node','test.js'],timeoutMs:1000,scope:source,outputs:['result.json'],installedData}} as ProviderRegistration;
  const config={deliveryRecordPath:'delivery/record.json',providers:[provider],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'font',gitContext:'full',dependencyInputs:['package.json'],dependencies:{command:['node','setup'],timeoutMs:1000},mutableOutputs:['result.json'],credentialIdentities:{}}],mechanicalProviders:[]},obligations:[{id:'font.passed',providers:['font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1','installed-data.applicable/1']}]} as unknown as HarnessConfig;
  const observation={version:'scoped-runtime/1' as const,runtimeDigest:hash('node'),flags:{},credentials:{}};
@@ -30,7 +31,7 @@ async function fixture(){
  const originalSource=await trees(originalTree);
  const identity=await scopedCheckIdentity(config,provider,originalSource.inventory,originalSource.read,observation,original,readEvidence);
  const native=await captureInstalledDataBinding(config,provider,original,observation,{base:await trees(baseTree),candidate:originalSource},readEvidence);
- const capture=await captureInstalledDataResources([request],native.context,{resolve:async()=>({mode:'require',packageRoot:'node_modules/font',manifestPath:'node_modules/font/package.json',search:[{path:'node_modules/font',kind:'directory'}]}),stat:async p=>({kind:p.endsWith('package.json')||p.endsWith('woff2')?'file':'directory',physicalPath:p,linkTarget:null}),readFile:async()=>new Uint8Array([0,255,1]),listDirectory:async()=>[]});
+ const capture=await captureInstalledDataResources(requests,native.context,{resolve:async()=>({mode:'require',packageRoot:'node_modules/font',manifestPath:'node_modules/font/package.json',search:[{path:'node_modules/font',kind:'directory'}]}),stat:async p=>({kind:p.endsWith('package.json')||p.endsWith('woff2')?'file':'directory',physicalPath:p,linkTarget:null}),readFile:async()=>new Uint8Array([0,255,1]),listDirectory:async()=>['z-normal.woff2','a-normal.woff2']});
  const origin={providerId:provider.id,runId:'run-1',attemptId:'attempt-1',generation:1,inputDigest:identity.inputDigest,profileDigest:identity.profileDigest,source:{headSha:original.headSha,treeSha:originalTree},status:'passed' as const,superseded:false};
  const projection=createResourceApplicabilityProjection({origin,consumerId:installedData.consumerId,declarationDigest:native.declarationDigest,sourceApplicabilityDigest:native.sourceApplicabilityDigest,capture});
  const proof={version:'installed-data-proof/1',observation,origin:{executionHeadSha:original.headSha,attempt:{version:'scoped-attempt/1',providerId:provider.id,attemptId:origin.attemptId,generation:origin.generation,inputDigest:origin.inputDigest,profileDigest:origin.profileDigest,status:'passed',origin:{runId:origin.runId,candidate:{treeSha:originalTree,deliverableDigest:original.deliverable.digest,identityToken:original.deliverable.identity,baseRef:original.base.ref,baseTipSha:original.base.tipSha,mergeBaseSha:original.base.mergeBaseSha,workspaceId:original.workspaceId}}},payload:{resourceApplicability:projection,outputs:[{path:'result.json',base64:Buffer.from('passed').toString('base64'),sha256:sha256Hex('passed')}],diagnostic:{availability:'available',phase:'complete',command:{exitCode:0},failure:{unavailable:'not-failed'}}}}};
@@ -41,6 +42,12 @@ describe('portable installed resource reconstruction',()=>{
   const f=await fixture();const current=await f.trees(currentTree);const identity=await scopedCheckIdentity(f.config,f.provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
   expect(identity.inputDigest).not.toBe(f.identity.inputDigest);expect(identity.profileDigest).not.toBe(f.identity.profileDigest);
   const value=await f.reconstruct();expect(value.binding.version).toBe('installed-data-binding/1');expect(value.binding.originDigest).toBe(digestCanonical(f.proof.origin.payload.resourceApplicability.origin));expect(value.binding.captureDigest).toBe(f.proof.origin.payload.resourceApplicability.capture.digest);expect(value).not.toHaveProperty('checks');
+ });
+ it.each(['request-ids','files','directories','combined'] as const)('reconstructs supported unsorted declaration %s without changing raw declaration identity',async order=>{
+  const f=await fixture(order);const raw=f.provider.check!.installedData!.requests;
+  expect(f.proof.origin.payload.resourceApplicability.declarationDigest).toBe(digestCanonical(f.provider.check!.installedData));
+  expect(digestCanonical(raw)).not.toBe(digestCanonical(f.proof.origin.payload.resourceApplicability.capture.requests));
+  const value=await f.reconstruct();expect(value.binding.declarationDigest).toBe(digestCanonical(f.provider.check!.installedData));
  });
  it.each(['head','tree','input','profile','run','generation','attempt','version','missing-projection','extra-proof'])('refuses malformed or substituted origin %s',async mode=>{
   const f=await fixture();const row=f.proof.origin;

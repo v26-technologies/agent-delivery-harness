@@ -74,11 +74,14 @@ fresh installed-resource capture.
 Configuration import and preparation acquire no installed resources. After normal
 preparation and selected independent review, `gate` derives source/setup identity
 from immutable Git inputs and captures resources in its existing owned dependency
-snapshot. Cold execution shares that snapshot and retains a separate
+snapshot when the consumer reaches its execution stage, after preceding checks.
+Cold execution shares that snapshot and retains a separate
 `resource-applicability/1` projection only after the command passes post-command
 verification. With parallel workers, the first requested check and the captured
 consumer run on the capture worker before the remaining checks enter the pool.
-Other workers retain independent snapshots.
+Other workers retain independent snapshots. Worker-local ordering keeps capture,
+applicability publication or cold execution together; cleanup drains accepted
+work before removing snapshots. Serial setup eviction remains unchanged.
 
 An unrelated HEAD can leave this qualified consumer's source/resources unchanged
 while its original full-Git input/profile remains stale. In that case the gate

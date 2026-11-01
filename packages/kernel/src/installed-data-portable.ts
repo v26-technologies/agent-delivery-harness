@@ -2,7 +2,7 @@
  * No importing-host dependency tree or native attempt store is consulted. */
 import { digestCanonical, sha256Hex } from "./digest.ts";
 import { captureInstalledDataBinding, type InstalledDataSourceTree } from "./installed-data-source.ts";
-import { validateResourceApplicabilityProjection, type InstalledDataAttemptOrigin } from "./installed-data-resources.ts";
+import { normalizeInstalledDataResourceRequests, validateResourceApplicabilityProjection, type InstalledDataAttemptOrigin } from "./installed-data-resources.ts";
 import { createResourceApplicabilityBinding } from "./installed-data-evidence.ts";
 import { scopedCheckIdentity, type ScopedRuntimeObservation } from "./scoped-inputs.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
@@ -45,7 +45,7 @@ export async function reconstructResourceApplicability(
   });
   const current = await captureInstalledDataBinding(config, provider, candidate, observation, { base: await sourceTree(candidate.base.mergeBaseSha), candidate: await sourceTree(candidate.treeSha) }, readEvidence);
   const capture = projection.capture;
-  if (projection.consumerId !== current.declaration.consumerId || digestCanonical(capture.requests) !== digestCanonical(current.declaration.requests) || digestCanonical(capture.context) !== digestCanonical(current.context)) refuse();
+  if (projection.consumerId !== current.declaration.consumerId || digestCanonical(capture.requests) !== digestCanonical(normalizeInstalledDataResourceRequests(current.declaration.requests)) || digestCanonical(capture.context) !== digestCanonical(current.context)) refuse();
   const bindingCandidate: RecordCandidateBinding = { treeSha: candidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: candidate.workspaceId };
   return { binding: createResourceApplicabilityBinding({ candidateDigest: digestCanonical(bindingCandidate), definitionDigest: digestCanonical(provider.check), declarationDigest: current.declarationDigest, sourceApplicabilityDigest: current.sourceApplicabilityDigest, capture, projection, originAttempt: origin }), observation };
 }

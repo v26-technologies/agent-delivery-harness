@@ -115,6 +115,24 @@ describe('native scoped installed resources',()=>{
     expect(await readFile(f.setupCount,'utf8')).toBe('setup\nsetup\n');
     expect(f.messages.some(s=>s.includes('consumer command omitted'))).toBe(true);
   },60000);
+  it('serial different-setup gate captures at the consumer and retains one-setup seed plus unrelated omission',async()=>{
+    const f=await fixture(true,true),font=f.config.providers[0]!;
+    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',''],timeoutMs:5000,scope:{...font.check!.scope!,profile:'other'}}};
+    const config=defineHarnessConfig({...f.config,providers:[peer,font],obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],scopedExecution:{...f.config.scopedExecution!,concurrency:1,profiles:[{id:'other',gitContext:'full',dependencyInputs:[],mutableOutputs:[],credentialIdentities:{}},...f.config.scopedExecution!.profiles]}});
+    const runtime={...f.runtime,loadConfig:async()=>config};
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe('setup\n');
+    const terminals=(await readdir(path.join(f.dir,'.git'),{recursive:true})).filter(p=>p.endsWith('terminal.json'));
+    const rows=await Promise.all(terminals.map(p=>readFile(path.join(f.dir,'.git',p),'utf8').then(JSON.parse)));
+    expect(rows.find(r=>r.entry.attempt.providerId==='check.font')?.entry.payload.resourceApplicability).toBeDefined();
+    await writeFile(path.join(f.dir,'serial-unrelated.md'),'prose');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe('setup\nsetup\n');
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    expect(f.messages.some(line=>line.includes('consumer command omitted'))).toBe(true);
+  },60000);
   it('seeds only an actual passing native consumer and matches DATA across an unrelated commit while the whole check stays stale',async()=>{
     const f=await fixture(true);let originalInput:string|undefined;
     let verifyHook=await duringCreation(async session=>{

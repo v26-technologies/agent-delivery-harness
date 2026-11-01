@@ -57,7 +57,6 @@ async function providerAdmission(
 
   const liveResults: LiveProviderResult[] = options.includeInjectedLiveResults ? [...(context.liveResults ?? [])] : [];
   const attempted = new Set<string>();
-  const resourceCaptures = new Set<string>();
   const attemptBlockers: Blocker[] = [];
   let admission = await admit(input, admissionOptions);
   await session?.explainReuse((admission.decision?.resolutions ?? []).flatMap(r => r.kind === "satisfied_evidence" ? [r.providerId] : []));
@@ -80,32 +79,6 @@ async function providerAdmission(
         entry.needsLiveResult ||= obligation.freshness === "live";
         requested.set(registration.id, entry);
       }
-    }
-
-    // Resolve conditional DATA before any check closes the capture phase. The
-    // ordinary admission above already enforced preparation and selected review.
-    const resource = session && [...requested].find(([id, request]) => !resourceCaptures.has(id) && context.config.providers.find(p => p.id === id)?.check?.installedData && request.obligationIds.every(obligationId => context.config.obligations.find(o => o.id === obligationId)?.acceptedPayloadSpecs.includes("installed-data.applicable/1")));
-    if (resource && session) {
-      const [id, request] = resource;
-      resourceCaptures.add(id);
-      let applicable = false;
-      try { applicable = (await session.captureInstalledDataFor(id)).applicable; }
-      catch (error) {
-        if (context.signal?.aborted) throw error;
-        context.write(`resource fallback ${id}: ${error instanceof Error ? error.message : "capture unavailable"}`);
-      }
-      if (applicable) {
-        // Existing same-candidate applicability may now resolve with current facts.
-        admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
-        const unresolved = request.obligationIds.filter(id => admission.decision?.resolutions.some(row => row.obligationId === id && row.kind === "blocked"));
-        if (unresolved.length) await session.publishInstalledDataApplicability(id, unresolved);
-        attempted.add(id);
-        admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
-        continue;
-      }
-      // A cold or changed consumer executes on the same serial owned snapshot.
-      // Capture is complete first; the first configured selection guard still
-      // precedes every other check in the ordinary execution order below.
     }
 
     // A pool runs every requested scoped check at once; a single worker keeps the one-at-a-time loop below.

@@ -56,6 +56,9 @@ export class ScopedChecks {
   private readonly capturing = oneAtATime();
   private captureTail: Promise<unknown> = Promise.resolve();
   private capturePhaseOpen = true;
+  private cleanupStarted = false;
+  private readonly executionLocks = new Map<Map<string, CheckSnapshot>, ReturnType<typeof oneAtATime>>();
+  private readonly executionTails = new Map<Map<string, CheckSnapshot>, Promise<unknown>>();
   private retainedResourceBindings?: Promise<Readonly<Record<string, ResourceApplicabilityBinding>>>;
   private readonly sourceTreeCache = new Map<string, Promise<InstalledDataSourceTree>>();
   private candidateSource!: InstalledDataSourceTree;
@@ -230,9 +233,9 @@ export class ScopedChecks {
       try { await this.execute(request.provider, request.obligationIds, false, lane); }
       catch (error) { if (!(error instanceof CheckSnapshotError)) throw error; failures.set(id, error); }
     };
-    const resource = requests.find(r => this.installed.has(r.provider.id));
+    const resource = requests.find(r => this.acceptsApplicability(r.provider, r.obligationIds));
     if (resource) {
-      // V1 has one captured consumer. Keep the first configured check ahead of
+      // V1 has one conditional consumer. Keep the first configured check ahead of
       // it, and execute both on the capture worker before releasing the rest to
       // the pool. Other workers never inherit that worker's installed tree.
       const serialIds = [...new Set([requests[0]!.provider.id, resource.provider.id])];
@@ -265,8 +268,8 @@ export class ScopedChecks {
     }
     return { snapshot, sharedOutputs };
   }
-  private scheduleCapture<T>(task: () => Promise<T>): Promise<T> {
-    if (!this.capturePhaseOpen) return Promise.reject(new CheckSnapshotError("installed_data_capture_closed", "Resource capture must finish before execution or cleanup begins."));
+  private scheduleCapture<T>(task: () => Promise<T>, executionStage = false): Promise<T> {
+    if (this.cleanupStarted || (!this.capturePhaseOpen && !executionStage)) return Promise.reject(new CheckSnapshotError("installed_data_capture_closed", "Resource capture must finish before execution or cleanup begins."));
     const accepted = this.capturing(task);
     this.captureTail = accepted.catch(() => undefined);
     return accepted;
@@ -287,11 +290,11 @@ export class ScopedChecks {
   private async sourceTrees() {
     return this.sourceFrames ??= (async () => ({ base: await this.sourceTree(this.candidate.base.mergeBaseSha), candidate: this.candidateSource }))();
   }
-  private async captureResourceFacts(providerId: string, requests: readonly InstalledDataResourceRequest[], context: InstalledDataResourceContext) {
+  private async captureResourceFacts(providerId: string, requests: readonly InstalledDataResourceRequest[], context: InstalledDataResourceContext, lane: Lane = this.serial) {
     const provider = this.context.config.providers.find(p => p.id === providerId);
     const profile = this.context.config.scopedExecution?.profiles.find(p => p.id === provider?.check?.scope?.profile);
     if (!provider?.check?.scope || !profile || !this.identities.has(providerId)) throw new CheckSnapshotError("scoped_executor_required", "Installed resources require an already configured scoped provider and profile.");
-    const normalized = normalizeInstalledDataResourceRequests(requests), lane = this.serial;
+    const normalized = normalizeInstalledDataResourceRequests(requests);
     try {
       const { snapshot } = await this.acquireSnapshot(profile, lane);
       const capture = await captureOwnedInstalledDataResources(snapshot, normalized, context, this.context.signal ? { signal: this.context.signal } : {});
@@ -311,18 +314,19 @@ export class ScopedChecks {
   /** Derive authority from the configured consumer and immutable native source frames.
    * Matching resources do not make the prior full-Git check attempt current. */
   captureInstalledDataFor(providerId: string) {
-    return this.scheduleCapture(async () => {
+    return this.scheduleCapture(() => this.captureDeclaredInstalledData(providerId));
+  }
+  private async captureDeclaredInstalledData(providerId: string, lane: Lane = this.serial) {
       const provider = this.context.config.providers.find(p => p.id === providerId);
       if (!provider?.check?.installedData || !this.observations.has(providerId)) throw new CheckSnapshotError("installed_data_source_unqualified", "A configured installed data consumer is required.");
       const binding = await captureInstalledDataBinding(this.context.config, provider, this.candidate, this.observations.get(providerId)!, await this.sourceTrees(), await candidateTreeEvidenceReader(this.context.rootDir, this.candidate.treeSha));
-      const { capture, snapshot } = await this.captureResourceFacts(providerId, binding.declaration.requests, binding.context);
+      const { capture, snapshot } = await this.captureResourceFacts(providerId, binding.declaration.requests, binding.context, lane);
       this.installed.set(providerId, { binding: structuredClone(binding), capture: structuredClone(capture), snapshot });
       // A newer running, failed or unqualified pass fences older successful history.
       const latest = (await this.locked(() => this.stores.get(providerId)!.read())).at(-1);
       const origin = latest && this.resourceOrigin(latest);
       const match = matchResourceApplicabilityProjection(latest?.payload?.resourceApplicability, { consumerId: binding.declaration.consumerId, declarationDigest: binding.declarationDigest, sourceApplicabilityDigest: binding.sourceApplicabilityDigest, capture, originAttempt: origin ?? null });
       return { capture, ...match };
-    });
   }
   /** Reuse only an already accepted same-candidate applicability observation.
    * New source candidates still require fresh native installed-resource capture. */
@@ -411,7 +415,37 @@ export class ScopedChecks {
     this.capturePhaseOpen = false;
     await this.captureTail;
   }
-  async execute(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission = false, lane: Lane = this.serial): Promise<void> {
+  private acceptsApplicability(provider: ProviderRegistration, obligationIds: readonly string[]): boolean {
+    return provider.check?.installedData !== undefined && obligationIds.length > 0 && obligationIds.every(id => this.context.config.obligations.find(o => o.id === id)?.acceptedPayloadSpecs.includes("installed-data.applicable/1"));
+  }
+  private onWorker<T>(lane: Lane, task: () => Promise<T>): Promise<T> {
+    let locked = this.executionLocks.get(lane.snapshots);
+    if (!locked) { locked = oneAtATime(); this.executionLocks.set(lane.snapshots, locked); }
+    const running = locked(task);
+    this.executionTails.set(lane.snapshots, running.catch(() => undefined));
+    return running;
+  }
+  execute(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission = false, lane: Lane = this.serial): Promise<void> {
+    this.capturePhaseOpen = false;
+    return this.onWorker(lane, async () => {
+      if (!deferSubmission && this.acceptsApplicability(provider, obligationIds)) {
+        await this.closeCapturePhase();
+        let applicable = false;
+        try {
+          // Resolve at this consumer's execution stage, after preceding checks.
+          // Its capture and cold command stay on one worker without changing
+          // serial snapshot eviction or adding a second resource cache.
+          applicable = (await this.scheduleCapture(() => this.captureDeclaredInstalledData(provider.id, lane), true)).applicable;
+        } catch (error) {
+          if (this.context.signal?.aborted || this.cleanupStarted) throw error;
+          lane.write(`resource fallback ${provider.id}: ${error instanceof Error ? error.message : "capture unavailable"}`);
+        }
+        if (applicable) { await this.publishInstalledDataApplicability(provider.id, obligationIds); return; }
+      }
+      await this.executeInLane(provider, obligationIds, deferSubmission, lane);
+    });
+  }
+  private async executeInLane(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission: boolean, lane: Lane): Promise<void> {
     await this.closeCapturePhase();
     const started = Date.now(), check = provider.check!, profile = this.context.config.scopedExecution!.profiles.find(p => p.id === check.scope!.profile)!;
     const attempt = this.owned.get(provider.id) ?? await this.allocate(provider.id);
@@ -495,7 +529,9 @@ export class ScopedChecks {
     }
   }
   async cleanup(): Promise<void> {
+    this.cleanupStarted = true;
     await this.closeCapturePhase();
+    await Promise.all(this.executionTails.values());
     for (const snapshots of this.workers) { for (const snapshot of snapshots.values()) await snapshot.cleanup(); snapshots.clear(); }
   }
 }
