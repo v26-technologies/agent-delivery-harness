@@ -297,6 +297,16 @@ stale when the candidate moves, the base advances, or a declared wiring file
 changes. A provider that hits a stale receipt asks for re-preparation; there is
 no bypass.
 
+When no mechanical providers are selected, preparation validates scoped profile
+and output declarations against the prepared inventory, checks required input
+presence through the source reader, and validates any declared finite physical
+source with the existing byte, mode, link, size and absence checks. It defers
+non-mechanical consumer content and runtime identities to the gate instead of
+hashing their broad input sets during preparation. This is not passing check
+evidence or a promise that a consumer runtime is available. A gate creates fresh
+identities; selecting mechanical providers retains their execution and identity
+checks before a receipt is published.
+
 ### 1. Read the review context
 
 `review-context` reports the candidate binding (tree, deliverable identity,
@@ -472,6 +482,11 @@ setup, resource observation and execution. Mutable outputs cannot overlap an
 absence or its ancestors/descendants. Output permissions do not waive absence,
 link or type checks. Verification still walks the entire resulting source and
 installed dependency tree; finite mode does not filter dependency verification.
+Filesystem inventory operations overlap within a fixed worker pool. Results
+retain the original sorted-child depth-first tuple order, including directory
+referent and link authority; globally sorting paths would change that identity.
+The pool drains started operations before reporting a failure. It neither
+removes verifier boundaries nor turns output exclusions into traversal skips.
 Existing directory referents use exact bigint filesystem device/inode identity
 from the inventory walk, so case and Unicode spelling aliases share the actual
 same coordinate while distinct directories remain distinct. Missing path suffixes
@@ -502,3 +517,9 @@ or establish latency. The adopter must select it only for a supported exact
 closure, preserving ordinary fallback for unknown effects or changed authority.
 Malformed explicit configuration fails closed rather than silently running an
 incomplete tree.
+
+Source identity capture also uses bounded concurrent reads and finite native
+Git object batches. A batch's frames, object hashes and child exit must all
+validate before its bytes are published. Injected command runners retain their
+individual-object contract. Concurrency changes neither the input set nor the
+identity's ordering, and malformed native output does not select another reader.

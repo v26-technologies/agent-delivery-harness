@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { computeDeliverableIdentity, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
+import { computeDeliverableIdentity, capturePhysicalSource, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
   createResourceApplicabilityProjection, matchResourceApplicabilityProjection, createResourceApplicabilityBinding, reconstructResourceApplicability, discoverRecords, portableArtifactContents, isRecordFreshForCandidate, isRecordNeutralPath, type ResourceApplicabilityBinding, type InstalledDataAttemptOrigin, type InstalledDataResourceRequest, normalizeInstalledDataResourceRequests, type InstalledDataResourceContext, type InstalledDataResourceCapture,
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
@@ -34,6 +34,25 @@ async function executableIdentity(command: string, root: string, searchPath: str
 /** Checks whose profiles declare the same dependency setup and Git context share one installed snapshot. */
 function setupKey(profile: ScopedExecutionProfile, physicalSource?: SnapshotRequest["physicalSource"]): string {
   return digestCanonical({ dependencies: profile.dependencies ?? null, dependencyInputs: [...profile.dependencyInputs].sort(), gitContext: profile.gitContext ?? "full", ...(physicalSource ? { physicalSource } : {}) });
+}
+/** Structural checks shared by execution and preparation without an identity. */
+function scopedProviders(context: CommandContext) {
+  const providers = context.config.providers.filter(p => p.check?.scope);
+  if (providers.length && context.config.scopedExecution?.version !== "scoped-execution/1") throw new CheckSnapshotError("scoped_executor_required", "Scoped checks require supported private execution profiles before preparation.");
+  return providers;
+}
+async function preparedSource(context: CommandContext, candidate: CapturedCandidate) {
+  const read = await candidateTreeSourceReader(context.rootDir, candidate.treeSha);
+  const listing = await runGitCommand(["git", "ls-tree", "-r", "--name-only", "-z", candidate.treeSha], { cwd: context.rootDir });
+  if (listing.exitCode !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Cannot enumerate the prepared source tree.");
+  return { inventory: listing.stdout.split("\0").filter(Boolean), read };
+}
+function validateScopedProvider(context: CommandContext, provider: ProviderRegistration, inventory: readonly string[]) {
+  const scope = provider.check!.scope!, profile = context.config.scopedExecution!.profiles.find(p => p.id === scope.profile);
+  if (!profile) throw new CheckSnapshotError("scoped_executor_required", "A selected execution profile is unsupported.");
+  if (profile.mutableOutputs.some(o => inventory.some(f => f === o.replace(/\/$/, "") || f.startsWith(`${o.replace(/\/$/, "")}/`)))) throw new CheckSnapshotError("check_output_overlaps_source", "Mutable outputs overlap prepared source.");
+  if ((provider.check!.outputs ?? []).some(o => !profile.mutableOutputs.some(m => m.endsWith("/") ? o.startsWith(m) : o === m))) throw new CheckSnapshotError("check_output_undeclared", "Every retained output must be declared mutable in its profile.");
+  return profile;
 }
 const shownArgument = (argument: string) => /^[\w@%+=:,./-]+$/.test(argument) ? argument : JSON.stringify(argument);
 /** Runs the tasks it is given one at a time, in call order. */
@@ -79,17 +98,41 @@ export class ScopedChecks {
     this.workers = Array.from({ length: this.concurrency }, () => new Map<string, CheckSnapshot>());
   }
   private get serial(): Lane { return { snapshots: this.workers[0]!, write: text => this.context.write(text) }; }
+  /** Zero mechanical preparation validates the real narrow physical frame,
+   * but does not hash broad consumer inputs or observe execution tools. Gate
+   * creates its own fresh session; no deferred identity is retained here. */
+  static async validatePreparation(context: CommandContext, candidate: CapturedCandidate): Promise<void> {
+    const providers = scopedProviders(context);
+    if (!providers.length) return;
+    const { inventory, read } = await preparedSource(context, candidate);
+    for (const provider of providers) {
+      const profile = validateScopedProvider(context, provider, inventory), scope = provider.check!.scope!;
+      // Metadata retains source/link/type and required-input validation without
+      // reading and hashing broad regular consumer input bytes.
+      const selected = new Set([...scope.files, ...scope.tests, ...profile.dependencyInputs,
+        ...scope.memberships.flatMap(prefix => inventory.filter(file => file.startsWith(prefix)))]);
+      for (const file of selected) {
+        const metadata = await read.metadata(file);
+        // The reader owns supported entry/link semantics, including committed
+        // directory links. A null mode is exactly its absent-byte result.
+        if (metadata.mode === null) {
+          if (profile.dependencyInputs.includes(file)) throw new CheckSnapshotError("check_dependency_input_missing", `Required dependency input ${file} is missing from the prepared tree.`);
+          if (scope.tests.includes(file)) throw new Error("Required test is absent");
+        }
+      }
+      if (provider.check!.physicalSource) {
+        try { await capturePhysicalSource(provider.check!.physicalSource, read); }
+        catch { throw new CheckSnapshotError("check_physical_source_invalid", "Physical source bytes, modes or required absences are unavailable or unsafe."); }
+      }
+    }
+  }
   static async create(context: CommandContext, candidate: CapturedCandidate): Promise<ScopedChecks | undefined> {
-    const providers = context.config.providers.filter(p => p.check?.scope);
+    const providers = scopedProviders(context);
     if (!providers.length) return undefined;
-    if (context.config.scopedExecution?.version !== "scoped-execution/1") throw new CheckSnapshotError("scoped_executor_required", "Scoped checks require supported private execution profiles before preparation.");
     const session = new ScopedChecks(context, candidate);
     const storage = await resolveRecordStorage(context.rootDir, { storageNamespace: context.config.storageNamespace, leaf: "scoped-attempts" });
-    const read = await candidateTreeSourceReader(context.rootDir, candidate.treeSha);
+    const { inventory, read } = await preparedSource(context, candidate);
     const readEvidence = await candidateTreeEvidenceReader(context.rootDir, candidate.treeSha);
-    const listing = await runGitCommand(["git", "ls-tree", "-r", "--name-only", "-z", candidate.treeSha], { cwd: context.rootDir });
-    if (listing.exitCode !== 0) throw new CheckSnapshotError("check_snapshot_unavailable", "Cannot enumerate the prepared source tree.");
-    const inventory = listing.stdout.split("\0").filter(Boolean);
     session.candidateSource = { inventory, read };
     const validationConfig = { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral };
     const validationTrees = new Map<string, Promise<string>>();
@@ -99,10 +142,7 @@ export class ScopedChecks {
       return digest;
     };
     for (const provider of providers) {
-      const scope = provider.check!.scope!, profile = context.config.scopedExecution.profiles.find(p => p.id === scope.profile)!;
-      if (!profile) throw new CheckSnapshotError("scoped_executor_required", "A selected execution profile is unsupported.");
-      if (profile.mutableOutputs.some(o => inventory.some(f => f === o.replace(/\/$/, "") || f.startsWith(`${o.replace(/\/$/, "")}/`)))) throw new CheckSnapshotError("check_output_overlaps_source", "Mutable outputs overlap prepared source.");
-      if ((provider.check!.outputs ?? []).some(o => !profile.mutableOutputs.some(m => m.endsWith("/") ? o.startsWith(m) : o === m))) throw new CheckSnapshotError("check_output_undeclared", "Every retained output must be declared mutable in its profile.");
+      const scope = provider.check!.scope!, profile = validateScopedProvider(context, provider, inventory);
       const searchPath = executionPath(context.rootDir, context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin");
       const tools = await Promise.all([[process.execPath, "."], [provider.check!.command[0], scope.cwd], ...(profile.dependencies ? [[profile.dependencies.command[0], "."]] : [])].map(([c, cwd]) => executableIdentity(c!, context.rootDir, searchPath, cwd!, read)));
       const observation: ScopedRuntimeObservation = { version: "scoped-runtime/1", runtimeDigest: digestCanonical({ platform: process.platform, arch: process.arch, tools, searchPath }),

@@ -52,17 +52,22 @@ async function candidateTreeReader(rootDir: string, treeSha: string, run: Candid
   };
   type ObjectRequest = { sha: string; type: "blob" | "tree"; resolve: (bytes: Buffer) => void; reject: (error: unknown) => void };
   const queued: ObjectRequest[] = [];
-  let active = false, scheduled = false;
+  let active = 0, scheduled = false;
   const schedule = () => {
-    if (active || scheduled) return;
+    if (scheduled || active >= 4 || !queued.length) return;
     scheduled = true;
-    queueMicrotask(() => { void flush(); });
+    queueMicrotask(() => {
+      scheduled = false;
+      // Feed the bounded source-input readers without building one large
+      // response. Every finite child retains its own validation barrier.
+      while (active < 4 && queued.length) {
+        const batch = queued.splice(0, 8);
+        active++;
+        void flush(batch);
+      }
+    });
   };
-  const flush = async () => {
-    scheduled = false;
-    active = true;
-    // Amortize process setup while retaining finite waves and one active child.
-    const batch = queued.splice(0, 32);
+  const flush = async (batch: ObjectRequest[]) => {
     try {
       const result = await runGitCommandBytes(["git", "cat-file", "--batch"], {
         cwd: rootDir, stdin: batch.map(request => `${request.sha}\n`).join(""),
@@ -84,7 +89,7 @@ async function candidateTreeReader(rootDir: string, treeSha: string, run: Candid
       // Publish nothing until every frame and the finite process have passed.
       batch.forEach((request, index) => request.resolve(values[index]!));
     } catch (error) { batch.forEach(request => request.reject(error)); }
-    finally { active = false; if (queued.length) schedule(); }
+    finally { active--; schedule(); }
   };
   const loadNativeObject = (sha: string, type: "blob" | "tree"): Promise<Buffer> => new Promise((resolve, reject) => {
     queued.push({ sha, type, resolve, reject });
