@@ -36,6 +36,7 @@ export * from "./blockers.ts";
 // The injected policy surface: the config schema, its load-time invariants, and
 // the neutral-matcher primitive the identity computation shares with it.
 export * from "./config.ts";
+export { capturePhysicalSource } from "./physical-source.ts";
 
 // The git-private evidence record store, and the fs-free shapes pure modules
 // read it through. The store owns the storage-dir resolver — records and

@@ -1,9 +1,9 @@
 /** Private execution tree. Never shares writable source, objects, index or dependencies. */
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, realpath, rename, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createExecPort, type ExecOutcome } from "@agent-delivery-harness/kernel";
+import { candidateTreeSourceReader, capturePhysicalSource, createExecPort, isPhysicalSourceDefinition, physicalSourceOutputOverlap, type CandidateCommandRunner, type PhysicalSourceDefinition, type ExecOutcome } from "@agent-delivery-harness/kernel";
 
 import { snapshotInventoryWorker } from "./snapshot-inventory-worker.ts";
 
@@ -18,6 +18,7 @@ export interface SnapshotRequest {
   readonly candidate: { readonly treeSha: string; readonly headSha: string; readonly base: { readonly ref: string; readonly tipSha: string; readonly mergeBaseSha: string } };
   readonly outputs: readonly string[];
   readonly gitContext?: "full" | "none";
+  readonly physicalSource?: PhysicalSourceDefinition;
   readonly environment: Readonly<Record<string, string>>;
   readonly dependencies?: { readonly command: readonly [string, ...string[]]; readonly timeoutMs: number };
   readonly onDependencyResult?: (result: ExecOutcome, durationMs: number) => void;
@@ -71,12 +72,12 @@ async function snapshotProcess(command: string, args: string[], cwd: string, env
   });
 }
 /** The inventory's blocking filesystem operations live only in a killable process. */
-export async function snapshotInventory(root: string, outputs: readonly string[], excludeDependencies = false, deadline = performance.now() + SNAPSHOT_TIMEOUT_MS, signal?: AbortSignal, forbidGit = false): Promise<string> {
-  return (await snapshotDigests(root, outputs, excludeDependencies, deadline, signal, forbidGit)).digest;
+export async function snapshotInventory(root: string, outputs: readonly string[], excludeDependencies = false, deadline = performance.now() + SNAPSHOT_TIMEOUT_MS, signal?: AbortSignal, forbidGit = false, absentInputs: readonly string[] = []): Promise<string> {
+  return (await snapshotDigests(root, outputs, excludeDependencies, deadline, signal, forbidGit, false, absentInputs)).digest;
 }
-async function snapshotDigests(root: string, outputs: readonly string[], excludeDependencies: boolean, deadline: number, signal?: AbortSignal, forbidGit = false, includeSource = false): Promise<{ digest: string; sourceDigest?: string }> {
+async function snapshotDigests(root: string, outputs: readonly string[], excludeDependencies: boolean, deadline: number, signal?: AbortSignal, forbidGit = false, includeSource = false, absentInputs: readonly string[] = []): Promise<{ digest: string; sourceDigest?: string }> {
   const result = await snapshotProcess(process.execPath, ["--input-type=module", "--eval", snapshotInventoryWorker], root,
-    { PATH: process.env["PATH"] ?? "/usr/bin:/bin", DELIVERY_SNAPSHOT_REQUEST: JSON.stringify({ root, outputs, excludeDependencies, forbidGit, includeSource }) }, deadline, signal);
+    { PATH: process.env["PATH"] ?? "/usr/bin:/bin", DELIVERY_SNAPSHOT_REQUEST: JSON.stringify({ root, outputs, excludeDependencies, forbidGit, includeSource, absentInputs }) }, deadline, signal);
   let parsed: { code?: string; digest?: string; sourceDigest?: string };
   try { parsed = JSON.parse(result.stdout); } catch { throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot inventory returned no valid result."); }
   if (result.code !== 0 || !/^[a-f0-9]{64}$/.test(parsed.digest ?? "") || (includeSource && !/^[a-f0-9]{64}$/.test(parsed.sourceDigest ?? ""))) throw new CheckSnapshotError(["check_snapshot_escape", "check_snapshot_drift"].includes(parsed.code ?? "") ? parsed.code! : "check_snapshot_unavailable", "Snapshot inventory could not verify private bytes and links.");
@@ -86,6 +87,7 @@ export function executionPath(root: string, value: string): string {
   return value.split(path.delimiter).filter(p => p && path.isAbsolute(p) && !inside(root, p) && !p.split(path.sep).includes("node_modules")).join(path.delimiter) || "/usr/bin:/bin";
 }
 export async function createCheckSnapshot(input: SnapshotRequest): Promise<CheckSnapshot> {
+  if (input.physicalSource !== undefined) return createFiniteCheckSnapshot(input);
   const report = (phase: SnapshotPhase, started: number) => {
     try { input.onPhase?.(phase, performance.now() - started); } catch { /* Timing cannot change admission. */ }
   };
@@ -189,5 +191,99 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
     await cleanup();
     if (error instanceof CheckSnapshotError) throw error;
     throw new CheckSnapshotError("check_snapshot_unavailable", "The exact prepared Git tree could not be materialized privately.");
+  }
+}
+
+/** Opt-in file-only execution; legacy snapshots above retain complete Git semantics. */
+function finiteSourceReaderRunner(input: SnapshotRequest): CandidateCommandRunner {
+  const deadline = performance.now() + SNAPSHOT_TIMEOUT_MS;
+  // Logical source bounds belong to capturePhysicalSource, including repeated
+  // blobs. Reserve separate bounded transport room for listings/size responses;
+  // protocol overhead must not consume the supported 64 MiB of source bytes.
+  const transportLimit = 128 * 1024 * 1024;
+  let transportBytes = 0;
+  return async (command, options) => {
+    if (input.signal?.aborted) throw new CheckSnapshotError("check_snapshot_interrupted", "Finite source capture was cancelled.");
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new CheckSnapshotError("check_snapshot_timeout", "Finite source capture exceeded its deadline.");
+    return await new Promise((resolve, reject) => {
+      const child = spawn(command[0]!, command.slice(1), { cwd: options.cwd,
+        env: { PATH: executionPath(input.rootDir, input.environment["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
+        stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+      let failure: CheckSnapshotError | undefined;
+      const chunks: Buffer[] = [];
+      const stop = (code: string) => { failure ??= new CheckSnapshotError(code, "Finite source reader did not complete safely."); child.kill("SIGKILL"); };
+      const abort = () => stop("check_snapshot_interrupted"), timer = setTimeout(() => stop("check_snapshot_timeout"), remaining);
+      input.signal?.addEventListener("abort", abort, { once: true });
+      if (input.signal?.aborted) abort();
+      child.stdout!.on("data", (chunk: Buffer) => { transportBytes += chunk.length; if (transportBytes > transportLimit) stop("check_snapshot_unavailable"); else chunks.push(chunk); });
+      child.stderr!.on("data", () => {});
+      child.once("error", () => { failure ??= new CheckSnapshotError("check_snapshot_unavailable", "Finite source reader failed to start."); });
+      child.stdin?.once("error", () => stop("check_snapshot_unavailable"));
+      child.stdin?.end(options.stdin);
+      child.once("close", code => {
+        clearTimeout(timer); input.signal?.removeEventListener("abort", abort);
+        if (failure) reject(failure);
+        else { const bytes = Buffer.concat(chunks); resolve({ exitCode: code ?? -1, stdout: bytes.toString("utf8"), stderr: "", ...(options.captureBytes ? { stdoutBase64: bytes.toString("base64") } : {}) }); }
+      });
+    });
+  };
+}
+async function createFiniteCheckSnapshot(input: SnapshotRequest): Promise<CheckSnapshot> {
+  const materializationStarted = performance.now();
+  const source = input.physicalSource!;
+  if (input.gitContext !== "none" || !isPhysicalSourceDefinition(source) || physicalSourceOutputOverlap(source, input.outputs))
+    throw new CheckSnapshotError("check_physical_source_invalid", "Finite source requires Git-none and absences disjoint from all mutable outputs.");
+  let captured: Awaited<ReturnType<typeof capturePhysicalSource>>;
+  try { captured = await capturePhysicalSource(source, await candidateTreeSourceReader(input.rootDir, input.candidate.treeSha, finiteSourceReaderRunner(input))); }
+  catch (error) { if (error instanceof CheckSnapshotError) throw error; throw new CheckSnapshotError("check_physical_source_invalid", "Finite source inputs are missing, linked or unsupported in the candidate."); }
+  const rootDir = await realpath(await mkdtemp(path.join(tmpdir(), "delivery-check-")));
+  let control: string | undefined;
+  const cleanup = async () => {
+    const removed = await Promise.allSettled([rootDir, ...(control ? [control] : [])].map(dir => rm(dir, { recursive: true, force: true })));
+    if (removed.some(result => result.status === "rejected")) throw new CheckSnapshotError("check_snapshot_cleanup_failed", "Cannot remove the owned finite snapshot.");
+  };
+  const measured = async <T>(phase: SnapshotPhase, operation: () => Promise<T>): Promise<T> => {
+    const start = performance.now();
+    try { return await operation(); } finally { try { input.onPhase?.(phase, performance.now() - start); } catch { /* Observation grants no authority. */ } }
+  };
+  const inventory = async (outputs: readonly string[], sourceOnly = false, deadline?: number) => {
+    if (physicalSourceOutputOverlap(source, outputs)) throw new CheckSnapshotError("check_physical_source_invalid", "Mutable output overlaps a required absence.");
+    return snapshotInventory(rootDir, outputs, sourceOnly, deadline, input.signal, true, source.absentInputs);
+  };
+  try {
+    control = await realpath(await mkdtemp(path.join(tmpdir(), "delivery-check-control-")));
+    for (const file of captured.files) {
+      await mkdir(path.dirname(path.join(rootDir, file.file)), { recursive: true });
+      await writeFile(path.join(rootDir, file.file), file.bytes, { flag: "wx" });
+      await chmod(path.join(rootDir, file.file), file.mode === "100755" ? 0o755 : 0o644);
+    }
+    try { input.onPhase?.("materialization", performance.now() - materializationStarted); } catch { /* Best-effort observation. */ }
+    const cleanPath = executionPath(input.rootDir, input.environment["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin");
+    const environment = { ...input.environment, PATH: `${path.join(rootDir, "node_modules/.bin")}${path.delimiter}${cleanPath}`,
+      HOME: path.join(control, "home"), TMPDIR: path.join(control, "tmp"), GIT_CEILING_DIRECTORIES: path.dirname(rootDir) };
+    await mkdir(environment.HOME, { recursive: true }); await mkdir(environment.TMPDIR, { recursive: true });
+    const baseline = await measured("baseline-inventory", () => inventory(input.outputs, Boolean(input.dependencies)));
+    if (input.dependencies) {
+      const start = performance.now();
+      const result = await measured("dependencies", () => createExecPort().run({ command: input.dependencies!.command[0], args: input.dependencies!.command.slice(1), cwd: rootDir,
+        env: environment, timeoutMs: input.dependencies!.timeoutMs, maxBuffer: 1024 * 1024, ...(input.signal ? { signal: input.signal } : {}) }));
+      input.onDependencyResult?.(result, Math.round(performance.now() - start));
+      if (result.code !== 0 || input.signal?.aborted) throw new CheckSnapshotError("check_dependency_failed", "Private finite dependency installation failed.");
+    }
+    const installed = input.dependencies ? await measured("post-dependency-inventory", () =>
+      snapshotDigests(rootDir, input.outputs, false, performance.now() + SNAPSHOT_TIMEOUT_MS, input.signal, true, true, source.absentInputs)) : { digest: baseline, sourceDigest: baseline };
+    if (baseline !== installed.sourceDigest) throw new CheckSnapshotError("check_snapshot_drift", "Dependency setup changed finite source bytes or modes.");
+    const verify: CheckSnapshot["verify"] = async (options = {}) => measured("verification", async () => {
+      const timeout = options.timeoutMs ?? SNAPSHOT_TIMEOUT_MS;
+      if (!Number.isFinite(timeout) || timeout <= 0 || timeout > SNAPSHOT_TIMEOUT_MS) throw new CheckSnapshotError("check_snapshot_timeout", "Invalid finite verification deadline.");
+      if (await inventory(options.outputs ?? input.outputs, false, performance.now() + timeout) !== installed.digest)
+        throw new CheckSnapshotError("check_snapshot_drift", "Finite source or installed dependencies changed.");
+    });
+    return { rootDir, commandRoot: path.join(control, "commands"), environment, dependencyDigest: installed.digest, verify, cleanup };
+  } catch (error) {
+    await cleanup();
+    if (error instanceof CheckSnapshotError) throw error;
+    throw new CheckSnapshotError("check_snapshot_unavailable", "Finite source could not be materialized or verified.");
   }
 }

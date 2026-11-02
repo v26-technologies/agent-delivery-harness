@@ -1086,6 +1086,21 @@ function installedConsumerInput() {
   const installedData={version:'installed-data-consumer/1',consumerId:'font',requests:[{version:'installed-package-data/1',id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json',files:['font.woff2'],directories:[]}],source,guards:{'reader.ts':'a'.repeat(64),'font.test.ts':'b'.repeat(64)}};
   const base=validInput();return {...base,providers:[{id:'check.font',findingCodes:[PROVIDER_CODE],check:{command:['node','test.js'],timeoutMs:5000,scope:source,installedData}}],obligations:[{...base.obligations[0]!,id:'font.passed',providers:['check.font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1']}],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'fixture',gitContext:'full',dependencyInputs:[],mutableOutputs:[],credentialIdentities:{}}],mechanicalProviders:[] as string[]}};
 }
+it('finite physical source validates explicit opt-in Git-none ownership and protected absence outputs',()=>{
+  const old=installedConsumerInput(),provider=old.providers[0]!,profile=old.scopedExecution.profiles[0]!;
+  const physicalSource={version:'physical-source/1',files:['reader.ts','font.test.ts'],absentInputs:['config/startup.cjs']};
+  const input={...old,providers:[{...provider,check:{...provider.check,physicalSource}}],scopedExecution:{...old.scopedExecution,profiles:[{...profile,gitContext:'none',mutableOutputs:['result.json']}]}};
+  expect(define(input).providers[0]?.check?.physicalSource).toEqual(physicalSource);
+  expect(define(old).providers[0]?.check).not.toHaveProperty('physicalSource');
+  for(const patch of [{version:'other'},{extra:true},{files:[]},{files:['../escape']},{files:['node_modules/entry.js']},{files:['reader.ts','Reader.ts']},{absentInputs:['reader.ts']},{absentInputs:['reader.ts/child']},{absentInputs:['.git/HEAD']},{absentInputs:['config/startup.cjs'],files:Array.from({length:1025},(_,i)=>`file${i}`)}])
+    expectOnly({...input,providers:[{...provider,check:{...provider.check,physicalSource:{...physicalSource,...patch}}}]},'config_invalid_member');
+  expectOnly({...input,scopedExecution:old.scopedExecution},'config_invalid_member');
+  for(const output of ['config/','config/startup.cjs','config/startup.cjs/child']) {
+    expectOnly({...input,scopedExecution:{...input.scopedExecution,profiles:[{...input.scopedExecution.profiles[0]!,mutableOutputs:[output]}]}},'config_invalid_member');
+  }
+  expectOnly({...input,providers:[{...provider,check:{...provider.check,physicalSource,outputs:['config']}}]},'config_invalid_member');
+  expectOnly({...input,scopedExecution:{...input.scopedExecution,profiles:[{...input.scopedExecution.profiles[0]!,dependencyInputs:['missing-manifest.json']}]}},'config_invalid_member');
+});
 it('installed consumer accepts one guarded scoped declaration and preserves field-absent legacy',()=>{
   const input=installedConsumerInput();expect(isInstalledDataConsumerDefinition(input.providers[0]!.check.installedData)).toBe(true);expect(validateHarnessConfig(input),JSON.stringify(validateHarnessConfig(input))).toMatchObject({ok:true});expect(define(input).providers[0]?.check).toHaveProperty('installedData',input.providers[0]!.check.installedData);
   const provider=input.providers[0]!;

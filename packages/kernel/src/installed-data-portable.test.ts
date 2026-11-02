@@ -4,16 +4,76 @@ import {reconstructResourceApplicability} from './installed-data-portable.ts';
 import {captureInstalledDataBinding,type InstalledDataSourceTree} from './installed-data-source.ts';
 import {captureInstalledDataResources,createResourceApplicabilityProjection,type InstalledDataResourceRequest} from './installed-data-resources.ts';
 import {scopedCheckIdentity} from './scoped-inputs.ts';
+import {capturePhysicalSource} from './physical-source.ts';
+import {selectScopedCheckAttempt} from './evaluator.ts';
 import type {CapturedCandidate} from './candidate.types.ts';
 import type {HarnessConfig,ProviderRegistration} from './config.ts';
 import type {CandidateTreeInputReader} from './portable-inputs.ts';
 const hash=(s:string)=>digestCanonical(s),sha=(s:string)=>s.repeat(40);
 const baseTree=sha('a'),originalTree=sha('b'),currentTree=sha('c');
+it.each(['content','mode','path'])('finite repair physical-only term fences retained attempt and resource context: %s',async term=>{
+ const f=await fixture(undefined,true);
+ for(const files of f.maps.values()){files.set('z-extra.bin','same bytes');files.set('z-other.bin','same bytes');}
+ const resourceProvider={...f.provider,check:{...f.provider.check!,physicalSource:{...f.provider.check!.physicalSource!,files:[...f.provider.check!.physicalSource!.files,'z-extra.bin']}}};
+ const {installedData:_removed,...check}=resourceProvider.check,provider={...resourceProvider,check};
+ const config={...f.config,providers:[provider]},resourceConfig={...f.config,providers:[resourceProvider]},current=await f.trees(currentTree),base=await f.trees(baseTree);
+ const before=await scopedCheckIdentity(config,provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+ const nativeBefore=await captureInstalledDataBinding(resourceConfig,resourceProvider,f.candidate,f.observation,{base,candidate:current},f.readEvidence);
+ let afterProvider=provider,afterResource=resourceProvider,read=current.read;
+ if(term==='content')f.maps.get(currentTree)!.set('z-extra.bin','different bytes');
+ if(term==='mode')read=Object.assign(async(p:string)=>current.read(p),{metadata:async(p:string)=>({...await current.read.metadata(p),...(p==='z-extra.bin'?{mode:'100755'}:{})})});
+ if(term==='path'){
+  const physicalSource={...check.physicalSource!,files:check.physicalSource!.files.map(p=>p==='z-extra.bin'?'z-other.bin':p)};
+  afterProvider={...provider,check:{...check,physicalSource}};afterResource={...resourceProvider,check:{...resourceProvider.check,physicalSource}};
+ }
+ const after=await scopedCheckIdentity({...config,providers:[afterProvider]},afterProvider,current.inventory,read,f.observation,f.candidate,f.readEvidence);
+ const retained={...f.proof.origin.attempt,version:'scoped-attempt/1' as const,status:'passed' as const,inputDigest:before.inputDigest,profileDigest:before.profileDigest};
+ expect(before.reusable).toBe(true);expect(after.reusable).toBe(true);
+ expect(selectScopedCheckAttempt(provider.id,before.inputDigest,before.profileDigest,[retained])?.attemptId).toBe(retained.attemptId);
+ expect(selectScopedCheckAttempt(provider.id,after.inputDigest,after.profileDigest,[retained])).toBeUndefined();
+ const nativeAfter=await captureInstalledDataBinding({...resourceConfig,providers:[afterResource]},afterResource,f.candidate,f.observation,{base,candidate:{...current,read}},f.readEvidence);
+ expect(nativeAfter.context.setupRecipeDigest).not.toBe(nativeBefore.context.setupRecipeDigest);
+});
+it('finite repair no-resource Git-none identity retains candidate-independent reuse',async()=>{
+ const f=await fixture(undefined,true),{installedData:_removed,...check}=f.provider.check!,provider={...f.provider,check},config={...f.config,providers:[provider]},current=await f.trees(currentTree);
+ const before=await scopedCheckIdentity(config,provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+ const after=await scopedCheckIdentity(config,provider,current.inventory,current.read,f.observation,{...f.candidate,headSha:sha('f'),treeSha:sha('e')},f.readEvidence);
+ expect(after.inputDigest).toBe(before.inputDigest);expect(after.profileDigest).toBe(before.profileDigest);
+});
+it.each(['per-file','aggregate'])('finite repair kernel accepts exact byte limit and refuses one byte over: %s',async kind=>{
+ const size=8*1024*1024,data=new Uint8Array(size),files=Array.from({length:kind==='per-file'?1:8},(_,i)=>`file-${i}.bin`);
+ const read=Object.assign(async(_p:string)=>data,{metadata:async(_p:string)=>({mode:'100644',links:[]})});
+ const source={version:'physical-source/1' as const,files,absentInputs:[]};
+ const exact=await capturePhysicalSource(source,read);expect(exact.files.reduce((sum,file)=>sum+file.bytes.length,0)).toBe(kind==='per-file'?size:8*size);
+ const overRead=Object.assign(async(p:string)=>kind==='per-file'?new Uint8Array(size+1):p==='one-extra-byte.bin'?new Uint8Array(1):data,{metadata:read.metadata});
+ let rejected=false;try{await capturePhysicalSource({...source,files:kind==='per-file'?files:[...files,'one-extra-byte.bin']},overRead);}catch(error){rejected=error instanceof Error&&/byte bounds/.test(error.message);}
+ expect(rejected).toBe(true);
+});
 function tree(bytes:Map<string,string>,linked=new Set<string>()):InstalledDataSourceTree {
  const read=Object.assign(async(p:string)=>bytes.has(p)?new TextEncoder().encode(bytes.get(p)!):null,{metadata:async(p:string)=>({mode:bytes.has(p)?'100644':null,links:linked.has(p)?[{path:p,target:'other'}]:[]})}) as CandidateTreeInputReader;
  return{inventory:[...bytes.keys()],read};
 }
-async function fixture(order?:'request-ids'|'files'|'directories'|'combined'){
+describe('finite physical source portable identity',()=>{
+ it('reconstructs an unrelated candidate with unchanged physical authority',async()=>{
+  const f=await fixture(undefined,true);
+  await expect(f.reconstruct()).resolves.toHaveProperty('binding');
+  const current=await f.trees(currentTree);
+  const identity=await scopedCheckIdentity(f.config,f.provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+  expect(identity.inputDigest).not.toBe(f.identity.inputDigest);
+ });
+ it.each(['envelope','absence','present-absence','physical-link','physical-bytes'])('refuses changed finite authority: %s',async mode=>{
+  const f=await fixture(undefined,true),physical=f.provider.check!.physicalSource!;
+  if(mode==='present-absence')f.maps.get(currentTree)!.set('startup.cjs','injected');
+  if(mode==='physical-link')f.links.get(currentTree)!.add('package.json');
+  if(mode==='physical-bytes')f.maps.get(currentTree)!.set('package.json','changed manifest');
+  if(mode==='envelope'||mode==='absence'){
+   const changed={...f.provider,check:{...f.provider.check!,physicalSource:{...physical,...(mode==='envelope'?{files:[...physical.files,'root.ts']}:{absentInputs:[...physical.absentInputs,'other.cjs']})}}};
+   const config={...f.config,providers:[changed]};
+   await expect(reconstructResourceApplicability(config,changed,f.candidate,f.proof,f.trees,f.readEvidence)).rejects.toThrow();
+  }else await expect(f.reconstruct()).rejects.toThrow();
+ });
+});
+async function fixture(order?:'request-ids'|'files'|'directories'|'combined',finite=false){
  const bytes=new Map([['font.test.ts','test'],['reader.ts','reader'],['asset.bin','data'],['package.json','{}'],['root.ts','old']]);
  const maps=new Map([[baseTree,new Map(bytes)],[originalTree,new Map(bytes)],[currentTree,new Map([...bytes].map(([p,s])=>[p,p==='root.ts'?'unrelated change':s]))]]);
  const links=new Map([...maps.keys()].map(key=>[key,new Set<string>()]));
@@ -23,8 +83,8 @@ async function fixture(order?:'request-ids'|'files'|'directories'|'combined'){
  const request:InstalledDataResourceRequest={version:'installed-package-data/1',id:'font',issuer:'font.test.ts',package:'font',manifest:'package.json',files:order==='files'||order==='combined'?['z.woff2','a.woff2']:['font.woff2'],directories:order==='directories'||order==='combined'?[{path:'z-fonts',suffix:'-normal.woff2'},{path:'a-fonts',suffix:'-normal.woff2'}]:[]};
  const requests=order==='request-ids'||order==='combined'?[{...request,id:'z-font'},{...request,id:'a-font'}]:[request];
  const installedData={version:'installed-data-consumer/1' as const,consumerId:'font',requests,source,guards:{'reader.ts':sha256Hex('reader'),'font.test.ts':sha256Hex('test')}};
- const provider={id:'font',findingCodes:[],check:{command:['node','test.js'],timeoutMs:1000,scope:source,outputs:['result.json'],installedData}} as ProviderRegistration;
- const config={deliveryRecordPath:'delivery/record.json',providers:[provider],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'font',gitContext:'full',dependencyInputs:['package.json'],dependencies:{command:['node','setup'],timeoutMs:1000},mutableOutputs:['result.json'],credentialIdentities:{}}],mechanicalProviders:[]},obligations:[{id:'font.passed',providers:['font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1','installed-data.applicable/1']}]} as unknown as HarnessConfig;
+ const provider={id:'font',findingCodes:[],check:{command:['node','test.js'],timeoutMs:1000,scope:source,outputs:['result.json'],installedData,...(finite?{physicalSource:{version:'physical-source/1',files:['font.test.ts','reader.ts','asset.bin','package.json'],absentInputs:['startup.cjs']}}:{})}} as ProviderRegistration;
+ const config={deliveryRecordPath:'delivery/record.json',providers:[provider],scopedExecution:{version:'scoped-execution/1',profiles:[{id:'font',gitContext:finite?'none':'full',dependencyInputs:['package.json'],dependencies:{command:['node','setup'],timeoutMs:1000},mutableOutputs:['result.json'],credentialIdentities:{}}],mechanicalProviders:[]},obligations:[{id:'font.passed',providers:['font'],freshness:'exact_candidate',acceptedPayloadSpecs:['checks.passed/1','installed-data.applicable/1']}]} as unknown as HarnessConfig;
  const observation={version:'scoped-runtime/1' as const,runtimeDigest:hash('node'),flags:{},credentials:{}};
  const original={headSha:sha('d'),treeSha:originalTree,deliverable:{digest:hash('old'),identity:'git-tree/v1'},base:{ref:'origin/main',tipSha:baseTree,mergeBaseSha:baseTree},workspaceId:'workspace'} as unknown as CapturedCandidate;
  const candidate={...original,headSha:sha('e'),treeSha:currentTree,deliverable:{...original.deliverable,digest:hash('current')}};

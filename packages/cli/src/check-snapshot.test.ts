@@ -36,6 +36,18 @@ async function fixture() {
   const treeSha = await git("write-tree");
   return { root, git, candidate: { headSha, treeSha, base: { ref: "origin/main", tipSha: headSha, mergeBaseSha: headSha } } };
 }
+it("finite physical source avoids whole-tree Git materialization commands",async()=>{
+  const f=await fixture(),before=inventoryProbe.commands.length;
+  const snapshot=await createCheckSnapshot({rootDir:f.root,candidate:f.candidate,gitContext:'none',outputs:[],environment:{},physicalSource:{version:'physical-source/1',files:['source.txt'],absentInputs:['startup.cjs']}});
+  try{
+    expect(await readFile(path.join(snapshot.rootDir,'source.txt'),'utf8')).toBe('prepared');
+    await expect(readFile(path.join(snapshot.rootDir,'new.txt'))).rejects.toMatchObject({code:'ENOENT'});
+    const commands=inventoryProbe.commands.slice(before).filter(command=>command.command==='git').map(command=>command.args[0]);
+    expect(commands).toContain('ls-tree');expect(commands).toContain('cat-file');
+    expect(commands.some(command=>['fetch','checkout-index','read-tree','init'].includes(command!))).toBe(false);
+    await snapshot.verify();
+  }finally{await snapshot.cleanup();}
+});
 async function shallowFixture() {
   const upstream = await fixture();
   await upstream.git("-c", "commit.gpgsign=false", "commit", "-qm", "boundary");

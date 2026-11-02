@@ -32,8 +32,8 @@ async function executableIdentity(command: string, root: string, searchPath: str
   throw new CheckSnapshotError("check_runtime_unavailable", "A declared execution tool cannot be resolved and bound.");
 }
 /** Checks whose profiles declare the same dependency setup and Git context share one installed snapshot. */
-function setupKey(profile: ScopedExecutionProfile): string {
-  return digestCanonical({ dependencies: profile.dependencies ?? null, dependencyInputs: [...profile.dependencyInputs].sort(), gitContext: profile.gitContext ?? "full" });
+function setupKey(profile: ScopedExecutionProfile, physicalSource?: SnapshotRequest["physicalSource"]): string {
+  return digestCanonical({ dependencies: profile.dependencies ?? null, dependencyInputs: [...profile.dependencyInputs].sort(), gitContext: profile.gitContext ?? "full", ...(physicalSource ? { physicalSource } : {}) });
 }
 const shownArgument = (argument: string) => /^[\w@%+=:,./-]+$/.test(argument) ? argument : JSON.stringify(argument);
 /** Runs the tasks it is given one at a time, in call order. */
@@ -189,7 +189,7 @@ export class ScopedChecks {
     const [first, ...rest] = ids;
     if (first === undefined) return [];
     const byCost = [first, ...rest.sort((a, b) => cost.get(a)! === cost.get(b)! ? 0 : cost.get(a)! < cost.get(b)! ? -1 : 1)];
-    const keys = byCost.map(id => setupKey(this.profileOf(id)));
+    const keys = byCost.map(id => setupKey(this.profileOf(id), this.context.config.providers.find(p => p.id === id)?.check?.physicalSource));
     return [...new Set(keys)].flatMap(key => byCost.filter((_, index) => keys[index] === key));
   }
   /**
@@ -246,12 +246,12 @@ export class ScopedChecks {
   }
   async submitMechanical(): Promise<void> { for (const submit of this.submissions) await submit(); this.submissions.length = 0; }
   /** One acquisition path preserves setup sharing, output ownership and worker isolation. */
-  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"]): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[] }> {
-    const key = setupKey(profile);
+  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"]): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[] }> {
+    const key = setupKey(profile, physicalSource);
     // Every scoped check's profile sharing this setup may write its own outputs in the shared tree;
     // only those profiles passed the overlap refusal in create().
     const sharedOutputs = [...new Set(this.context.config.scopedExecution!.profiles
-      .filter(p => setupKey(p) === key && this.context.config.providers.some(q => q.check?.scope?.profile === p.id)).flatMap(p => p.mutableOutputs))];
+      .filter(p => this.context.config.providers.some(q => q.check?.scope?.profile === p.id && setupKey(p, q.check.physicalSource) === key)).flatMap(p => p.mutableOutputs))];
     let snapshot = lane.snapshots.get(key);
     if (!snapshot) {
       // A single worker retains only consecutive same-setup reuse; durable outputs no longer
@@ -260,8 +260,12 @@ export class ScopedChecks {
         await previous.cleanup();
         lane.snapshots.delete(previousKey);
       }
-      snapshot = await createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
-        onPhase: (phase, durationMs) => this.phaseWriters.get(lane.snapshots)?.(phase, durationMs),
+      snapshot = await createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(physicalSource ? { physicalSource } : {}), ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
+        onPhase: (phase, durationMs) => {
+          const write = this.phaseWriters.get(lane.snapshots);
+          if (write) write(phase, durationMs);
+          else lane.write(`snapshot ${profile.id}: bootstrap ${phase} ${Math.round(durationMs)}ms`);
+        },
         ...(onDependencyResult ? { onDependencyResult } : {}),
       });
       lane.snapshots.set(key, snapshot);
@@ -296,7 +300,7 @@ export class ScopedChecks {
     if (!provider?.check?.scope || !profile || !this.identities.has(providerId)) throw new CheckSnapshotError("scoped_executor_required", "Installed resources require an already configured scoped provider and profile.");
     const normalized = normalizeInstalledDataResourceRequests(requests);
     try {
-      const { snapshot, sharedOutputs } = await this.acquireSnapshot(profile, lane);
+      const { snapshot, sharedOutputs } = await this.acquireSnapshot(profile, lane, undefined, provider.check.physicalSource);
       // Prior checks have already retained their outputs. Resource observation
       // reads immutable package DATA, so remove permitted mutable products first
       // and retain the observer's strict source/dependency verification.
@@ -304,7 +308,7 @@ export class ScopedChecks {
       const capture = await captureOwnedInstalledDataResources(snapshot, normalized, context, this.context.signal ? { signal: this.context.signal } : {});
       return { capture, snapshot };
     } catch (error) {
-      const key = setupKey(profile), damaged = lane.snapshots.get(key);
+      const key = setupKey(profile, provider.check.physicalSource), damaged = lane.snapshots.get(key);
       // Keep a failed cleanup in the pool so final cleanup can retry it.
       await damaged?.cleanup();
       lane.snapshots.delete(key);
@@ -461,7 +465,7 @@ export class ScopedChecks {
     const secrets = check.scope!.environment.filter(e => e.kind === "credential").map(e => this.context.env[e.name]).filter((v): v is string => !!v);
     try {
       const { snapshot, sharedOutputs } = await this.acquireSnapshot(profile, lane,
-        (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; });
+        (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; }, check.physicalSource);
       diagnostic = { ...diagnostic, phase: "pre-command-verification" };
       // A sibling or dependency setup cannot supply this command's result, and
       // another profile's outputs are not this profile's to read or write.
@@ -526,8 +530,8 @@ export class ScopedChecks {
         `  command (cwd ${ran.cwd}): ${ran.argv.map(shownArgument).join(" ")}`,
         ...("unavailable" in ran.result ? [`  output ${ran.result.unavailable}`]
           : [`  exit ${ran.result.exitCode ?? "unavailable"}; output tail (last 40 lines):`, ...ran.result.outputTail.trimEnd().split("\n").slice(-40).map(line => `    ${line}`)])].join("\n"));
-      const damaged = lane.snapshots.get(setupKey(profile));
-      lane.snapshots.delete(setupKey(profile));
+      const damaged = lane.snapshots.get(setupKey(profile, check.physicalSource));
+      lane.snapshots.delete(setupKey(profile, check.physicalSource));
       await damaged?.cleanup();
       throw error;
     }

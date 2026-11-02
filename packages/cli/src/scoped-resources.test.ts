@@ -13,17 +13,22 @@ const exec = promisify(execFile), roots:string[]=[];
 afterEach(async()=>{vi.restoreAllMocks();await Promise.all(roots.splice(0).map(dir=>rm(dir,{recursive:true,force:true})));});
 const resourceContext:InstalledDataResourceContext={setupRecipeDigest:digestCanonical('setup'),dependencyDigest:digestCanonical('deps'),runtimeDigest:digestCanonical('node'),releaseDigest:digestCanonical('release'),policyDigest:digestCanonical('policy')};
 const request={version:'installed-package-data/1' as const,id:'font',issuer:'packages/app/font.test.ts',package:'@fonts/demo',manifest:'package.json' as const,files:['wght.css'],directories:[{path:'files',suffix:'-normal.woff2'}]};
-async function fixture(installed = false, applicability = false) {
+async function fixture(installed = false, applicability = false, finite = false, varyingResource = false) {
   const dir=await mkdtemp(path.join(tmpdir(),'scoped-resource-cli-'));roots.push(dir);
   const git=async(...args:string[])=>(await exec('git',args,{cwd:dir})).stdout.trim();
   await git('init','-q');await git('config','user.name','Test');await git('config','user.email','test@example.invalid');
   await mkdir(path.join(dir,'packages/app'),{recursive:true});await writeFile(path.join(dir,request.issuer),'export {};\n');await writeFile(path.join(dir,'harness.config.ts'),'export default {};\n');
   if(installed) await writeFile(path.join(dir,'data.fixture'),'font-css');
+  if(finite) await writeFile(path.join(dir,'excluded-sentinel.txt'),'unrelated source');
   await git('add','.');await git('-c','commit.gpgsign=false','commit','-qm','base');await git('branch','origin/main');
   const setupCount=path.join(dir,'.git/setup-count'),commandCount=path.join(dir,'.git/command-count');
-  const setup=`const fs=require('fs');const root='node_modules/@fonts/demo';fs.mkdirSync(root+'/files',{recursive:true});fs.writeFileSync(root+'/package.json',JSON.stringify({name:'@fonts/demo',exports:{'./package.json':'./package.json'}}));fs.writeFileSync(root+'/wght.css',fs.existsSync('data.fixture')?fs.readFileSync('data.fixture'):'font-css');fs.writeFileSync(root+'/files/a-normal.woff2',Buffer.from([0,255,1]));fs.appendFileSync(${JSON.stringify(setupCount)},${JSON.stringify('setup\n')});`;
-  const provider={id:'check.font',findingCodes:[],check:{command:[process.execPath,'-e',`const fs=require('fs');fs.appendFileSync(${JSON.stringify(commandCount)},${JSON.stringify('command\n')});fs.writeFileSync('result.json','{}');`],timeoutMs:5000,outputs:['result.json'],scope:{version:'scoped-check/1',files:installed?[request.issuer,'data.fixture']:[request.issuer],memberships:[],tests:installed?[request.issuer]:[],cwd:'.',profile:'fixture',environment:[]},...(installed?{installedData:{version:'installed-data-consumer/1',consumerId:'font',requests:[request],source:{version:'scoped-check/1',files:installed?[request.issuer,'data.fixture']:[request.issuer],memberships:[],tests:[request.issuer],cwd:'.',profile:'fixture',environment:[]},guards:{[request.issuer]:sha256Hex('export {};\n')}}}:{})}};
-  const config=defineHarnessConfig({...base,preparationWiringPaths:['harness.config.ts'],preparationCommands:[],providers:[provider],obligations:[{...base.obligations[0]!,id:'font.passed',activation:{kind:'always'},providers:[provider.id],acceptedPayloadSpecs:applicability?['checks.passed/1','installed-data.applicable/1']:['checks.passed/1'],humanWaiverAllowed:false,allowedResolutionKinds:['satisfied_evidence']}],scopedExecution:{version:'scoped-execution/1',mechanicalProviders:installed?[]:[provider.id],profiles:[{id:'fixture',gitContext:'full',dependencyInputs:[],mutableOutputs:['result.json'],credentialIdentities:{},dependencies:{command:[process.execPath,'-e',setup],timeoutMs:5000}}]}} as unknown as HarnessConfigInput);
+  const physical=finite?`if(fs.existsSync('excluded-sentinel.txt')||fs.existsSync('.git')||fs.readFileSync(${JSON.stringify(request.issuer)},'utf8')!=='export {};\\n')throw Error('not the finite physical root');`:'';
+  // Randomness is part of this admitted setup command, not a hidden source or
+  // external fixture input: identical recipe/lock identity does not prove DATA.
+  const vary=varyingResource?`fs.writeFileSync(root+'/wght.css',require('crypto').randomBytes(32));fs.appendFileSync(${JSON.stringify(path.join(dir,'.git/resource-hashes'))},require('crypto').createHash('sha256').update(fs.readFileSync(root+'/wght.css')).digest('hex')+'\\n');`:'';
+  const setup=`const fs=require('fs');${physical}const root='node_modules/@fonts/demo';fs.mkdirSync(root+'/files',{recursive:true});fs.writeFileSync(root+'/package.json',JSON.stringify({name:'@fonts/demo',exports:{'./package.json':'./package.json'}}));fs.writeFileSync(root+'/wght.css',fs.existsSync('data.fixture')?fs.readFileSync('data.fixture'):'font-css');fs.writeFileSync(root+'/files/a-normal.woff2',Buffer.from([0,255,1]));${vary}fs.appendFileSync(${JSON.stringify(setupCount)},${JSON.stringify('setup\n')});`;
+  const provider={id:'check.font',findingCodes:[],check:{command:[process.execPath,'-e',`const fs=require('fs');${physical}fs.appendFileSync(${JSON.stringify(commandCount)},${JSON.stringify('command\n')});fs.writeFileSync('result.json',${varyingResource?"fs.readFileSync('node_modules/@fonts/demo/wght.css').toString('hex')":"'{}'"});`],timeoutMs:5000,outputs:['result.json'],...(finite?{physicalSource:{version:'physical-source/1',files:[request.issuer,'harness.config.ts','data.fixture'],absentInputs:['startup.cjs']}}:{}),scope:{version:'scoped-check/1',files:installed?[request.issuer,'data.fixture']:[request.issuer],memberships:[],tests:installed?[request.issuer]:[],cwd:'.',profile:'fixture',environment:[]},...(installed?{installedData:{version:'installed-data-consumer/1',consumerId:'font',requests:[request],source:{version:'scoped-check/1',files:installed?[request.issuer,'data.fixture']:[request.issuer],memberships:[],tests:[request.issuer],cwd:'.',profile:'fixture',environment:[]},guards:{[request.issuer]:sha256Hex('export {};\n')}}}:{})}};
+  const config=defineHarnessConfig({...base,preparationWiringPaths:['harness.config.ts'],preparationCommands:[],providers:[provider],obligations:[{...base.obligations[0]!,id:'font.passed',activation:{kind:'always'},providers:[provider.id],acceptedPayloadSpecs:applicability?['checks.passed/1','installed-data.applicable/1']:['checks.passed/1'],humanWaiverAllowed:false,allowedResolutionKinds:['satisfied_evidence']}],scopedExecution:{version:'scoped-execution/1',mechanicalProviders:installed?[]:[provider.id],profiles:[{id:'fixture',gitContext:finite?'none':'full',dependencyInputs:[],mutableOutputs:['result.json'],credentialIdentities:{},dependencies:{command:[process.execPath,'-e',setup],timeoutMs:5000}}]}} as unknown as HarnessConfigInput);
   const artifacts=path.join(dir,'.git/artifacts');await mkdir(artifacts);const errors:string[]=[],messages:string[]=[];
   const runtime:CliRuntime={cwd:dir,env:{PATH:process.env['PATH']!},stdinIsTTY:false,stdoutIsTTY:false,stdout:s=>messages.push(s),stderr:s=>errors.push(s),loadConfig:async()=>config,artifacts:createArtifactsPort({runRootBase:artifacts})};
   return {dir,git,config,runtime,errors,messages,setupCount,commandCount};
@@ -38,6 +43,47 @@ async function duringCreation(hook:(session:ScopedChecks)=>Promise<void>) {
   return ()=>{if(hookFailure)throw hookFailure;};
 }
 describe('native scoped installed resources',()=>{
+  it.each(['both','HEAD-only','tree-only'])('finite physical resource freshness observes changed DATA with identical admitted setup inputs: %s',async transition=>{
+    const f=await fixture(true,true,true,true);
+    for(const command of ['prepare','gate'])expect(await runCli([command],f.runtime),f.errors.join('\n')).toBe(0);
+    const definition=digestCanonical(f.config);
+    const before={head:await f.git('rev-parse','HEAD'),tree:await f.git('write-tree')};
+    if(transition==='HEAD-only')await f.git('-c','commit.gpgsign=false','commit','--allow-empty','-qm','HEAD only');
+    else{await writeFile(path.join(f.dir,'excluded-sentinel.txt'),'only unrelated source changed');await f.git('add','.');if(transition==='both')await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');}
+    const after={head:await f.git('rev-parse','HEAD'),tree:await f.git('write-tree')};
+    if(transition==='HEAD-only'){expect(after.head).not.toBe(before.head);expect(after.tree).toBe(before.tree);}
+    else if(transition==='tree-only'){expect(after.head).toBe(before.head);expect(after.tree).not.toBe(before.tree);}
+    else{expect(after.head).not.toBe(before.head);expect(after.tree).not.toBe(before.tree);}
+    for(const command of ['prepare','gate'])expect(await runCli([command],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(digestCanonical(f.config)).toBe(definition);
+    const resources=(await readFile(path.join(f.dir,'.git/resource-hashes'),'utf8')).trim().split('\n');
+    expect(resources).toHaveLength(2);expect(resources[0]).not.toBe(resources[1]);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\ncommand\n');
+    const terminals=(await readdir(path.join(f.dir,'.git'),{recursive:true})).filter(file=>file.endsWith('terminal.json'));
+    const outputs=await Promise.all(terminals.map(async file=>JSON.parse(await readFile(path.join(f.dir,'.git',file),'utf8')).entry.payload.outputs[0].base64));
+    expect(new Set(outputs).size).toBe(2);
+    process.stdout.write(JSON.stringify({fixture:'finite resource freshness under identical admitted setup',transition,before,after,definition,resourceHashes:resources,consumerOutputHex:outputs.map(value=>Buffer.from(value,'base64').toString())})+'\n');
+  },120000);
+  it('finite physical source preserves cold warm resource restoration and portable no-setup verification',async()=>{
+    const f=await fixture(true,true,true);
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    await writeFile(path.join(f.dir,'excluded-sentinel.txt'),'changed unrelated source');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    expect(f.messages.some(line=>line.includes('bootstrap materialization'))).toBe(true);
+    const setups=await readFile(f.setupCount,'utf8');
+    expect(await runCli(['record'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['verify'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.setupCount,'utf8')).toBe(setups);
+    await writeFile(path.join(f.dir,'data.fixture'),'changed resource bytes');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','changed DATA');
+    expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],f.runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\ncommand\n');
+    expect((await readFile(f.setupCount,'utf8')).trim().split('\n')).toHaveLength(3);
+  },120000);
   it('native gate emits applicability after unrelated HEAD without a fresh passed attempt or consumer command',async()=>{
     const f=await fixture(true,true);
     expect(await runCli(['prepare'],f.runtime),f.errors.join('\n')).toBe(0);
