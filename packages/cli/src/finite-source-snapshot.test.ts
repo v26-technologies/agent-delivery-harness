@@ -138,3 +138,18 @@ it("finite source setup and consumer observe the owned finite cwd and all depend
     await expect(snapshot.verify()).rejects.toMatchObject({ code: "check_snapshot_drift" });
   } finally { await snapshot.cleanup(); }
 });
+
+it.each([false,true])('finite repair protects nested output directory aliases before consumer unsafe=%s',async unsafe=>{
+  const f=await fixture(),ran=path.join(f.root,'.git/nested-consumer-ran');
+  const destination=unsafe?'config':'safe';
+  const setup=`const fs=require('fs');fs.mkdirSync('config');fs.mkdirSync('safe');fs.mkdirSync('node_modules/tree',{recursive:true});fs.symlinkSync('../../${destination}','node_modules/tree/link');fs.symlinkSync('node_modules/tree','out');`;
+  const input={...f.request,outputs:['out/','result.json'],physicalSource:{...f.request.physicalSource!,absentInputs:['config/startup.cjs']},dependencies:{command:[process.execPath,'-e',setup] as [string,...string[]],timeoutMs:5000}};
+  let failure:unknown,snapshot:Awaited<ReturnType<typeof createCheckSnapshot>>|undefined;
+  try{
+    snapshot=await createCheckSnapshot(input);await snapshot.verify();
+    await exec(process.execPath,['-e',`const fs=require('fs');${unsafe?"fs.writeFileSync('out/link/startup.cjs','injected');":"if(!fs.statSync('out/link').isDirectory())throw Error('safe alias unavailable');"}fs.writeFileSync('result.json','consumer passed');fs.writeFileSync(${JSON.stringify(ran)},'executed');`],{cwd:snapshot.rootDir,env:snapshot.environment});
+    if(!unsafe){await snapshot.verify();expect(await readFile(path.join(snapshot.rootDir,'result.json'),'utf8')).toBe('consumer passed');}
+  }catch(error){failure=error;}finally{await snapshot?.cleanup();}
+  if(unsafe){await expect(lstat(ran)).rejects.toMatchObject({code:'ENOENT'});expect(failure).toMatchObject({code:'check_snapshot_drift'});}
+  else{expect(failure).toBeUndefined();expect(await readFile(ran,'utf8')).toBe('executed');}
+});

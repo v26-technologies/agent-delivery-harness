@@ -38,15 +38,31 @@ const resolveMissing = async target => {
   }
   return resolved;
 };
-const protectOutputAlias = (relative, resolved) => {
-  for (const output of outputs) {
-    const o = output.replace(/\/$/, '');
-    const effective = relative === o || relative.startsWith(o + '/') ? resolved : o.startsWith(relative + '/') ? path.join(resolved, o.slice(relative.length + 1)) : null;
-    if (effective === null) continue;
-    const name = path.relative(root, effective).normalize('NFC').toLowerCase();
-    for (const absent of absentInputs) {
-      const a = absent.normalize('NFC').toLowerCase();
-      if (name === '' || name === a || name.startsWith(a + '/') || a.startsWith(name + '/')) throw { code: 'check_snapshot_drift' };
+// Retain the already-walked links so output authority can follow directory
+// referents without recursively following links or weakening inventory digests.
+const aliases = [];
+const protectOutputAlias = resolved => {
+  const name = path.relative(root, resolved).normalize('NFC').toLowerCase();
+  for (const absent of absentInputs) {
+    const a = absent.normalize('NFC').toLowerCase();
+    if (name === '' || name === a || name.startsWith(a + '/') || a.startsWith(name + '/')) throw { code: 'check_snapshot_drift' };
+  }
+};
+const protectOutputReachability = async () => {
+  const reachable = [];
+  for (const output of outputs) reachable.push(await resolveMissing(path.join(root, output.replace(/\/$/, ''))));
+  for (const target of reachable) protectOutputAlias(target);
+  // Each collected link is expanded at most once. Its fully resolved target
+  // is writable whenever its lexical location is below an output referent.
+  const pending = new Set(aliases);
+  for (let index = 0; index < reachable.length; index++) {
+    const directory = reachable[index];
+    for (const alias of pending) {
+      const relative = path.relative(directory, alias.absolute);
+      if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) continue;
+      pending.delete(alias);
+      protectOutputAlias(alias.resolved);
+      reachable.push(alias.resolved);
     }
   }
 };
@@ -61,10 +77,7 @@ const walk = async (relative, mutable = false) => {
     if (path.isAbsolute(target) || !inside(path.resolve(path.dirname(absolute), target))) escape();
     try { if (!inside(await realpath(absolute))) escape(); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (absentInputs.length && outputs.some(output => {
-      const o = output.replace(/\/$/, '');
-      return relative === o || relative.startsWith(o + '/') || o.startsWith(relative + '/');
-    })) protectOutputAlias(relative, await resolveMissing(absolute));
+    if (absentInputs.length) aliases.push({ absolute, resolved: await resolveMissing(absolute) });
     if (!mutable) record(relative, [relative, 'link', target]);
   } else if (stat.isDirectory()) {
     for (const name of (await readdir(absolute)).sort()) await walk(relative ? relative + '/' + name : name, mutable);
@@ -84,6 +97,7 @@ try {
   }
   if (forbidGit && await lstat(path.join(root, '.git')).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) throw { code: 'check_snapshot_drift' };
   await walk('');
+  if (absentInputs.length) await protectOutputReachability();
   // Tuples contain only arrays, strings and permission integers: JSON.stringify
   // has exactly the same bytes as canonical JSON for this restricted shape.
   const digest = tuples => createHash('sha256').update(JSON.stringify(tuples)).digest('hex');
