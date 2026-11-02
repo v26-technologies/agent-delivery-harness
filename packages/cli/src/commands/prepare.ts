@@ -133,8 +133,12 @@ export const prepareCommand: CommandDescriptor = {
       if (context.config.scopedExecution) {
         capture = finalCapture;
         validationDigest = await computeDeliverableIdentity({ rootDir: context.rootDir, treeSha: capture.candidate.treeSha, config: { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral } });
-        scoped = await ScopedChecks.create(context, capture.candidate);
-        await scoped?.satisfyMechanical();
+        if (context.config.scopedExecution.mechanicalProviders.length === 0) {
+          await ScopedChecks.validatePreparation(context, capture.candidate);
+        } else {
+          scoped = await ScopedChecks.create(context, capture.candidate);
+          await scoped?.satisfyMechanical();
+        }
       }
       const published = await publishPreparationReceipt(
         context.rootDir,

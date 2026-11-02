@@ -75,7 +75,7 @@ export async function captureScopedCheckInputs(definition: ScopedCheckDefinition
   }
   // Indexed results preserve identity bytes despite out-of-order completion.
   // Ports have no cancellation contract: settle in-flight work before rejecting.
-  await Promise.all(Array.from({ length: Math.min(8, selected.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(32, selected.length) }, worker));
   if (failure !== undefined) throw failure.error;
   const environment: ScopedInputCapture["environment"] = [...definition.environment].sort((a, b) => a.name.localeCompare(b.name)).map(entry => {
     const value = ports.environment[entry.name];

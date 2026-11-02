@@ -9,7 +9,7 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-const paths = Array.from({ length: 24 }, (_, i) => `src/${String(i).padStart(2, "0")}.ts`);
+const paths = Array.from({ length: 80 }, (_, i) => `src/${String(i).padStart(2, "0")}.ts`);
 const definition = { version: "scoped-check/1" as const, files: [...paths].reverse(), memberships: [], tests: [], cwd: ".", profile: "local", environment: [] };
 function ports(overrides: Partial<ScopedInputCapturePorts> = {}): ScopedInputCapturePorts {
   return {
@@ -40,7 +40,7 @@ it("matches the serial capture golden including binary, absent, membership and s
   expect(result.inputDigest).toBe("7976cf9ed049e0083f6d09495fba2ef9eff01ed5550a462e93d7065f4a332604");
 });
 
-it("overlaps reads with an eight-file cap through metadata and retains sorted results", async () => {
+it("overlaps reads with a thirty-two-file cap through metadata and retains sorted results", async () => {
   const reads = paths.map(() => deferred<Uint8Array | null>());
   const metadata = paths.map(() => deferred<{ mode: string; links: [] }>());
   const started: string[] = [];
@@ -56,16 +56,16 @@ it("overlaps reads with an eight-file cap through metadata and retains sorted re
     },
   }));
   await setImmediate();
-  expect(started).toEqual(paths.slice(0, 8));
-  for (let base = 0; base < paths.length; base += 8) {
-    for (let i = base + 7; i >= base; i--) reads[i]!.resolve(Buffer.from(paths[i]!));
+  expect(started).toEqual(paths.slice(0, 32));
+  for (let base = 0; base < paths.length; base += 32) {
+    for (let i = Math.min(base + 31, paths.length - 1); i >= base; i--) reads[i]!.resolve(Buffer.from(paths[i]!));
     await setImmediate();
-    expect(started).toHaveLength(base + 8); // Metadata still owns each worker.
-    for (let i = base + 7; i >= base; i--) metadata[i]!.resolve({ mode: "100644", links: [] });
+    expect(started).toHaveLength(Math.min(base + 32, paths.length)); // Metadata still owns each worker.
+    for (let i = Math.min(base + 31, paths.length - 1); i >= base; i--) metadata[i]!.resolve({ mode: "100644", links: [] });
     await setImmediate();
   }
   const result = await capture;
-  expect(peak).toBe(8);
+  expect(peak).toBe(32);
   expect(active).toBe(0);
   expect(result.files.map(file => file.path)).toEqual(paths);
   expect(result).toEqual(await captureScopedCheckInputs(definition, ports({ readMetadata: async () => ({ mode: "100644", links: [] }) })));
@@ -86,16 +86,16 @@ it("stops dispatch on failure, drains started work, and throws the earliest sort
   reads[6]!.reject(late);
   await setImmediate();
   expect(settled).toBe(false);
-  expect(started).toEqual(paths.slice(0, 8));
+  expect(started).toEqual(paths.slice(0, 32));
   reads[0]!.resolve(Buffer.from(paths[0]!));
-  for (const i of [1, 2, 3, 4, 5]) reads[i]!.resolve(Buffer.from(paths[i]!));
+  for (let i = 1; i < 31; i++) if (i !== 6) reads[i]!.resolve(Buffer.from(paths[i]!));
   await setImmediate();
   expect(settled).toBe(false); // Last in-flight read must drain before rejection.
-  reads[7]!.resolve(Buffer.from(paths[7]!));
+  reads[31]!.resolve(Buffer.from(paths[31]!));
   const result = await outcome;
   expect(result).toEqual({ ok: false, error: first });
   if (!result.ok) expect(result.error).toBe(first);
-  expect(started).toEqual(paths.slice(0, 8));
+  expect(started).toEqual(paths.slice(0, 32));
 });
 
 it("preserves rejection with undefined and drains other reads", async () => {

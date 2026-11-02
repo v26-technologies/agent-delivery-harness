@@ -110,7 +110,7 @@ it("keeps native binary batches out of UTF8 and base64 text transport", async ()
   expect(bodyEncodings).toEqual([]);
 });
 
-it("bounds native waves to thirty-two and flushes a single request without waiting for peers", async () => {
+it("bounds native waves to eight and flushes a single request without waiting for peers", async () => {
   const f = fixture(); for (let i = 0; i < 67; i++) writeFileSync(path.join(f.root, `extra-${i}`), `unique ${i}`);
   // Keep the transport wrapper out of the pinned tree.
   f.git("add", ...Array.from({ length: 67 }, (_, i) => `extra-${i}`)); const tree = f.git("write-tree").toString().trim();
@@ -118,10 +118,10 @@ it("bounds native waves to thirty-two and flushes a single request without waiti
   expect(await Promise.all(Array.from({ length: 67 }, (_, i) => read(`extra-${i}`)))).toEqual(Array.from({ length: 67 }, (_, i) => Buffer.from(`unique ${i}`)));
   expect(await read("empty")).toEqual(Buffer.alloc(0));
   const waves = f.calls().filter(call => call.args[1] === "--batch").map(call => call.input.trim().split("\n").length);
-  expect(waves).toEqual([32, 32, 3, 1]);
+  expect(waves).toEqual([...Array.from({ length: 8 }, () => 8), 3, 1]);
 });
 
-it("keeps one native child active when a distinct request arrives during a held batch", async () => {
+it("allows a distinct native child to overlap an earlier held batch", async () => {
   const f = fixture(); f.mode("hold");
   const read = await candidateTreeSourceReader(f.root, f.tree), first = read("input");
   const launches = () => vi.mocked(spawn).mock.calls.map((call, index) => ({ call, result: vi.mocked(spawn).mock.results[index]! }))
@@ -132,8 +132,8 @@ it("keeps one native child active when a distinct request arrives during a held 
     second = read("exec");
     // Drain scheduler microtasks while the first real child waits for release.
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(launches()).toHaveLength(1);
-    expect(launches()[0]!.result.value.exitCode).toBeNull();
+    expect(launches()).toHaveLength(2);
+    expect(launches().every(({ result }) => result.value.exitCode === null)).toBe(true);
   } finally {
     f.release(); await Promise.allSettled([first, ...(second ? [second] : [])]);
   }

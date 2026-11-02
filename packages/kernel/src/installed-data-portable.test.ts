@@ -7,7 +7,7 @@ import {scopedCheckIdentity} from './scoped-inputs.ts';
 import {capturePhysicalSource} from './physical-source.ts';
 import {selectScopedCheckAttempt} from './evaluator.ts';
 import type {CapturedCandidate} from './candidate.types.ts';
-import type {HarnessConfig,ProviderRegistration} from './config.ts';
+import {deliveryRecordPathFor,type HarnessConfig,type ProviderRegistration} from './config.ts';
 import type {CandidateTreeInputReader} from './portable-inputs.ts';
 const hash=(s:string)=>digestCanonical(s),sha=(s:string)=>s.repeat(40);
 const baseTree=sha('a'),originalTree=sha('b'),currentTree=sha('c');
@@ -134,6 +134,79 @@ describe('portable installed resource reconstruction',()=>{
   const changed=await scopedCheckIdentity(f.config,f.provider,original.inventory,original.read,f.observation,f.original,f.readEvidence);
   f.proof.origin.attempt.inputDigest=changed.inputDigest;f.proof.origin.attempt.profileDigest=changed.profileDigest;
   const p=f.proof.origin.payload.resourceApplicability;Object.assign(p.origin,{inputDigest:changed.inputDigest,profileDigest:changed.profileDigest});const{digest,...body}=p;Object.assign(p,{digest:digestCanonical(body)});
+  await expect(f.reconstruct()).rejects.toThrow();
+ });
+});
+
+describe('retained origin scope for growing ordinary plans',()=>{
+ async function growing(){
+  const f=await fixture(undefined,true),proof=Object.assign(f.proof,{origin:{...f.proof.origin,payload:{...f.proof.origin.payload,resourceScope:structuredClone(f.provider.check!.scope!)}}});
+  const provider={...f.provider,check:{...f.provider.check!,scope:{...f.provider.check!.scope!,files:[...f.provider.check!.scope!.files,'root.ts','new-absent.ts']}}},config={...f.config,providers:[provider]};
+  return {...f,proof,provider,config,reconstruct:()=>reconstructResourceApplicability(config,provider,f.candidate,proof,f.trees,f.readEvidence)};
+ }
+ it('reconstructs the authenticated old scope while checking the complete current consumer',async()=>{
+  const f=await growing();await expect(f.reconstruct()).resolves.toHaveProperty('binding');
+  const current=await f.trees(currentTree),identity=await scopedCheckIdentity(f.config,f.provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+  expect(identity.inputDigest).not.toBe(f.identity.inputDigest);
+ });
+ it('omits only the exact configured record output from current resource definition identity',async()=>{
+  const f=await growing(),baseline=await f.reconstruct(),scope=f.provider.check!.scope!;
+  Object.assign(scope,{files:[...scope.files,deliveryRecordPathFor(f.config,f.candidate.deliverable.digest)]});
+  expect((await f.reconstruct()).binding.definitionDigest).toBe(baseline.binding.definitionDigest);
+  Object.assign(scope,{files:[...scope.files,'delivery/forged.json']});
+  expect((await f.reconstruct()).binding.definitionDigest).not.toBe(baseline.binding.definitionDigest);
+ });
+ it.each(['missing-frame','files','absences','tests','memberships','extra-key','unsafe-path','forged-neutral','oversized','old-bytes'])('refuses altered historical authority: %s',async mode=>{
+  const f=await growing(),payload=f.proof.origin.payload,scope=payload.resourceScope;
+  if(mode==='missing-frame')delete (payload as {resourceScope?:unknown}).resourceScope;
+  if(mode==='files')Object.assign(scope,{files:scope.files.filter(file=>file!=='asset.bin')});
+  if(mode==='absences')Object.assign(scope,{files:[...scope.files,'invented-absence.ts']});
+  if(mode==='tests')Object.assign(scope,{tests:[]});
+  if(mode==='memberships')Object.assign(scope,{memberships:['unrelated/']});
+  if(mode==='extra-key')Object.assign(scope,{extra:true});
+  if(mode==='unsafe-path')Object.assign(scope,{files:['../escape']});
+  if(mode==='forged-neutral')Object.assign(scope,{files:[...scope.files,'delivery/forged.json']});
+  if(mode==='oversized')Object.assign(scope,{files:['x'.repeat(2*1024*1024+1)]});
+  if(mode==='old-bytes')f.maps.get(originalTree)!.set('asset.bin','altered historical bytes');
+  await expect(f.reconstruct()).rejects.toThrow();
+ });
+ it.each(['command','profile','cwd','environment','policy','source','resource'])('retained scope never substitutes changed current authority: %s',async mode=>{
+  const f=await growing(),check=f.provider.check!,scope=check.scope!;
+  if(mode==='command')Object.assign(check,{command:['node','different-consumer.js']});
+  if(mode==='profile')Object.assign(f.config.scopedExecution!.profiles[0]!,{dependencies:{command:['node','different-setup'],timeoutMs:1000}});
+  if(mode==='cwd')Object.assign(scope,{cwd:'other'});
+  if(mode==='environment')Object.assign(scope,{environment:[{name:'NEW_FLAG',kind:'flag'}]});
+  if(mode==='policy')Object.assign(f.config,{obligations:[{...f.config.obligations[0],freshness:'live'}]});
+  if(mode==='source')f.maps.get(currentTree)!.set('asset.bin','changed current DATA');
+  if(mode==='resource')Object.assign(f.proof.origin.payload.resourceApplicability.capture.context,{runtimeDigest:hash('tampered resource capture')});
+  await expect(f.reconstruct()).rejects.toThrow();
+ });
+});
+
+describe('canonical retained environment declarations',()=>{
+ async function reordered(){
+  const f=await fixture(undefined,true),originalSource=await f.trees(originalTree);
+  const oldScope={...f.provider.check!.scope!,environment:[{name:'FLAG_A',kind:'flag' as const},{name:'FLAG_B',kind:'flag' as const}]};
+  const oldProvider={...f.provider,check:{...f.provider.check!,scope:oldScope}},oldConfig={...f.config,providers:[oldProvider]};
+  const oldIdentity=await scopedCheckIdentity(oldConfig,oldProvider,originalSource.inventory,originalSource.read,f.observation,f.original,f.readEvidence);
+  const provider={...oldProvider,check:{...oldProvider.check,scope:{...oldScope,environment:[...oldScope.environment].reverse().map(row=>({...row}))}}},config={...f.config,providers:[provider]};
+  const currentIdentity=await scopedCheckIdentity(config,provider,originalSource.inventory,originalSource.read,f.observation,f.original,f.readEvidence);
+  expect(currentIdentity.inputDigest).toBe(oldIdentity.inputDigest);expect(currentIdentity.profileDigest).toBe(oldIdentity.profileDigest);
+  Object.assign(f.proof.origin.attempt,{inputDigest:oldIdentity.inputDigest,profileDigest:oldIdentity.profileDigest});
+  const projection=f.proof.origin.payload.resourceApplicability;Object.assign(projection.origin,{inputDigest:oldIdentity.inputDigest,profileDigest:oldIdentity.profileDigest});const {digest,...body}=projection;Object.assign(projection,{digest:digestCanonical(body)});
+  Object.assign(f.proof.origin.payload,{resourceScope:oldScope});
+  return {...f,oldScope,provider,config,reconstruct:()=>reconstructResourceApplicability(config,provider,f.candidate,f.proof,f.trees,f.readEvidence)};
+ }
+ it('preserves authenticated identity under declaration reordering without mutating either scope',async()=>{
+  const f=await reordered();await expect(f.reconstruct()).resolves.toHaveProperty('binding');
+  expect(f.oldScope.environment.map(row=>row.name)).toEqual(['FLAG_A','FLAG_B']);expect(f.provider.check.scope.environment.map(row=>row.name)).toEqual(['FLAG_B','FLAG_A']);
+ });
+ it.each(['kind','name','value','cwd','profile'])('still refuses changed environment or execution context: %s',async mode=>{
+  const f=await reordered(),scope=f.provider.check.scope;
+  if(mode==='kind')Object.assign(scope.environment.find(row=>row.name==='FLAG_A')!,{kind:'credential'});
+  if(mode==='name')Object.assign(scope.environment.find(row=>row.name==='FLAG_A')!,{name:'OTHER_FLAG'});
+  if(mode==='value')Object.assign(f.observation.flags,{FLAG_A:'changed effective value'});
+  if(mode==='cwd')Object.assign(scope,{cwd:'other'});if(mode==='profile')Object.assign(scope,{profile:'other'});
   await expect(f.reconstruct()).rejects.toThrow();
  });
 });
