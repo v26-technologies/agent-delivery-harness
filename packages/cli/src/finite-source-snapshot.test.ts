@@ -20,6 +20,41 @@ async function fixture() {
     gitContext: "none", outputs: ["result.json"], environment: {}, physicalSource: { version: "physical-source/1", files: ["entry.mjs"], absentInputs: ["startup.cjs"] } } as SnapshotRequest;
   return { root, git, request };
 }
+it.each(['file','ancestor','descendant','root'].flatMap(kind=>['direct','chained'].map(chain=>({kind,chain}))))('finite repair rejects dangling protected output alias before consumer $kind/$chain',async({kind,chain})=>{
+  const f=await fixture(),target=kind==='file'?'config/startup.cjs':kind==='ancestor'?'config':kind==='root'?'.':'config/startup.cjs/child';
+  const ran=path.join(f.root,'.git/consumer-ran'),outputs=['out','result.json'];
+  // An owned dependency link is outside mutable outputs and excluded only from
+  // source comparison. It must not mask a broken outer-output alias resolver.
+  const setup=chain==='direct'?`fs.symlinkSync(${JSON.stringify(target)},'out');`:`fs.mkdirSync('node_modules');fs.symlinkSync(${JSON.stringify('../'+target)},'node_modules/relay');fs.symlinkSync('node_modules/relay','out');`;
+  const input={...f.request,outputs,physicalSource:{...f.request.physicalSource!,absentInputs:['config/startup.cjs']},dependencies:{command:[process.execPath,'-e',`const fs=require('fs');${setup}`] as [string,...string[]],timeoutMs:5000}};
+  let failure:unknown,snapshot:Awaited<ReturnType<typeof createCheckSnapshot>>|undefined;
+  try{snapshot=await createCheckSnapshot(input);await snapshot.verify();await exec(process.execPath,['-e',`require('fs').writeFileSync(${JSON.stringify(ran)},'executed')`],{cwd:snapshot.rootDir});}
+  catch(error){failure=error;}finally{await snapshot?.cleanup();}
+  await expect(lstat(ran)).rejects.toMatchObject({code:'ENOENT'});
+  expect(failure).toMatchObject({code:'check_snapshot_drift'});
+});
+it('finite repair rejects a dangling output alias with a missing suffix after a dependency link',async()=>{
+  const f=await fixture(),input={...f.request,outputs:['out'],physicalSource:{...f.request.physicalSource!,absentInputs:['config/startup.cjs']},dependencies:{command:[process.execPath,'-e',"const fs=require('fs');fs.mkdirSync('node_modules');fs.symlinkSync('../config','node_modules/relay');fs.symlinkSync('node_modules/relay/startup.cjs','out');"] as [string,...string[]],timeoutMs:5000}};
+  await expect(createCheckSnapshot(input)).rejects.toMatchObject({code:'check_snapshot_drift'});
+});
+it('finite repair allows a nonoverlapping dangling output alias and ordinary consumer output',async()=>{
+  const f=await fixture(),input={...f.request,outputs:['out','relay','result.json'],physicalSource:{...f.request.physicalSource!,absentInputs:['config/startup.cjs']},dependencies:{command:[process.execPath,'-e',"const fs=require('fs');fs.symlinkSync('safe/missing.json','relay');fs.symlinkSync('relay','out');"] as [string,...string[]],timeoutMs:5000}};
+  const snapshot=await createCheckSnapshot(input);
+  try{await exec(process.execPath,['-e',"require('fs').writeFileSync('result.json','consumer passed')"],{cwd:snapshot.rootDir});await snapshot.verify();expect(await readFile(path.join(snapshot.rootDir,'result.json'),'utf8')).toBe('consumer passed');}
+  finally{await snapshot.cleanup();}
+});
+it.each(['per-file','aggregate'] as const)('finite repair real reader accepts exact source boundary and rejects one byte over: %s',async kind=>{
+  const f=await fixture(),size=8*1024*1024,files=Array.from({length:kind==='per-file'?1:8},(_,i)=>`boundary-${i}.bin`);
+  for(const[index,file]of files.entries())await writeFile(path.join(f.root,file),Buffer.alloc(size,65+index));
+  await f.git('add','.');const exact={...f.request,candidate:{...f.request.candidate,treeSha:await f.git('write-tree')},physicalSource:{version:'physical-source/1' as const,files,absentInputs:[]}};
+  const snapshot=await createCheckSnapshot(exact);
+  try{for(const[index,file]of files.entries()){const bytes=await readFile(path.join(snapshot.rootDir,file));expect(bytes.length).toBe(size);expect(bytes[0]).toBe(65+index);}await snapshot.verify();}finally{await snapshot.cleanup();}
+  const over=kind==='per-file'?files:[...files,'one-extra-byte.bin'];
+  await writeFile(path.join(f.root,over.at(-1)!),Buffer.alloc(kind==='per-file'?size+1:1,99));await f.git('add','.');
+  let failure:unknown,unexpected:Awaited<ReturnType<typeof createCheckSnapshot>>|undefined;
+  try{unexpected=await createCheckSnapshot({...exact,candidate:{...exact.candidate,treeSha:await f.git('write-tree')},physicalSource:{...exact.physicalSource,files:over}});}catch(error){failure=error;}finally{await unexpected?.cleanup();}
+  expect(failure).toMatchObject({code:'check_physical_source_invalid'});
+},30000);
 it("finite source materializes exact candidate bytes and modes while full fallback retains the sentinel", async () => {
   const f = await fixture(); await writeFile(path.join(f.root, "entry.mjs"), "author edit");
   const snapshot = await createCheckSnapshot(f.request);

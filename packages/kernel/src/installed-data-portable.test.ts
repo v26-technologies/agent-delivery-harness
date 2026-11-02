@@ -4,11 +4,51 @@ import {reconstructResourceApplicability} from './installed-data-portable.ts';
 import {captureInstalledDataBinding,type InstalledDataSourceTree} from './installed-data-source.ts';
 import {captureInstalledDataResources,createResourceApplicabilityProjection,type InstalledDataResourceRequest} from './installed-data-resources.ts';
 import {scopedCheckIdentity} from './scoped-inputs.ts';
+import {capturePhysicalSource} from './physical-source.ts';
+import {selectScopedCheckAttempt} from './evaluator.ts';
 import type {CapturedCandidate} from './candidate.types.ts';
 import type {HarnessConfig,ProviderRegistration} from './config.ts';
 import type {CandidateTreeInputReader} from './portable-inputs.ts';
 const hash=(s:string)=>digestCanonical(s),sha=(s:string)=>s.repeat(40);
 const baseTree=sha('a'),originalTree=sha('b'),currentTree=sha('c');
+it.each(['content','mode','path'])('finite repair physical-only term fences retained attempt and resource context: %s',async term=>{
+ const f=await fixture(undefined,true);
+ for(const files of f.maps.values()){files.set('z-extra.bin','same bytes');files.set('z-other.bin','same bytes');}
+ const resourceProvider={...f.provider,check:{...f.provider.check!,physicalSource:{...f.provider.check!.physicalSource!,files:[...f.provider.check!.physicalSource!.files,'z-extra.bin']}}};
+ const {installedData:_removed,...check}=resourceProvider.check,provider={...resourceProvider,check};
+ const config={...f.config,providers:[provider]},resourceConfig={...f.config,providers:[resourceProvider]},current=await f.trees(currentTree),base=await f.trees(baseTree);
+ const before=await scopedCheckIdentity(config,provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+ const nativeBefore=await captureInstalledDataBinding(resourceConfig,resourceProvider,f.candidate,f.observation,{base,candidate:current},f.readEvidence);
+ let afterProvider=provider,afterResource=resourceProvider,read=current.read;
+ if(term==='content')f.maps.get(currentTree)!.set('z-extra.bin','different bytes');
+ if(term==='mode')read=Object.assign(async(p:string)=>current.read(p),{metadata:async(p:string)=>({...await current.read.metadata(p),...(p==='z-extra.bin'?{mode:'100755'}:{})})});
+ if(term==='path'){
+  const physicalSource={...check.physicalSource!,files:check.physicalSource!.files.map(p=>p==='z-extra.bin'?'z-other.bin':p)};
+  afterProvider={...provider,check:{...check,physicalSource}};afterResource={...resourceProvider,check:{...resourceProvider.check,physicalSource}};
+ }
+ const after=await scopedCheckIdentity({...config,providers:[afterProvider]},afterProvider,current.inventory,read,f.observation,f.candidate,f.readEvidence);
+ const retained={...f.proof.origin.attempt,version:'scoped-attempt/1' as const,status:'passed' as const,inputDigest:before.inputDigest,profileDigest:before.profileDigest};
+ expect(before.reusable).toBe(true);expect(after.reusable).toBe(true);
+ expect(selectScopedCheckAttempt(provider.id,before.inputDigest,before.profileDigest,[retained])?.attemptId).toBe(retained.attemptId);
+ expect(selectScopedCheckAttempt(provider.id,after.inputDigest,after.profileDigest,[retained])).toBeUndefined();
+ const nativeAfter=await captureInstalledDataBinding({...resourceConfig,providers:[afterResource]},afterResource,f.candidate,f.observation,{base,candidate:{...current,read}},f.readEvidence);
+ expect(nativeAfter.context.setupRecipeDigest).not.toBe(nativeBefore.context.setupRecipeDigest);
+});
+it('finite repair no-resource Git-none identity retains candidate-independent reuse',async()=>{
+ const f=await fixture(undefined,true),{installedData:_removed,...check}=f.provider.check!,provider={...f.provider,check},config={...f.config,providers:[provider]},current=await f.trees(currentTree);
+ const before=await scopedCheckIdentity(config,provider,current.inventory,current.read,f.observation,f.candidate,f.readEvidence);
+ const after=await scopedCheckIdentity(config,provider,current.inventory,current.read,f.observation,{...f.candidate,headSha:sha('f'),treeSha:sha('e')},f.readEvidence);
+ expect(after.inputDigest).toBe(before.inputDigest);expect(after.profileDigest).toBe(before.profileDigest);
+});
+it.each(['per-file','aggregate'])('finite repair kernel accepts exact byte limit and refuses one byte over: %s',async kind=>{
+ const size=8*1024*1024,data=new Uint8Array(size),files=Array.from({length:kind==='per-file'?1:8},(_,i)=>`file-${i}.bin`);
+ const read=Object.assign(async(_p:string)=>data,{metadata:async(_p:string)=>({mode:'100644',links:[]})});
+ const source={version:'physical-source/1' as const,files,absentInputs:[]};
+ const exact=await capturePhysicalSource(source,read);expect(exact.files.reduce((sum,file)=>sum+file.bytes.length,0)).toBe(kind==='per-file'?size:8*size);
+ const overRead=Object.assign(async(p:string)=>kind==='per-file'?new Uint8Array(size+1):p==='one-extra-byte.bin'?new Uint8Array(1):data,{metadata:read.metadata});
+ let rejected=false;try{await capturePhysicalSource({...source,files:kind==='per-file'?files:[...files,'one-extra-byte.bin']},overRead);}catch(error){rejected=error instanceof Error&&/byte bounds/.test(error.message);}
+ expect(rejected).toBe(true);
+});
 function tree(bytes:Map<string,string>,linked=new Set<string>()):InstalledDataSourceTree {
  const read=Object.assign(async(p:string)=>bytes.has(p)?new TextEncoder().encode(bytes.get(p)!):null,{metadata:async(p:string)=>({mode:bytes.has(p)?'100644':null,links:linked.has(p)?[{path:p,target:'other'}]:[]})}) as CandidateTreeInputReader;
  return{inventory:[...bytes.keys()],read};

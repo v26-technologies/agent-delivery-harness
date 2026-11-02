@@ -197,7 +197,11 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
 /** Opt-in file-only execution; legacy snapshots above retain complete Git semantics. */
 function finiteSourceReaderRunner(input: SnapshotRequest): CandidateCommandRunner {
   const deadline = performance.now() + SNAPSHOT_TIMEOUT_MS;
-  let totalBytes = 0;
+  // Logical source bounds belong to capturePhysicalSource, including repeated
+  // blobs. Reserve separate bounded transport room for listings/size responses;
+  // protocol overhead must not consume the supported 64 MiB of source bytes.
+  const transportLimit = 128 * 1024 * 1024;
+  let transportBytes = 0;
   return async (command, options) => {
     if (input.signal?.aborted) throw new CheckSnapshotError("check_snapshot_interrupted", "Finite source capture was cancelled.");
     const remaining = deadline - performance.now();
@@ -206,13 +210,13 @@ function finiteSourceReaderRunner(input: SnapshotRequest): CandidateCommandRunne
       const child = spawn(command[0]!, command.slice(1), { cwd: options.cwd,
         env: { PATH: executionPath(input.rootDir, input.environment["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
         stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
-      let failure: CheckSnapshotError | undefined, size = 0;
+      let failure: CheckSnapshotError | undefined;
       const chunks: Buffer[] = [];
       const stop = (code: string) => { failure ??= new CheckSnapshotError(code, "Finite source reader did not complete safely."); child.kill("SIGKILL"); };
       const abort = () => stop("check_snapshot_interrupted"), timer = setTimeout(() => stop("check_snapshot_timeout"), remaining);
       input.signal?.addEventListener("abort", abort, { once: true });
       if (input.signal?.aborted) abort();
-      child.stdout!.on("data", (chunk: Buffer) => { size += chunk.length; totalBytes += chunk.length; if (size > 8 * 1024 * 1024 || totalBytes > 64 * 1024 * 1024) stop("check_snapshot_unavailable"); else chunks.push(chunk); });
+      child.stdout!.on("data", (chunk: Buffer) => { transportBytes += chunk.length; if (transportBytes > transportLimit) stop("check_snapshot_unavailable"); else chunks.push(chunk); });
       child.stderr!.on("data", () => {});
       child.once("error", () => { failure ??= new CheckSnapshotError("check_snapshot_unavailable", "Finite source reader failed to start."); });
       child.stdin?.once("error", () => stop("check_snapshot_unavailable"));

@@ -43,11 +43,17 @@ async function duringCreation(hook:(session:ScopedChecks)=>Promise<void>) {
   return ()=>{if(hookFailure)throw hookFailure;};
 }
 describe('native scoped installed resources',()=>{
-  it('finite physical resource freshness observes changed DATA with identical admitted setup inputs',async()=>{
+  it.each(['both','HEAD-only','tree-only'])('finite physical resource freshness observes changed DATA with identical admitted setup inputs: %s',async transition=>{
     const f=await fixture(true,true,true,true);
     for(const command of ['prepare','gate'])expect(await runCli([command],f.runtime),f.errors.join('\n')).toBe(0);
     const definition=digestCanonical(f.config);
-    await writeFile(path.join(f.dir,'excluded-sentinel.txt'),'only unrelated source changed');await f.git('add','.');await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');
+    const before={head:await f.git('rev-parse','HEAD'),tree:await f.git('write-tree')};
+    if(transition==='HEAD-only')await f.git('-c','commit.gpgsign=false','commit','--allow-empty','-qm','HEAD only');
+    else{await writeFile(path.join(f.dir,'excluded-sentinel.txt'),'only unrelated source changed');await f.git('add','.');if(transition==='both')await f.git('-c','commit.gpgsign=false','commit','-qm','unrelated');}
+    const after={head:await f.git('rev-parse','HEAD'),tree:await f.git('write-tree')};
+    if(transition==='HEAD-only'){expect(after.head).not.toBe(before.head);expect(after.tree).toBe(before.tree);}
+    else if(transition==='tree-only'){expect(after.head).toBe(before.head);expect(after.tree).not.toBe(before.tree);}
+    else{expect(after.head).not.toBe(before.head);expect(after.tree).not.toBe(before.tree);}
     for(const command of ['prepare','gate'])expect(await runCli([command],f.runtime),f.errors.join('\n')).toBe(0);
     expect(digestCanonical(f.config)).toBe(definition);
     const resources=(await readFile(path.join(f.dir,'.git/resource-hashes'),'utf8')).trim().split('\n');
@@ -56,7 +62,7 @@ describe('native scoped installed resources',()=>{
     const terminals=(await readdir(path.join(f.dir,'.git'),{recursive:true})).filter(file=>file.endsWith('terminal.json'));
     const outputs=await Promise.all(terminals.map(async file=>JSON.parse(await readFile(path.join(f.dir,'.git',file),'utf8')).entry.payload.outputs[0].base64));
     expect(new Set(outputs).size).toBe(2);
-    process.stdout.write(JSON.stringify({fixture:'finite resource freshness under identical admitted setup',definition,resourceHashes:resources,consumerOutputHex:outputs.map(value=>Buffer.from(value,'base64').toString())})+'\n');
+    process.stdout.write(JSON.stringify({fixture:'finite resource freshness under identical admitted setup',transition,before,after,definition,resourceHashes:resources,consumerOutputHex:outputs.map(value=>Buffer.from(value,'base64').toString())})+'\n');
   },120000);
   it('finite physical source preserves cold warm resource restoration and portable no-setup verification',async()=>{
     const f=await fixture(true,true,true);

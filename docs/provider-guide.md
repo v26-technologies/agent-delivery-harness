@@ -462,12 +462,19 @@ file/absence entries. Materialized source is bounded to 8 MiB per file and
 internal links to omitted targets. Tracked dependency files cannot be physical
 source. Files come from the immutable prepared candidate, preserving bytes and
 executable modes; author worktree files and installations supply no authority.
+These logical source bounds are checked by the kernel before materialization,
+counting every declared file even when Git deduplicates its blob. The CLI reader
+separately bounds Git transport to 128 MiB, reserving room for listings and size
+responses without reducing the supported source-content budget.
 
 Required absences are checked against that candidate and protected throughout
 setup, resource observation and execution. Mutable outputs cannot overlap an
 absence or its ancestors/descendants. Output permissions do not waive absence,
 link or type checks. Verification still walks the entire resulting source and
 installed dependency tree; finite mode does not filter dependency verification.
+Dangling output aliases are resolved component by component, including missing
+suffixes and relative link chains (at most 32 links); unresolved unsafe chains
+are refused. A dangling target does not lose its protected absence identity.
 Different source envelopes cannot share an incomplete execution tree solely
 because their setup commands match. Cancellation and cleanup retain ownership
 of the snapshot and reader processes.

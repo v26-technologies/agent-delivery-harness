@@ -17,14 +17,26 @@ const inside = target => {
 };
 const escape = () => { throw { code: 'check_snapshot_escape' }; };
 const resolveMissing = async target => {
-  const suffix = [];
-  for (;;) {
-    try { return path.join(await realpath(target), ...suffix); }
-    catch (error) {
-      if (error.code !== 'ENOENT' || target === root || !inside(target)) throw error;
-      suffix.unshift(path.basename(target)); target = path.dirname(target);
+  if (!inside(target)) escape();
+  let resolved = root, links = 0;
+  const pending = path.relative(root, target).split(path.sep);
+  while (pending.length) {
+    const segment = pending.shift();
+    if (!segment || segment === '.') continue;
+    if (segment === '..') resolved = path.dirname(resolved);
+    else {
+      const next = path.join(resolved, segment);
+      const info = await lstat(next).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (info?.isSymbolicLink()) {
+        if (++links > 32) escape();
+        const link = await readlink(next);
+        if (path.isAbsolute(link)) escape();
+        pending.unshift(...link.split(path.sep));
+      } else resolved = next;
     }
+    if (!inside(resolved)) escape();
   }
+  return resolved;
 };
 const protectOutputAlias = (relative, resolved) => {
   for (const output of outputs) {
@@ -34,7 +46,7 @@ const protectOutputAlias = (relative, resolved) => {
     const name = path.relative(root, effective).normalize('NFC').toLowerCase();
     for (const absent of absentInputs) {
       const a = absent.normalize('NFC').toLowerCase();
-      if (name === a || name.startsWith(a + '/') || a.startsWith(name + '/')) throw { code: 'check_snapshot_drift' };
+      if (name === '' || name === a || name.startsWith(a + '/') || a.startsWith(name + '/')) throw { code: 'check_snapshot_drift' };
     }
   }
 };
