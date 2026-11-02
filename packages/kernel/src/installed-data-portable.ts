@@ -42,7 +42,7 @@ export async function reconstructResourceApplicability(
     const retained = payload["resourceScope"], current = provider.check?.scope;
     if (!isScopedCheckDefinition(retained) || Buffer.byteLength(JSON.stringify(retained), "utf8") > MAX_PORTABLE_ARTIFACT_BYTES || !current ||
         retained.cwd !== current.cwd || retained.profile !== current.profile ||
-        digestCanonical(retained.environment) !== digestCanonical(current.environment)) refuse();
+        digestCanonical([...retained.environment].sort((a, b) => a.name.localeCompare(b.name))) !== digestCanonical([...current.environment].sort((a, b) => a.name.localeCompare(b.name)))) refuse();
     originalProvider = { ...provider, check: { ...provider.check!, scope: retained } };
   }
   const identity = await scopedCheckIdentity(config, originalProvider, originalTree.inventory, originalTree.read, observation, originalCandidate, readEvidence);

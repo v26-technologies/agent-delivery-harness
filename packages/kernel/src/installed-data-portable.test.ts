@@ -182,3 +182,31 @@ describe('retained origin scope for growing ordinary plans',()=>{
   await expect(f.reconstruct()).rejects.toThrow();
  });
 });
+
+describe('canonical retained environment declarations',()=>{
+ async function reordered(){
+  const f=await fixture(undefined,true),originalSource=await f.trees(originalTree);
+  const oldScope={...f.provider.check!.scope!,environment:[{name:'FLAG_A',kind:'flag' as const},{name:'FLAG_B',kind:'flag' as const}]};
+  const oldProvider={...f.provider,check:{...f.provider.check!,scope:oldScope}},oldConfig={...f.config,providers:[oldProvider]};
+  const oldIdentity=await scopedCheckIdentity(oldConfig,oldProvider,originalSource.inventory,originalSource.read,f.observation,f.original,f.readEvidence);
+  const provider={...oldProvider,check:{...oldProvider.check,scope:{...oldScope,environment:[...oldScope.environment].reverse().map(row=>({...row}))}}},config={...f.config,providers:[provider]};
+  const currentIdentity=await scopedCheckIdentity(config,provider,originalSource.inventory,originalSource.read,f.observation,f.original,f.readEvidence);
+  expect(currentIdentity.inputDigest).toBe(oldIdentity.inputDigest);expect(currentIdentity.profileDigest).toBe(oldIdentity.profileDigest);
+  Object.assign(f.proof.origin.attempt,{inputDigest:oldIdentity.inputDigest,profileDigest:oldIdentity.profileDigest});
+  const projection=f.proof.origin.payload.resourceApplicability;Object.assign(projection.origin,{inputDigest:oldIdentity.inputDigest,profileDigest:oldIdentity.profileDigest});const {digest,...body}=projection;Object.assign(projection,{digest:digestCanonical(body)});
+  Object.assign(f.proof.origin.payload,{resourceScope:oldScope});
+  return {...f,oldScope,provider,config,reconstruct:()=>reconstructResourceApplicability(config,provider,f.candidate,f.proof,f.trees,f.readEvidence)};
+ }
+ it('preserves authenticated identity under declaration reordering without mutating either scope',async()=>{
+  const f=await reordered();await expect(f.reconstruct()).resolves.toHaveProperty('binding');
+  expect(f.oldScope.environment.map(row=>row.name)).toEqual(['FLAG_A','FLAG_B']);expect(f.provider.check.scope.environment.map(row=>row.name)).toEqual(['FLAG_B','FLAG_A']);
+ });
+ it.each(['kind','name','value','cwd','profile'])('still refuses changed environment or execution context: %s',async mode=>{
+  const f=await reordered(),scope=f.provider.check.scope;
+  if(mode==='kind')Object.assign(scope.environment.find(row=>row.name==='FLAG_A')!,{kind:'credential'});
+  if(mode==='name')Object.assign(scope.environment.find(row=>row.name==='FLAG_A')!,{name:'OTHER_FLAG'});
+  if(mode==='value')Object.assign(f.observation.flags,{FLAG_A:'changed effective value'});
+  if(mode==='cwd')Object.assign(scope,{cwd:'other'});if(mode==='profile')Object.assign(scope,{profile:'other'});
+  await expect(f.reconstruct()).rejects.toThrow();
+ });
+});

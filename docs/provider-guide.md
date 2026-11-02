@@ -299,7 +299,9 @@ no bypass.
 
 When no mechanical providers are selected, preparation validates scoped profile
 and output declarations against the prepared inventory, checks required input
-presence through the source reader, and validates any declared finite physical
+presence through the source reader, and requires selected ordinary inventory
+members to resolve as present through metadata. Actual absent resolution probes
+and directory witnesses remain supported. It validates any declared finite physical
 source with the existing byte, mode, link, size and absence checks. It defers
 non-mechanical consumer content and runtime identities to the gate instead of
 hashing their broad input sets during preparation. This is not passing check
@@ -515,7 +517,8 @@ Git-none alone grants neither setup omission nor a smaller dependency runtime.
 Successful installed-DATA origins retain their original scoped selection. Portable
 reconstruction validates that closed scope against the immutable original tree
 and exact original input/profile digests, while current execution context,
-source, policy and resource authority remain mandatory. Older proofs without a
+source, policy and resource authority remain mandatory. Environment declarations
+use the identity's name-sorted order; changed names, kinds or values still refuse. Older proofs without a
 retained scope require the existing current-frame reconstruction to prove those
 same original digests; missing history is never backfilled. Resource definition
 identity shares the ordinary check convention that omits only the exact current

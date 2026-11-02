@@ -110,3 +110,37 @@ it.each([false,true])("preserves required missing-test refusal with mechanical e
  expect(await f.run("prepare")).toBe(1);expect(f.stderr.join("\n")).toContain("Required test is absent");
  const wiring=await wireRepo(f.root,f.config),capture=await wiring.captureCandidate();if(capture.ok)expect((await kernel.evaluatePreparationReceipt(f.root,{config:f.config,candidate:capture.candidate},wiring.storageOptions)).prepared).toBe(false);
 });
+
+it.each([false,true])("committed dangling ordinary inventory input refuses mechanical=%s",async mechanical=>{
+ const f=await fixture();await rm(path.join(f.root,"broad-only.txt"));await symlink("missing-target.txt",path.join(f.root,"broad-only.txt"));await f.git("add",".");
+ f.setConfig({...f.config,scopedExecution:{...f.config.scopedExecution!,mechanicalProviders:mechanical?["check.consumer"]:[]}});
+ expect(await f.run("prepare"),f.stderr.join("\n")).toBe(1);
+ const wiring=await wireRepo(f.root,f.config),capture=await wiring.captureCandidate();expect(capture.ok).toBe(true);if(capture.ok)expect((await kernel.evaluatePreparationReceipt(f.root,{config:f.config,candidate:capture.candidate},wiring.storageOptions)).prepared).toBe(false);
+ if(!mechanical){expect(observations.identities).toBe(0);expect(observations.sourceFiles).not.toContain("broad-only.txt");}
+});
+it.each([false,true])("full-Git required dependency outside physical source missing=%s",async missing=>{
+ const f=await fixture();f.setConfig({...f.config,providers:f.config.providers.map(provider=>{const {physicalSource,...check}=provider.check!;return {...provider,check};}),scopedExecution:{...f.config.scopedExecution!,profiles:f.config.scopedExecution!.profiles.map(profile=>({...profile,gitContext:"full"}))}});
+ expect(f.config.providers[0]!.check!.scope!.files).not.toContain("lock.txt");expect(f.config.providers[0]!.check!.physicalSource).toBeUndefined();
+ if(missing)await f.git("rm","lock.txt");
+ expect(await f.run("prepare"),f.stderr.join("\n")).toBe(missing?1:0);expect(observations.identities).toBe(0);expect(observations.sourceFiles).not.toContain("broad-only.txt");
+ const wiring=await wireRepo(f.root,f.config),capture=await wiring.captureCandidate();expect(capture.ok).toBe(true);if(capture.ok)expect((await kernel.evaluatePreparationReceipt(f.root,{config:f.config,candidate:capture.candidate},wiring.storageOptions)).prepared).toBe(!missing);
+});
+it.each([false,true])("membership-only metadata validation escaping=%s",async escaping=>{
+ const f=await fixture(),member="members/selected";await mkdir(path.join(f.root,"members"));if(escaping)await symlink("../../outside",path.join(f.root,member));else await writeFile(path.join(f.root,member),"safe membership-only input");await f.git("add",".");
+ f.setConfig({...f.config,providers:f.config.providers.map(provider=>({...provider,check:{...provider.check!,scope:{...provider.check!.scope!,memberships:["members/"]}}}))});
+ expect(f.config.providers[0]!.check!.scope!.files).not.toContain(member);expect(f.config.providers[0]!.check!.physicalSource!.files).not.toContain(member);expect(f.config.scopedExecution!.profiles[0]!.dependencyInputs).not.toContain(member);
+ expect(await f.run("prepare"),f.stderr.join("\n")).toBe(escaping?1:0);expect(observations.identities).toBe(0);expect(observations.sourceFiles).not.toContain(member);
+ const wiring=await wireRepo(f.root,f.config),capture=await wiring.captureCandidate();expect(capture.ok).toBe(true);if(capture.ok)expect((await kernel.evaluatePreparationReceipt(f.root,{config:f.config,candidate:capture.candidate},wiring.storageOptions)).prepared).toBe(!escaping);
+});
+
+it("ordinary metadata excludes the exact recorder output but refuses its dangling sibling",async()=>{
+ const f=await fixture(),wiring=await wireRepo(f.root,f.config),initial=await wiring.captureCandidate();expect(initial.ok).toBe(true);if(!initial.ok)throw Error("candidate unavailable");
+ const output=kernel.deliveryRecordPathFor(f.config,initial.candidate.deliverable.digest),sibling=path.posix.join(path.posix.dirname(output),"not-the-configured-record.json");
+ await mkdir(path.dirname(path.join(f.root,output)),{recursive:true});await writeFile(path.join(f.root,output),"exact native recorder output");await f.git("add","--",output);
+ f.setConfig({...f.config,providers:f.config.providers.map(provider=>({...provider,check:{...provider.check!,scope:{...provider.check!.scope!,files:[...provider.check!.scope!.files,output]}}}))});
+ expect(await f.run("prepare"),f.stderr.join("\n")).toBe(0);expect(observations.metadataFiles).not.toContain(output);
+ await symlink("missing-target.json",path.join(f.root,sibling));await f.git("add","--",sibling);
+ f.setConfig({...f.config,providers:f.config.providers.map(provider=>({...provider,check:{...provider.check!,scope:{...provider.check!.scope!,files:[...provider.check!.scope!.files,sibling]}}}))});
+ expect(await f.run("prepare"),f.stderr.join("\n")).toBe(1);expect(observations.identities).toBe(0);expect(observations.sourceFiles).not.toContain("broad-only.txt");
+ const currentWiring=await wireRepo(f.root,f.config),captured=await currentWiring.captureCandidate();expect(captured.ok).toBe(true);if(captured.ok)expect((await kernel.evaluatePreparationReceipt(f.root,{config:f.config,candidate:captured.candidate},currentWiring.storageOptions)).prepared).toBe(false);
+});

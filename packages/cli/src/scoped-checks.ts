@@ -105,12 +105,15 @@ export class ScopedChecks {
     const providers = scopedProviders(context);
     if (!providers.length) return;
     const { inventory, read } = await preparedSource(context, candidate);
+    const output = deliveryRecordPathFor(context.config, candidate.deliverable.digest);
+    const ordinaryInventory = inventory.filter(file => file !== output), inventoryPaths = new Set(ordinaryInventory);
     for (const provider of providers) {
-      const profile = validateScopedProvider(context, provider, inventory), scope = provider.check!.scope!;
+      const profile = validateScopedProvider(context, provider, inventory), scope = recordOutputProvider(provider, output).check!.scope!;
       // Metadata retains source/link/type and required-input validation without
       // reading and hashing broad regular consumer input bytes.
-      const selected = new Set([...scope.files, ...scope.tests, ...profile.dependencyInputs,
-        ...scope.memberships.flatMap(prefix => inventory.filter(file => file.startsWith(prefix)))]);
+      const ordinarySelected = new Set([...scope.files, ...scope.tests,
+        ...scope.memberships.flatMap(prefix => ordinaryInventory.filter(file => file.startsWith(prefix)))]);
+      const selected = new Set([...ordinarySelected, ...profile.dependencyInputs]);
       for (const file of selected) {
         const metadata = await read.metadata(file);
         // The reader owns supported entry/link semantics, including committed
@@ -119,6 +122,8 @@ export class ScopedChecks {
           if (profile.dependencyInputs.includes(file)) throw new CheckSnapshotError("check_dependency_input_missing", `Required dependency input ${file} is missing from the prepared tree.`);
           if (scope.tests.includes(file)) throw new Error("Required test is absent");
         }
+        if (ordinarySelected.has(file) && (metadata.mode !== null) !== inventoryPaths.has(file))
+          throw new Error("Snapshot membership and metadata presence disagree");
       }
       if (provider.check!.physicalSource) {
         try { await capturePhysicalSource(provider.check!.physicalSource, read); }
