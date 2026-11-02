@@ -472,6 +472,15 @@ setup, resource observation and execution. Mutable outputs cannot overlap an
 absence or its ancestors/descendants. Output permissions do not waive absence,
 link or type checks. Verification still walks the entire resulting source and
 installed dependency tree; finite mode does not filter dependency verification.
+Existing directory referents use exact bigint filesystem device/inode identity
+from the inventory walk, so case and Unicode spelling aliases share the actual
+same coordinate while distinct directories remain distinct. Missing path suffixes
+have no object identity: finite verification supports ASCII suffixes only, with
+conservative ASCII case comparison. A non-ASCII unresolved alias or required
+absence suffix is unsupported and is refused before the consumer; the producer
+does not automatically retry a full snapshot. An adopter may independently
+recognize that unsupported qualification and select its ordinary full fallback.
+
 Dangling output aliases are resolved component by component, including missing
 suffixes and relative link chains (at most 32 links); unresolved unsafe chains
 are refused. A dangling target does not lose its protected absence identity.

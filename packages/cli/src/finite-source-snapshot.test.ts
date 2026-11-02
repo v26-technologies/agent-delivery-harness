@@ -153,3 +153,42 @@ it.each([false,true])('finite repair protects nested output directory aliases be
   if(unsafe){await expect(lstat(ran)).rejects.toMatchObject({code:'ENOENT'});expect(failure).toMatchObject({code:'check_snapshot_drift'});}
   else{expect(failure).toBeUndefined();expect(await readFile(ran,'utf8')).toBe('executed');}
 });
+
+const equivalentDirectorySpellings = [
+  {name:'leaf-case',written:'tree',alternate:'TREE',parent:'node_modules'},
+  {name:'parent-case',written:'parent/tree',alternate:'PARENT/tree',parent:'node_modules'},
+  {name:'NFC',written:'caf\u00e9',alternate:'cafe\u0301',parent:'node_modules'},
+  {name:'NFC-case',written:'caf\u00e9',alternate:'CAFE\u0301',parent:'node_modules'},
+  {name:'sigma',written:'\u03c3',alternate:'\u03c2',parent:'node_modules'},
+  {name:'eszett',written:'Stra\u00dfe',alternate:'STRASSE',parent:'node_modules'},
+  {name:'dotted-i',written:'\u0130',alternate:'i\u0307',parent:'node_modules'},
+];
+it.each(equivalentDirectorySpellings.flatMap(row=>[true,false].map(unsafe=>({...row,unsafe}))))('finite repair uses actual directory identity for $name unsafe=$unsafe',async({name,written,alternate,parent,unsafe})=>{
+  const f=await fixture(),ran=path.join(f.root,'.git/equivalent-consumer'),facts=path.join(f.root,'.git/equivalence.json');
+  const actual='node_modules/'+written,alias=parent+'/'+alternate;
+  const setup=`const fs=require('fs');fs.mkdirSync('config');fs.mkdirSync('safe');fs.mkdirSync(${JSON.stringify(actual)},{recursive:true});fs.symlinkSync(${JSON.stringify(path.posix.relative(actual,unsafe?'config':'safe'))},${JSON.stringify(actual+'/link')});let equivalent=false;try{const a=fs.statSync(${JSON.stringify(actual)}),b=fs.statSync(${JSON.stringify(alias)});equivalent=a.dev===b.dev&&a.ino===b.ino;}catch{}if(!equivalent){fs.mkdirSync(${JSON.stringify(alias)},{recursive:true});fs.symlinkSync(${JSON.stringify(path.posix.relative(alias,'safe'))},${JSON.stringify(alias+'/link')});}fs.writeFileSync(${JSON.stringify(facts)},JSON.stringify({equivalent}));fs.symlinkSync(${JSON.stringify(alias)},'out');`;
+  const input={...f.request,outputs:['out/','result.json'],physicalSource:{...f.request.physicalSource!,absentInputs:['config/startup.cjs']},dependencies:{command:[process.execPath,'-e',setup] as [string,...string[]],timeoutMs:5000}};
+  let failure:unknown,snapshot:Awaited<ReturnType<typeof createCheckSnapshot>>|undefined;
+  try{snapshot=await createCheckSnapshot(input);await snapshot.verify();const {equivalent}=JSON.parse(await readFile(facts,'utf8'));
+    await exec(process.execPath,['-e',`const fs=require('fs');${unsafe&&equivalent?"fs.writeFileSync('out/link/startup.cjs','injected');":"if(!fs.statSync('out/link').isDirectory())throw Error('safe distinct directory unavailable');"}fs.writeFileSync('result.json','safe');fs.writeFileSync(${JSON.stringify(ran)},'started');`],{cwd:snapshot.rootDir,env:snapshot.environment});if(!unsafe||!equivalent)await snapshot.verify();
+  }catch(error){failure=error;}finally{await snapshot?.cleanup();}
+  const {equivalent}=JSON.parse(await readFile(facts,'utf8'));console.log(JSON.stringify({name,unsafe,equivalent}));
+  if(unsafe&&equivalent){await expect(lstat(ran)).rejects.toMatchObject({code:'ENOENT'});expect(failure).toMatchObject({code:'check_snapshot_drift'});}
+  else{expect(failure).toBeUndefined();expect(await readFile(ran,'utf8')).toBe('started');}
+});
+it.each([{written:'startup',alternate:'STARTUP'},{written:'caf\u00e9',alternate:'cafe\u0301'},{written:'\u03c3',alternate:'\u03c2'},{written:'Stra\u00dfe',alternate:'STRASSE'},{written:'\u0130',alternate:'i\u0307'}])('finite repair refuses unresolved equivalent leaves $written/$alternate',async({written,alternate})=>{
+  const f=await fixture(),ran=path.join(f.root,'.git/direct-consumer');
+  const input={...f.request,outputs:['out','result.json'],physicalSource:{...f.request.physicalSource!,absentInputs:['config/'+written]},dependencies:{command:[process.execPath,'-e',`const fs=require('fs');fs.mkdirSync('config');fs.symlinkSync(${JSON.stringify('config/'+alternate)},'out');`] as [string,...string[]],timeoutMs:5000}};
+  let failure:unknown,snapshot:Awaited<ReturnType<typeof createCheckSnapshot>>|undefined;
+  try{snapshot=await createCheckSnapshot(input);await snapshot.verify();await exec(process.execPath,['-e',`const fs=require('fs');fs.writeFileSync('out','injected');fs.writeFileSync(${JSON.stringify(ran)},'started');`],{cwd:snapshot.rootDir});}catch(error){failure=error;}finally{await snapshot?.cleanup();}
+  await expect(lstat(ran)).rejects.toMatchObject({code:'ENOENT'});expect(failure).toMatchObject({code:'check_snapshot_drift'});
+});
+it.each([false,true])('finite repair saturates multiple reachable directories unsafe=%s',async unsafe=>{
+  const f=await fixture(),ran=path.join(f.root,'.git/multi-consumer');
+  const setup=`const fs=require('fs');fs.mkdirSync('config');fs.mkdirSync('safe');fs.mkdirSync('node_modules/a',{recursive:true});fs.mkdirSync('node_modules/b');fs.symlinkSync('../b','node_modules/a/link');fs.symlinkSync('../../${unsafe?'config':'safe'}','node_modules/b/link');fs.symlinkSync('node_modules/a','out');`;
+  const input={...f.request,outputs:['out/','result.json'],physicalSource:{...f.request.physicalSource!,absentInputs:['config/startup.cjs']},dependencies:{command:[process.execPath,'-e',setup] as [string,...string[]],timeoutMs:5000}};
+  let failure:unknown,snapshot:Awaited<ReturnType<typeof createCheckSnapshot>>|undefined;
+  try{snapshot=await createCheckSnapshot(input);await snapshot.verify();await exec(process.execPath,['-e',`const fs=require('fs');${unsafe?"fs.writeFileSync('out/link/link/startup.cjs','injected');":"if(!fs.statSync('out/link/link').isDirectory())throw Error('safe multi alias unavailable');"}fs.writeFileSync('result.json','safe');fs.writeFileSync(${JSON.stringify(ran)},'started');`],{cwd:snapshot.rootDir});if(!unsafe)await snapshot.verify();}catch(error){failure=error;}finally{await snapshot?.cleanup();}
+  if(unsafe){await expect(lstat(ran)).rejects.toMatchObject({code:'ENOENT'});expect(failure).toMatchObject({code:'check_snapshot_drift'});}
+  else{expect(failure).toBeUndefined();expect(await readFile(ran,'utf8')).toBe('started');}
+});
