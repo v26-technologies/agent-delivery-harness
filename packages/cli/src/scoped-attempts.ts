@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { digestCanonical, validateResourceApplicabilityProjection, type ResourceApplicabilityProjection, type ScopedCheckAttempt } from "@agent-delivery-harness/kernel";
+import { digestCanonical, validateResourceApplicabilityProjection, type ResourceApplicabilityProjection, type ScopedCheckAttempt, type ScopedCheckDefinition } from "@agent-delivery-harness/kernel";
 import { CheckSnapshotError } from "./check-snapshot.ts";
 import type { RecordedScopedAttemptDiagnostic } from "./scoped-diagnostics.ts";
 export interface AttemptPayload {
@@ -13,6 +13,8 @@ export interface AttemptPayload {
   readonly diagnostic?: RecordedScopedAttemptDiagnostic;
   /** Native successful origin binding is checked before retention and on every load. */
   readonly resourceApplicability?: ResourceApplicabilityProjection;
+  /** Original broad selection, authenticated by the native attempt digests. */
+  readonly resourceScope?: ScopedCheckDefinition;
 }
 export interface StoredAttempt { readonly attempt: ScopedCheckAttempt; readonly payload?: AttemptPayload; readonly executionHeadSha?: string }
 const corrupt = () => new CheckSnapshotError("check_attempt_corrupt", "Scoped check attempt history is missing, corrupt or inconsistent.");

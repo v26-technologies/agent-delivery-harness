@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { computeDeliverableIdentity, capturePhysicalSource, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
+import { deliveryRecordPathFor, recordOutputProvider, computeDeliverableIdentity, capturePhysicalSource, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
   createResourceApplicabilityProjection, matchResourceApplicabilityProjection, createResourceApplicabilityBinding, reconstructResourceApplicability, discoverRecords, portableArtifactContents, isRecordFreshForCandidate, isRecordNeutralPath, type ResourceApplicabilityBinding, type InstalledDataAttemptOrigin, type InstalledDataResourceRequest, normalizeInstalledDataResourceRequests, type InstalledDataResourceContext, type InstalledDataResourceCapture,
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
@@ -420,7 +420,7 @@ export class ScopedChecks {
       const { binding, capture } = current;
       if (!matchResourceApplicabilityProjection(projection, { consumerId: binding.declaration.consumerId, declarationDigest: binding.declarationDigest, sourceApplicabilityDigest: binding.sourceApplicabilityDigest, capture, originAttempt: origin }).applicable) continue;
       const provider = this.context.config.providers.find(p => p.id === id)!;
-      bindings[id] = createResourceApplicabilityBinding({ candidateDigest: digestCanonical(scopedCandidate(this.candidate)), definitionDigest: digestCanonical(provider.check),
+      bindings[id] = createResourceApplicabilityBinding({ candidateDigest: digestCanonical(scopedCandidate(this.candidate)), definitionDigest: digestCanonical(recordOutputProvider(provider, deliveryRecordPathFor(this.context.config, this.candidate.deliverable.digest)).check),
         declarationDigest: binding.declarationDigest, sourceApplicabilityDigest: binding.sourceApplicabilityDigest, capture, projection, originAttempt: origin });
     }
     return bindings;
@@ -530,7 +530,7 @@ export class ScopedChecks {
       payload = { ...payload, outputs, diagnostic: { ...diagnostic, phase: "complete" } };
       const installed = this.installed.get(provider.id);
       // Only the same owned snapshot that supplied the facts can seed a pass.
-      if (installed?.snapshot === snapshot) payload = { ...payload, resourceApplicability: createResourceApplicabilityProjection({
+      if (installed?.snapshot === snapshot) payload = { ...payload, resourceScope: structuredClone(check.scope!), resourceApplicability: createResourceApplicabilityProjection({
         origin: this.resourceOrigin({ attempt: { ...attempt, status: "passed" }, executionHeadSha: this.candidate.headSha })!,
         consumerId: installed.binding.declaration.consumerId, declarationDigest: installed.binding.declarationDigest,
         sourceApplicabilityDigest: installed.binding.sourceApplicabilityDigest, capture: installed.capture,

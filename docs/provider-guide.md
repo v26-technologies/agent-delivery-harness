@@ -512,6 +512,15 @@ while changed DATA restores it. Same-candidate record verification does not
 reacquire dependencies. Builtin-only checks can separately qualify no setup;
 Git-none alone grants neither setup omission nor a smaller dependency runtime.
 
+Successful installed-DATA origins retain their original scoped selection. Portable
+reconstruction validates that closed scope against the immutable original tree
+and exact original input/profile digests, while current execution context,
+source, policy and resource authority remain mandatory. Older proofs without a
+retained scope require the existing current-frame reconstruction to prove those
+same original digests; missing history is never backfilled. Resource definition
+identity shares the ordinary check convention that omits only the exact current
+candidate-keyed delivery-record output, not other neutral paths or siblings.
+
 This capability does not prove an adopter's source closure, qualify its command,
 or establish latency. The adopter must select it only for a supported exact
 closure, preserving ordinary fallback for unknown effects or changed authority.

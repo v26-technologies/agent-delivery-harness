@@ -1248,3 +1248,6 @@ export { captureInstalledDataBinding, InstalledDataSourceError, type InstalledDa
 export type { ResourceApplicabilityBinding } from "./records.types.ts";
 
 export { reconstructResourceApplicability } from "./installed-data-portable.ts";
+
+/** Exact native delivery-record output convention shared with resource evidence. */
+export { recordOutputProvider } from "./record-output.ts";

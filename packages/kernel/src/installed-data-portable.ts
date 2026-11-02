@@ -4,9 +4,11 @@ import { digestCanonical, sha256Hex } from "./digest.ts";
 import { captureInstalledDataBinding, type InstalledDataSourceTree } from "./installed-data-source.ts";
 import { normalizeInstalledDataResourceRequests, validateResourceApplicabilityProjection, type InstalledDataAttemptOrigin } from "./installed-data-resources.ts";
 import { createResourceApplicabilityBinding } from "./installed-data-evidence.ts";
+import { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";
 import { scopedCheckIdentity, type ScopedRuntimeObservation } from "./scoped-inputs.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
-import type { HarnessConfig, ProviderRegistration } from "./config.ts";
+import { recordOutputProvider } from "./record-output.ts";
+import { deliveryRecordPathFor, isScopedCheckDefinition, type HarnessConfig, type ProviderRegistration } from "./config.ts";
 import type { ScopedCheckAttempt, RecordCandidateBinding } from "./records.types.ts";
 import type { ReviewInputReader } from "./review-inputs.ts";
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -32,7 +34,18 @@ export async function reconstructResourceApplicability(
   if (original.workspaceId !== candidate.workspaceId || original.identityToken !== candidate.deliverable.identity) refuse();
   const originalCandidate = { headSha: origin.source.headSha, treeSha: original.treeSha, base: { ref: original.baseRef, tipSha: original.baseTipSha, mergeBaseSha: original.mergeBaseSha }, deliverable: { digest: original.deliverableDigest, identity: original.identityToken } };
   const originalTree = await sourceTree(original.treeSha);
-  const identity = await scopedCheckIdentity(config, provider, originalTree.inventory, originalTree.read, observation, originalCandidate, readEvidence);
+  // Ordinary planning can grow its broad selected paths after an unrelated
+  // edit. Recompute the actual old selection, never a current-frame substitute.
+  // Its original input/profile digests still authenticate every retained field.
+  let originalProvider = provider;
+  if (payload["resourceScope"] !== undefined) {
+    const retained = payload["resourceScope"], current = provider.check?.scope;
+    if (!isScopedCheckDefinition(retained) || Buffer.byteLength(JSON.stringify(retained), "utf8") > MAX_PORTABLE_ARTIFACT_BYTES || !current ||
+        retained.cwd !== current.cwd || retained.profile !== current.profile ||
+        digestCanonical(retained.environment) !== digestCanonical(current.environment)) refuse();
+    originalProvider = { ...provider, check: { ...provider.check!, scope: retained } };
+  }
+  const identity = await scopedCheckIdentity(config, originalProvider, originalTree.inventory, originalTree.read, observation, originalCandidate, readEvidence);
   if (!identity.reusable || identity.inputDigest !== attempt.inputDigest || identity.profileDigest !== attempt.profileDigest) refuse();
   const originalSource = await captureInstalledDataBinding(config, provider, originalCandidate, observation, { base: await sourceTree(original.mergeBaseSha), candidate: originalTree }, readEvidence);
   if (originalSource.declarationDigest !== projection.declarationDigest || originalSource.sourceApplicabilityDigest !== projection.sourceApplicabilityDigest || digestCanonical(originalSource.context) !== digestCanonical(projection.capture.context)) refuse();
@@ -47,5 +60,5 @@ export async function reconstructResourceApplicability(
   const capture = projection.capture;
   if (projection.consumerId !== current.declaration.consumerId || digestCanonical(capture.requests) !== digestCanonical(normalizeInstalledDataResourceRequests(current.declaration.requests)) || digestCanonical(capture.context) !== digestCanonical(current.context)) refuse();
   const bindingCandidate: RecordCandidateBinding = { treeSha: candidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: candidate.workspaceId };
-  return { binding: createResourceApplicabilityBinding({ candidateDigest: digestCanonical(bindingCandidate), definitionDigest: digestCanonical(provider.check), declarationDigest: current.declarationDigest, sourceApplicabilityDigest: current.sourceApplicabilityDigest, capture, projection, originAttempt: origin }), observation };
+  return { binding: createResourceApplicabilityBinding({ candidateDigest: digestCanonical(bindingCandidate), definitionDigest: digestCanonical(recordOutputProvider(provider, deliveryRecordPathFor(config, candidate.deliverable.digest)).check), declarationDigest: current.declarationDigest, sourceApplicabilityDigest: current.sourceApplicabilityDigest, capture, projection, originAttempt: origin }), observation };
 }

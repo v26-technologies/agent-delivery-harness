@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createArtifactsPort, defineHarnessConfig, digestCanonical, sha256Hex, type HarnessConfigInput, type InstalledDataResourceContext } from "@agent-delivery-harness/kernel";
+import { createArtifactsPort, defineHarnessConfig, deliveryRecordPathFor, digestCanonical, sha256Hex, type HarnessConfigInput, type InstalledDataResourceContext } from "@agent-delivery-harness/kernel";
 import base from "../../../harness.config.ts";
-import { runCli, type CliRuntime } from "./index.ts";
+import { runCli, wireRepo, type CliRuntime } from "./index.ts";
 import { ScopedChecks } from "./scoped-checks.ts";
 import * as snapshots from "./check-snapshot.ts";
 const exec = promisify(execFile), roots:string[]=[];
@@ -43,6 +43,25 @@ async function duringCreation(hook:(session:ScopedChecks)=>Promise<void>) {
   return ()=>{if(hookFailure)throw hookFailure;};
 }
 describe('native scoped installed resources',()=>{
+  it('retains actual historical scope when ordinary broad membership grows across resource reuse',async()=>{
+    const f=await fixture(true,true,true);let config=defineHarnessConfig({...f.config,providers:f.config.providers.map(provider=>({...provider,check:{...provider.check!,scope:{...provider.check!.scope!,files:[...provider.check!.scope!.files,'excluded-sentinel.txt']}}}))});
+    const runtime={...f.runtime,loadConfig:async()=>config};
+    for(const command of ['prepare','gate'])expect(await runCli([command],runtime),f.errors.join('\n')).toBe(0);
+    await writeFile(path.join(f.dir,'helper.ts'),'export const unrelated=1;');await f.git('add','helper.ts');await f.git('-c','commit.gpgsign=false','commit','-qm','new ordinary broad input');
+    config=defineHarnessConfig({...config,providers:config.providers.map(provider=>({...provider,check:{...provider.check!,scope:{...provider.check!.scope!,files:[...provider.check!.scope!.files,'helper.ts']}}}))});
+    for(const command of ['prepare','gate'])expect(await runCli([command],runtime),f.errors.join('\n')).toBe(0);
+    expect(await readFile(f.commandCount,'utf8')).toBe('command\n');expect(f.messages.some(line=>line.includes('consumer command omitted'))).toBe(true);
+    const setups=await readFile(f.setupCount,'utf8'),wiring=await wireRepo(f.dir,config),captured=await wiring.captureCandidate();expect(captured.ok).toBe(true);if(!captured.ok)throw Error('candidate unavailable');
+    const recordPath=deliveryRecordPathFor(config,captured.candidate.deliverable.digest);
+    expect(await runCli(['record'],runtime),f.errors.join('\n')).toBe(0);expect(await readFile(f.setupCount,'utf8')).toBe(setups);
+    await f.git('add','--',recordPath);
+    config=defineHarnessConfig({...config,providers:config.providers.map(provider=>({...provider,check:{...provider.check!,scope:{...provider.check!.scope!,files:[...provider.check!.scope!.files,recordPath]}}}))});
+    expect(await runCli(['prepare','--refresh-record-neutral'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['verify'],runtime),f.errors.join('\n')).toBe(0);expect(await readFile(f.setupCount,'utf8')).toBe(setups);expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+    await writeFile(path.join(f.dir,'untracked-source.ts'),'export const unsafe=1;');
+    expect(await runCli(['record'],runtime)).toBe(1);expect(await readFile(f.setupCount,'utf8')).toBe(setups);expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
+  },60000);
+
   it.each(['both','HEAD-only','tree-only'])('finite physical resource freshness observes changed DATA with identical admitted setup inputs: %s',async transition=>{
     const f=await fixture(true,true,true,true);
     for(const command of ['prepare','gate'])expect(await runCli([command],f.runtime),f.errors.join('\n')).toBe(0);
