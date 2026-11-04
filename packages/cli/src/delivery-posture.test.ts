@@ -4,13 +4,15 @@ import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createArtifactsPort, defineHarnessConfig, DELIVERY_POSTURE_PATH, resolveDeliveryPosture, type HarnessConfigInput } from "@agent-delivery-harness/kernel";
 import adopterConfig from "../../../harness.config.ts";
 import { runCli, type CliRuntime } from "./index.ts";
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
+// Each scenario runs many real git and harness steps, which a busy machine can make slow.
+vi.setConfig({ testTimeout: 60_000 });
 let pinnedStore: string | undefined;
 beforeEach(() => { pinnedStore = process.env["DELIVERY_HARNESS_RUN_STORE"]; });
 afterEach(async () => {
@@ -193,7 +195,7 @@ describe("base focused", () => {
     await f.publish(declaration("focused"));
     const bin = path.join(f.root, "shim"); await mkdir(bin);
     const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
-    await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase "$1" in\n  ls-remote) sleep 120 ;;\nesac\nexec "${real}" "$@"\n`);
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in\n  *" ls-remote "*) sleep 120 ;;\nesac\nexec "${real}" "$@"\n`);
     await chmod(path.join(bin, "git"), 0o755);
     const original = process.env["PATH"];
     process.env["PATH"] = `${bin}${path.delimiter}${original}`;
@@ -206,6 +208,42 @@ describe("base focused", () => {
       expect(Date.now() - started).toBeLessThan(10_000);
     } finally { process.env["PATH"] = original; }
   }, 30_000);
+
+  it("runs nothing after an interrupt during the read, under a command that would otherwise gate", async () => {
+    const f = await fixture();
+    expect((await f.cli("prepare")).code).toBe(0);
+    const bin = path.join(f.root, "shim"); await mkdir(bin);
+    const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in\n  *" ls-remote "*) sleep 120 ;;\nesac\nexec "${real}" "$@"\n`);
+    await chmod(path.join(bin, "git"), 0o755);
+    const original = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${original}`;
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 300);
+      expect(await runCli(["gate"], { ...f.runtime, signal: controller.signal })).toBe(130);
+      expect(existsSync(f.sentinel)).toBe(false);
+    } finally { process.env["PATH"] = original; }
+  });
+
+  it("gates, by the real command, from a subdirectory holding a committed bare layout", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    const pkg = path.join(f.repo, "pkg");
+    await f.git("clone", "-q", "--bare", f.remote, pkg);
+    await f.git("-C", pkg, "config", "remote.origin.url", ".");
+    const work = path.join(f.root, "pkg-work");
+    await f.git("clone", "-q", pkg, work);
+    await f.git("-C", work, "config", "user.name", "Test"); await f.git("-C", work, "config", "user.email", "test@example.invalid");
+    await writeFile(path.join(work, DELIVERY_POSTURE_PATH), declaration("focused"));
+    await f.git("-C", work, "add", "-A"); await f.git("-C", work, "-c", "commit.gpgsign=false", "commit", "-qm", "self-declare");
+    await f.git("-C", work, "push", "-q", "origin", "HEAD:refs/heads/main");
+    expect((await exec("git", ["rev-parse", "--git-dir"], { cwd: pkg })).stdout.trim()).toBe(".");
+    const seen: string[] = [];
+    const code = await runCli(["verify"], { ...f.runtime, cwd: pkg, stdout: text => seen.push(text), stderr: text => seen.push(text) });
+    expect(seen.join("")).not.toContain("outcome: focused");
+    expect(code).toBe(1);
+  });
 
   it("the sentinel is real: the same obligation runs it under gate", async () => {
     const f = await fixture();

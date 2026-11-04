@@ -207,6 +207,11 @@ tracking ref and any private ref to both say so, and the base tip reported is th
 tracking ref's. Otherwise the result is the `gate` of the ref that said so, the
 tracking ref first. Each network call is bounded at 15 seconds.
 
+The check assumes the repository's own `.git/config` is the operator's. A
+repository that includes a tracked file from it, through `include.path`, has handed
+the candidate control of git, and can't rely on this check. Refusing a bare
+repository discovered in a subdirectory needs git 2.38 or newer.
+
 The hosted action calls the record check directly and doesn't read this file.
 
 ## Bounded retention of tracked records

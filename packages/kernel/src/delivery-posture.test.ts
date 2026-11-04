@@ -3,7 +3,7 @@ import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DELIVERY_POSTURE_NETWORK_TIMEOUT_MS,
   DELIVERY_POSTURE_PATH,
@@ -12,6 +12,8 @@ import {
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
+// Each scenario runs many real git commands, which a busy machine can make slow.
+vi.setConfig({ testTimeout: 60_000 });
 let originalPath: string | undefined;
 beforeEach(() => { originalPath = process.env["PATH"]; });
 afterEach(async () => {
@@ -68,8 +70,8 @@ async function hangingGit(f: Fixture, subcommands: readonly string[]) {
   const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
   const bin = path.join(f.root, "shim"); await mkdir(bin, { recursive: true });
   const pidFile = path.join(f.root, "hung.pid");
-  const cases = subcommands.map(name => `  ${name}) sleep 120 & echo $! > "${pidFile}"; wait; exit 0 ;;`).join("\n");
-  await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase "$1" in\n${cases}\nesac\nexec "${real}" "$@"\n`);
+  const cases = subcommands.map(name => `  *" ${name} "*) sleep 120 & echo $! > "${pidFile}"; wait; exit 0 ;;`).join("\n");
+  await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in\n${cases}\nesac\nexec "${real}" "$@"\n`);
   await chmod(path.join(bin, "git"), 0o755);
   process.env["PATH"] = `${bin}${path.delimiter}${originalPath}`;
   return { pidFile };
@@ -89,7 +91,7 @@ async function expectGone(pid: number): Promise<void> {
 async function shimmedGit(f: Fixture, arms: string) {
   const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
   const bin = path.join(f.root, "shim"); await mkdir(bin, { recursive: true });
-  await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase "$*" in\n${arms}\nesac\nexec "${real}" "$@"\n`);
+  await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in\n${arms}\nesac\nexec "${real}" "$@"\n`);
   await chmod(path.join(bin, "git"), 0o755);
   process.env["PATH"] = `${bin}${path.delimiter}${originalPath}`;
 }
@@ -289,6 +291,69 @@ describe("which base is trusted", () => {
 
     expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
     await f.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  });
+
+  it("does not take a bare layout committed in a subdirectory for the repository", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    const pkg = path.join(f.repo, "pkg");
+    await f.git("clone", "-q", "--bare", f.remote, pkg);
+    await f.git("-C", pkg, "config", "remote.origin.url", ".");
+    const work = path.join(f.root, "pkg-work");
+    await f.git("clone", "-q", pkg, work);
+    await f.git("-C", work, "config", "user.name", "Test"); await f.git("-C", work, "config", "user.email", "test@example.invalid");
+    await writeFile(path.join(work, DELIVERY_POSTURE_PATH), declaration("focused"));
+    await f.git("-C", work, "add", "-A"); await f.git("-C", work, "-c", "commit.gpgsign=false", "commit", "-qm", "self-declare");
+    await f.git("-C", work, "push", "-q", "origin", "HEAD:refs/heads/main");
+    // The control: git really does discover that directory as the repository.
+    expect((await exec("git", ["rev-parse", "--git-dir"], { cwd: pkg })).stdout.trim()).toBe(".");
+
+    expect(await resolveDeliveryPosture({ rootDir: pkg, baseRef: "origin/main" })).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  });
+
+  it("reads the same declaration from a real subdirectory of the repository", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const nested = path.join(f.repo, "nested"); await mkdir(nested);
+    expect(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+  });
+
+  it("does not let a ref below the tracking ref's name answer for a missing one", async () => {
+    const f = await fixture();
+    const focused = await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    await f.git("update-ref", "-d", "refs/remotes/origin/main");
+    await f.git("update-ref", "refs/remotes/origin/main/stale", focused);
+    await f.disconnect();
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  });
+
+  it("takes the default only from HEAD's own symref line", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    const sha = await f.tracking();
+    await shimmedGit(f, `  *" ls-remote "*) printf 'ref: refs/heads/main\\trefs/heads/other\\n${sha}\\tHEAD\\n'; exit 0 ;;`);
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback" });
+  });
+
+  it.each(["GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE"])("reads the repository it's asked about, whatever %s an ancestor left set", async (name) => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    const other = await fixture();
+    await other.publish(declaration("focused"));
+    await other.resolve();
+    process.env[name] = name === "GIT_NAMESPACE" ? "elsewhere" : name === "GIT_COMMON_DIR" ? path.join(other.repo, ".git") : path.join(other.repo, ".git/objects");
+    try {
+      expect(await f.resolve()).toMatchObject({ posture: "gate", code: null });
+    } finally { delete process.env[name]; }
+  });
+
+  it.each(["ls-tree", "cat-file"])("gives posture_unreadable when %s fails", async (subcommand) => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await shimmedGit(f, `  *" ${subcommand} "*) exit 128 ;;`);
     expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
   });
 
@@ -608,7 +673,7 @@ describe("the bound on every network call", () => {
     const pidFile = path.join(f.root, "helper.pid");
     const helper = path.join(f.root, "helper.cjs");
     await writeFile(helper, `const c=require("node:child_process").spawn("sleep",["60"],{detached:true,stdio:["ignore",1,2]});require("node:fs").writeFileSync(${JSON.stringify(pidFile)},String(c.pid));c.unref();`);
-    await shimmedGit(f, `  fetch*) "${process.execPath}" "${helper}"; exit 0 ;;`);
+    await shimmedGit(f, `  *" fetch "*) "${process.execPath}" "${helper}"; exit 0 ;;`);
     const started = Date.now();
     try {
       expect(await f.resolve("origin/main", 2_000)).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });

@@ -22,6 +22,10 @@
  * relative path, so a bare repository committed at `origin/` in the candidate's
  * own tree would answer as the remote and could declare itself `focused`.
  *
+ * WHY BARE REPOSITORIES ARE REFUSED. From a subdirectory, git would discover a
+ * bare layout committed there as the repository, with its own config and refs
+ * answering every question here. So only an explicit bare repository is honoured.
+ *
  * Everything that can't be read resolves to `gate`. This never rejects.
  */
 import { spawn } from "node:child_process";
@@ -104,7 +108,7 @@ function boundedGit(args: readonly string[], cwd: string, env: Record<string, st
     if (signal?.aborted) { resolve(failed); return; }
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("git", args, { cwd, env, stdio: ["ignore", "pipe", "ignore"], detached: true, windowsHide: true });
+      child = spawn("git", ["-c", "safe.bareRepository=explicit", ...args], { cwd, env, stdio: ["ignore", "pipe", "ignore"], detached: true, windowsHide: true });
     } catch { resolve(failed); return; }
     const chunks: Buffer[] = [];
     let settled = false;
