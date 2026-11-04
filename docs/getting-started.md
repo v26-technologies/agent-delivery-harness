@@ -437,6 +437,9 @@ the first, and writes nothing.
 
 ## 6. Gate, record, verify
 
+A repository can declare on its base that its deliveries run without this gate:
+see [the declared posture](delivery-record.md#the-declared-posture).
+
 ```sh
 delivery-harness gate
 delivery-harness record

@@ -15,6 +15,7 @@ import { runDeclaredCheck } from "../declared-checks.ts";
  */
 import { computeDeliverableIdentity, runAdmission, type AdmissionResult, type Blocker, type LiveProviderResult } from "@agent-delivery-harness/kernel";
 import { CliInterruption, type CommandContext, type CommandDescriptor, type CommandResult } from "../boundary.ts";
+import { focusedOutcome } from "../delivery-posture.ts";
 import { oneLine } from "../run-surface.ts";
 
 const scopedCheckBlocker = (error: CheckSnapshotError): Blocker => commandBlocker({ code: error.code, sourceId: "delivery-harness.cli.gate", summary: error.message, remediations: [{ id: "repair-scoped-check", kind: "manual_action", summary: "Repair the declared scoped check or its execution profile and run the gate again." }] });
@@ -156,6 +157,33 @@ export async function runProviderBackedAdmission(context: CommandContext, option
   } finally { await session?.cleanup(); }
 }
 
+/**
+ * The gate itself, with no posture. `admit` runs this directly, because it keeps
+ * its behaviour under either posture: only the `gate` command honours `focused`.
+ */
+export async function runGate(context: CommandContext): Promise<CommandResult> {
+  const result = await runProviderBackedAdmission(context, { allowPrompt: true, includeInjectedLiveResults: true });
+
+  if (result.admitted) {
+    const waiverNote =
+      result.waiver === "accepted"
+        ? ` (waived: ${result.waivedObligationIds.join(", ")})`
+        : "";
+    const kinds = (result.decision?.resolutions ?? []).map((resolution) => `${resolution.obligationId}=${resolution.kind}`);
+    // This observation describes the admitted immutable tree. Failure to
+    // observe it cannot change admission; the run journal is not evidence.
+    let digest: string | undefined;
+    if (result.candidate !== undefined) {
+      try {
+        digest = await computeDeliverableIdentity({ rootDir: context.rootDir, treeSha: result.candidate.treeSha,
+          config: { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral } });
+      } catch { /* Best-effort observability, like the completion append. */ }
+    }
+    return { kind: "ok", summary: `admitted${waiverNote}: ${kinds.join(", ")}`, ...(digest === undefined ? {} : { digest }) };
+  }
+  return { kind: "blocked", blockers: [...result.blockers] };
+}
+
 export const gateCommand: CommandDescriptor = {
   capturesCandidate: true,
   name: "gate",
@@ -169,25 +197,9 @@ export const gateCommand: CommandDescriptor = {
     if (unexpected !== undefined) {
       return { kind: "usage", message: `gate takes no arguments, and ${oneLine(unexpected, 64)} is one.\n${gateCommand.usage}` };
     }
-    const result = await runProviderBackedAdmission(context, { allowPrompt: true, includeInjectedLiveResults: true });
+    const focused = await focusedOutcome(context);
+    if (focused !== undefined) return focused;
 
-    if (result.admitted) {
-      const waiverNote =
-        result.waiver === "accepted"
-          ? ` (waived: ${result.waivedObligationIds.join(", ")})`
-          : "";
-      const kinds = (result.decision?.resolutions ?? []).map((resolution) => `${resolution.obligationId}=${resolution.kind}`);
-      // This observation describes the admitted immutable tree. Failure to
-      // observe it cannot change admission; the run journal is not evidence.
-      let digest: string | undefined;
-      if (result.candidate !== undefined) {
-        try {
-          digest = await computeDeliverableIdentity({ rootDir: context.rootDir, treeSha: result.candidate.treeSha,
-            config: { ...context.config, computingIdentityVersion: "validation-tree/v1", reviewNeutral: context.config.recordNeutral } });
-        } catch { /* Best-effort observability, like the completion append. */ }
-      }
-      return { kind: "ok", summary: `admitted${waiverNote}: ${kinds.join(", ")}`, ...(digest === undefined ? {} : { digest }) };
-    }
-    return { kind: "blocked", blockers: [...result.blockers] };
+    return runGate(context);
   },
 };

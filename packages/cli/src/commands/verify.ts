@@ -43,6 +43,7 @@ import {
   type RunJournalRow,
 } from "@agent-delivery-harness/kernel";
 import { commandBlocker } from "../boundary.ts";
+import { focusedOutcome } from "../delivery-posture.ts";
 import type { CommandContext, CommandDescriptor, CommandResult } from "../boundary.ts";
 import { RUN_JOURNAL_ADMISSION_ROW, oneLine, resolveRunJournalRow, resolveRunSpan, runJournalRows } from "../run-surface.ts";
 import { durationLabel } from "../run-projection.ts";
@@ -244,6 +245,9 @@ export const verifyCommand: CommandDescriptor = {
     // nothing, exactly as `emit` and `submit-evidence` order it.
     const parsedArgs = parseArgs(context.args);
     if (!parsedArgs.ok) return { kind: "usage", message: parsedArgs.message };
+
+    const focused = await focusedOutcome(context);
+    if (focused !== undefined) return focused;
 
     const wiring = await context.wire();
     const capture = await wiring.captureCandidate();

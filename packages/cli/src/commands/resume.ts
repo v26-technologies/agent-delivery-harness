@@ -1,5 +1,6 @@
 import { classifyCandidateDrift, digestCanonical, evaluatePreparationReceipt, runAdmission, type CandidateBinding } from "@agent-delivery-harness/kernel";
 import { installedRelease, policyDigest, reconciliationActions, recoveryBlocker, recoveryRun } from "../ordinary-context.ts";
+import { focusedOutcome } from "../delivery-posture.ts";
 import type { CommandDescriptor } from "../boundary.ts";
 
 const USAGE = "Usage: delivery-harness resume [--run <run-id>]";
@@ -10,6 +11,8 @@ export const resumeCommand: CommandDescriptor = {
   usage: USAGE,
   async run(context) {
     if (context.args.length !== 0 && (context.args.length !== 2 || context.args[0] !== "--run")) return { kind: "usage", message: USAGE };
+    const focused = await focusedOutcome(context);
+    if (focused !== undefined) return focused;
     const run = await recoveryRun(context.rootDir, context.args[1]);
     if (!run.ok) return { kind: "blocked", blockers: [run.blocker] };
     const saved = [...run.events].reverse().find(event => event.kind === "context.saved");

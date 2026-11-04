@@ -13,9 +13,9 @@ import path from "node:path";
 
 import { commandBlocker, type CommandContext, type CommandDescriptor, type CommandResult } from "../boundary.ts";
 import { emitReviewEvidence, OutcomeError } from "../review-evidence.ts";
-import { gateCommand } from "./gate.ts";
+import { runGate } from "./gate.ts";
 import { prepareCommand } from "./prepare.ts";
-import { recordCommand } from "./record.ts";
+import { writeRecord } from "./record.ts";
 import { reviewContextCommand } from "./review-context.ts";
 import { submitEvidenceCommand } from "./submit-evidence.ts";
 
@@ -98,10 +98,10 @@ export const admitCommand: CommandDescriptor = {
     const stoppedAfterSubmission = report(context, "submitted", submitted);
     if (stoppedAfterSubmission !== undefined) return stoppedAfterSubmission;
 
-    const gated = await gateCommand.run(withArgs(context, []));
+    const gated = await runGate(withArgs(context, []));
     const stoppedAfterGate = report(context, "gate", gated);
     if (stoppedAfterGate !== undefined) return stoppedAfterGate;
 
-    return recordCommand.run(withArgs(context, []));
+    return writeRecord(withArgs(context, []));
   },
 };

@@ -1,6 +1,6 @@
 {
   "name": "delivery-harness",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "private": true,
   "type": "module",
   "description": "Fail-closed merge admission for AI coding agents",
