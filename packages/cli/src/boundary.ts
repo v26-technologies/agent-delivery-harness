@@ -91,7 +91,9 @@ export class CliInterruption extends Error {
  * the typed blockers to render; `usage` is an argument or invocation error.
  */
 export type CommandResult =
-  | { readonly kind: "ok"; readonly summary?: string; readonly digest?: string; readonly preparation?: RunPreparationObservation }
+  | { readonly kind: "ok"; readonly summary?: string; readonly digest?: string; readonly preparation?: RunPreparationObservation;
+      /** The command did not do its work, so no completion of it goes in the run's journal. */
+      readonly unobserved?: true }
   | { readonly kind: "blocked"; readonly blockers: readonly Blocker[] }
   | { readonly kind: "usage"; readonly message: string };
 
@@ -431,7 +433,7 @@ export async function runCliBoundary(
     ? await beginCommandObservation(runtime.cwd, descriptor.name) : undefined;
   let completed: Extract<CommandResult, { kind: "ok" }> | undefined;
   const code = await runConfiguredCommand(descriptor, args, runtime, value => { completed = value; }, observation);
-  await observation?.finish(code, Date.now() - startedAt, completed?.digest, completed?.preparation);
+  if (!completed?.unobserved) await observation?.finish(code, Date.now() - startedAt, completed?.digest, completed?.preparation);
   return code;
 }
 

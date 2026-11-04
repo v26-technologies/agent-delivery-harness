@@ -4,6 +4,7 @@
  * Each calls this once its arguments have parsed and before anything else. Under
  * `focused` the command returns the one outcome this builds, having read no
  * delivery record and run no obligation, and that outcome is the whole record.
+ * It journals no completion: `gate ok` in a run would read as a gate that passed.
  * Under `gate` the command carries on, with output as it would be had nothing
  * been declared. The one exception is a malformed declaration: a repository said
  * something and it didn't take, so its code and reason go to stderr, leaving
@@ -23,6 +24,7 @@ export async function focusedOutcome(context: CommandContext): Promise<Extract<C
   if (resolved.posture === "focused") {
     return {
       kind: "ok",
+      unobserved: true,
       summary: [
         "outcome: focused",
         `posture: ${resolved.posture}`,

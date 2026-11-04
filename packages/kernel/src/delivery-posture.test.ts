@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -75,8 +75,33 @@ async function hangingGit(f: Fixture, subcommands: readonly string[]) {
   return { pidFile };
 }
 
-const alive = (pid: number): boolean => {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+/** A killed process lingers until it's reaped, so this waits rather than samples once. */
+async function expectGone(pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { return; }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`process ${pid} outlived the bound`);
+}
+
+/** A `git` first on PATH with one shell `case` arm of the caller's, and the real one otherwise. */
+async function shimmedGit(f: Fixture, arms: string) {
+  const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
+  const bin = path.join(f.root, "shim"); await mkdir(bin, { recursive: true });
+  await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase "$*" in\n${arms}\nesac\nexec "${real}" "$@"\n`);
+  await chmod(path.join(bin, "git"), 0o755);
+  process.env["PATH"] = `${bin}${path.delimiter}${originalPath}`;
+}
+
+const pidIn = async (file: string): Promise<number> => {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const text = await readFile(file, "utf8").catch(() => "");
+    if (text.trim() !== "") return Number(text.trim());
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`no pid in ${file}`);
 };
 
 describe("what the base holds", () => {
@@ -143,13 +168,36 @@ describe("what the base holds", () => {
     expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
   });
 
-  it("does not read through a symlink at the path", async () => {
+  it("does not read a symlink at the path, even one whose blob is a valid declaration", async () => {
     const f = await fixture();
     await mkdir(path.join(f.seed, ".agents"), { recursive: true });
-    await writeFile(path.join(f.seed, "real.json"), declaration("focused"));
-    await exec("ln", ["-s", "../real.json", path.join(f.seed, DELIVERY_POSTURE_PATH)]);
-    await f.git("-C", f.seed, "add", "-A"); await f.git("-C", f.seed, "-c", "commit.gpgsign=false", "commit", "-qm", "link");
+    const blob = path.join(f.root, "declaration.json");
+    await writeFile(blob, declaration("focused"));
+    const sha = await f.git("-C", f.seed, "hash-object", "-w", blob);
+    await f.git("-C", f.seed, "update-index", "--add", "--cacheinfo", `120000,${sha},${DELIVERY_POSTURE_PATH}`);
+    await f.git("-C", f.seed, "-c", "commit.gpgsign=false", "commit", "-qm", "link");
     await f.git("-C", f.seed, "push", "-q", "origin", "HEAD:refs/heads/main");
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_malformed" });
+  });
+
+  it("reads an executable declaration, which is still a regular file", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.git("-C", f.seed, "update-index", "--chmod=+x", DELIVERY_POSTURE_PATH);
+    await f.git("-C", f.seed, "-c", "commit.gpgsign=false", "commit", "-qm", "executable");
+    await f.git("-C", f.seed, "push", "-q", "origin", "HEAD:refs/heads/main");
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+  });
+
+  it("requires a reason of a gate declaration too", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate", " "));
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_malformed" });
+  });
+
+  it("refuses an invalid byte inside an otherwise valid reason", async () => {
+    const f = await fixture();
+    await f.publish(Buffer.concat([Buffer.from(`{"schemaVersion":"delivery-posture/1","posture":"focused","reason":"r`), Buffer.from([0xff]), Buffer.from(`"}`)]));
     expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_malformed" });
   });
 
@@ -200,6 +248,103 @@ describe("which base is trusted", () => {
     expect(await f.resolve()).toMatchObject({ posture: "gate", code: null, source: "origin/main" });
   });
 
+  it("reads the full ref offline too, so a local branch and a tag of the short name do not win", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    await f.fetchTracking();
+    const focused = await f.publish(declaration("focused"), "elsewhere");
+    await f.git("fetch", "-q", "origin", "refs/heads/elsewhere");
+    await f.git("branch", "origin/main", focused);
+    await f.git("tag", "origin/main", focused);
+    await f.disconnect();
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: null, source: "origin/main" });
+  });
+
+  it("does not let a tag or branch named after a missing tracking ref answer for it", async () => {
+    const f = await fixture();
+    const focused = await f.publish(declaration("focused"), "elsewhere");
+    await f.git("fetch", "-q", "origin", "refs/heads/elsewhere");
+    await f.git("update-ref", "-d", "refs/remotes/origin/main");
+    await f.git("tag", "refs/remotes/origin/main", focused);
+    await f.git("branch", "refs/remotes/origin/main", focused);
+    await f.disconnect();
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  });
+
+  it("does not answer from a bare repository in the candidate's tree when origin isn't configured", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    const focused = path.join(f.root, "focused.git");
+    await f.git("clone", "-q", "--bare", f.remote, focused);
+    const work = path.join(f.root, "focused-work");
+    await f.git("clone", "-q", focused, work);
+    await f.git("-C", work, "config", "user.name", "Test"); await f.git("-C", work, "config", "user.email", "test@example.invalid");
+    await writeFile(path.join(work, DELIVERY_POSTURE_PATH), declaration("focused"));
+    await f.git("-C", work, "add", "-A"); await f.git("-C", work, "-c", "commit.gpgsign=false", "commit", "-qm", "self-declare");
+    await f.git("-C", work, "push", "-q", "origin", "HEAD:refs/heads/main");
+    await cp(focused, path.join(f.repo, "origin"), { recursive: true });
+    // The control: git really does read that directory as `origin` here.
+    await f.git("remote", "remove", "origin");
+    expect(await f.git("ls-remote", "origin", "refs/heads/main")).toContain("refs/heads/main");
+
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+    await f.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  });
+
+  it("does not let a local replace ref change what the base holds", async () => {
+    const f = await fixture();
+    const gateTip = await f.publish(declaration("gate"));
+    const focusedTip = await f.publish(declaration("focused"), "elsewhere");
+    await f.publish(declaration("gate"));
+    await f.git("fetch", "-q", "origin");
+    const tip = await f.tracking();
+    expect(gateTip).not.toBe(focusedTip);
+    const blob = (branch: string) => f.git("rev-parse", `${branch}:${DELIVERY_POSTURE_PATH}`);
+    await f.git("replace", await blob("refs/remotes/origin/main"), await blob("refs/remotes/origin/elsewhere"));
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: null, baseTipSha: tip });
+    await f.git("replace", tip, focusedTip);
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: null, baseTipSha: tip });
+  });
+
+  it("reads the repository it's asked about, whatever GIT_DIR an ancestor left set", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    const other = await fixture();
+    await other.publish(declaration("focused"));
+    await other.fetchTracking();
+    await other.resolve();
+    process.env["GIT_DIR"] = path.join(other.repo, ".git");
+    try {
+      expect(await f.resolve()).toMatchObject({ posture: "gate", code: null });
+    } finally { delete process.env["GIT_DIR"]; }
+  });
+
+  it("reaches a remote through what the operator's environment carries", async () => {
+    // The remote's URL rewrites to the real one only through inherited GIT_CONFIG_*.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    const tip = await f.publish(declaration("gate"));
+    const alias = "reachable-only-through-env:";
+    await f.git("remote", "set-url", "origin", `${alias}remote.git`);
+    Object.assign(process.env, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: `url.${f.remote}.insteadOf`, GIT_CONFIG_VALUE_0: `${alias}remote.git` });
+    try {
+      expect(await f.resolve()).toMatchObject({ posture: "gate", code: null, baseTipSha: tip });
+    } finally {
+      for (const name of ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]) delete process.env[name];
+    }
+  });
+
+  it("does not take a detached remote HEAD's default from what was recorded earlier", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    await writeFile(path.join(f.remote, "HEAD"), `${tip}\n`);
+    expect(await f.git("symbolic-ref", "refs/remotes/origin/HEAD")).toBe("refs/remotes/origin/main");
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback" });
+  });
+
   it("gives the tip's posture whichever way a candidate branched", async () => {
     const f = await fixture();
     await f.publish(declaration("focused"));
@@ -240,6 +385,27 @@ describe("which base is trusted", () => {
     const tip = await f.publish(declaration("gate"));
     expect(await f.resolve()).toMatchObject({ posture: "gate", baseTipSha: tip, code: null });
     expect(await f.privateRef()).toBe(tip);
+  });
+
+  it("follows a force-pushed base rather than holding a stale focused", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.resolve();
+    await f.fetchTracking();
+    await f.git("-C", f.seed, "reset", "-q", "--hard", f.first);
+    const tip = await f.publish(declaration("gate"));
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: null, baseTipSha: tip });
+    expect(await f.privateRef()).toBe(tip);
+  });
+
+  it("leaves FETCH_HEAD as it was, in a repository that declares nothing", async () => {
+    const f = await fixture();
+    await f.publish(null, "topic");
+    await f.git("fetch", "-q", "origin", "refs/heads/topic");
+    const before = await readFile(path.join(f.repo, ".git/FETCH_HEAD"), "utf8");
+    await f.publish(null);
+    expect(await f.resolve()).toMatchObject({ code: "posture_undeclared" });
+    expect(await readFile(path.join(f.repo, ".git/FETCH_HEAD"), "utf8")).toBe(before);
   });
 
   it.each(["main", "refs/remotes/origin/main", "upstream/main", "origin/", "origin/-x"])("gives %s posture_unreadable", async (baseRef) => {
@@ -372,6 +538,17 @@ describe("a failed fetch", () => {
     expect(await g.resolve()).toMatchObject({ posture: "gate", code: "posture_malformed", baseTipSha: malformed });
   });
 
+  it("with the tracking ref focused and the private ref unlistable, is posture_unreadable", async () => {
+    const f = await fixture();
+    await f.publish(declaration("gate"));
+    await f.resolve();
+    await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    await f.disconnect();
+    await shimmedGit(f, `  *for-each-ref*refs/delivery/posture/main*) exit 128 ;;`);
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback" });
+  });
+
   it("when both refs are non-focused with different codes, the tracking ref's code wins", async () => {
     const f = await fixture();
     await f.publish("not json");
@@ -400,8 +577,7 @@ describe("the bound on every network call", () => {
     expect(elapsed).toBeGreaterThanOrEqual(DELIVERY_POSTURE_NETWORK_TIMEOUT_MS - 100);
     expect(elapsed).toBeLessThan(DELIVERY_POSTURE_NETWORK_TIMEOUT_MS + 10_000);
     // The whole process group went, not only the immediate child.
-    const hung = Number((await readFile(pidFile, "utf8")).trim());
-    expect(alive(hung)).toBe(false);
+    await expectGone(await pidIn(pidFile));
   }, 40_000);
 
   it("holds on a hanging ls-remote with origin/HEAD absent: posture_unreadable", async () => {
@@ -425,15 +601,56 @@ describe("the bound on every network call", () => {
     expect(Date.now() - started).toBeLessThan(10_000);
   });
 
-  it("holds when a child keeps the pipes open after the process it was asked to run has gone", async () => {
+  it("holds when a helper in its own session keeps the pipes open after git has gone", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    const pidFile = path.join(f.root, "helper.pid");
+    const helper = path.join(f.root, "helper.cjs");
+    await writeFile(helper, `const c=require("node:child_process").spawn("sleep",["60"],{detached:true,stdio:["ignore",1,2]});require("node:fs").writeFileSync(${JSON.stringify(pidFile)},String(c.pid));c.unref();`);
+    await shimmedGit(f, `  fetch*) "${process.execPath}" "${helper}"; exit 0 ;;`);
+    const started = Date.now();
+    try {
+      expect(await f.resolve("origin/main", 2_000)).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+      expect(Date.now() - started).toBeLessThan(12_000);
+    } finally {
+      process.kill(await pidIn(pidFile), "SIGKILL");
+    }
+  }, 30_000);
+
+  it("bounds a local read too: a hanging git is posture_unreadable", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    await f.disconnect();
+    await hangingGit(f, ["symbolic-ref"]);
+    const started = Date.now();
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback" });
+    expect(Date.now() - started).toBeLessThan(DELIVERY_POSTURE_NETWORK_TIMEOUT_MS + 10_000);
+  }, 40_000);
+
+  it("stops at once on an abort, killing what it started", async () => {
     const f = await fixture();
     await f.publish(declaration("focused"));
     await f.fetchTracking();
     const { pidFile } = await hangingGit(f, ["ls-remote"]);
+    const controller = new AbortController();
     const started = Date.now();
-    await f.resolve("origin/main", 400);
+    const pending = resolveDeliveryPosture({ rootDir: f.repo, baseRef: "origin/main", signal: controller.signal });
+    const hung = await pidIn(pidFile);
+    controller.abort();
+    expect(await pending).toMatchObject({ posture: "gate", code: "posture_unreadable" });
     expect(Date.now() - started).toBeLessThan(10_000);
-    expect(alive(Number((await readFile(pidFile, "utf8")).trim()))).toBe(false);
+    await expectGone(hung);
+  }, 30_000);
+
+  it("runs nothing when it's already aborted", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.fetchTracking();
+    const controller = new AbortController();
+    controller.abort();
+    expect(await resolveDeliveryPosture({ rootDir: f.repo, baseRef: "origin/main", signal: controller.signal })).toMatchObject({ posture: "gate", code: "posture_unreadable" });
   });
 
   it("does not move the tracking ref or fetch tags into the repository", async () => {

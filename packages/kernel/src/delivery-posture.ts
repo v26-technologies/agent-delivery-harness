@@ -18,6 +18,10 @@
  * can be the stale one, since an earlier run left the private ref and a normal
  * fetch moves only the tracking ref, so `focused` then needs both to say so.
  *
+ * WHY `origin` MUST BE CONFIGURED. With no such remote, git reads `origin` as a
+ * relative path, so a bare repository committed at `origin/` in the candidate's
+ * own tree would answer as the remote and could declare itself `focused`.
+ *
  * Everything that can't be read resolves to `gate`. This never rejects.
  */
 import { spawn } from "node:child_process";
@@ -58,18 +62,49 @@ interface GitResult {
   readonly stdout: Buffer;
 }
 
+type GitRunner = (args: readonly string[], timeoutMs: number) => Promise<GitResult>;
+
+/** A local replace ref would make a base's objects read as something it never held. */
+const NO_REPLACE = { GIT_NO_REPLACE_OBJECTS: "1" };
+
+const localEnvironment = (): Record<string, string> => ({ ...scrubbedEnvironment(), ...NO_REPLACE });
+
+/**
+ * What git itself treats as selecting a repository, which a hook or another
+ * tool's subprocess can leave set.
+ */
+const REPOSITORY_SELECTING = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_CONFIG", "GIT_DIR", "GIT_GRAFT_FILE", "GIT_IMPLICIT_WORK_TREE",
+  "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY", "GIT_PREFIX", "GIT_QUARANTINE_PATH", "GIT_REPLACE_REF_BASE",
+  "GIT_SHALLOW_FILE", "GIT_WORK_TREE",
+]);
+
+/**
+ * The network calls keep what carries transport and authentication, such as
+ * `GIT_SSH_COMMAND`, `GIT_ASKPASS` and `GIT_CONFIG_*`. Scrubbing those would send
+ * a machine that reaches `origin` only through them down the offline path, where
+ * a stale tip could decide.
+ */
+function networkEnvironment(): Record<string, string> {
+  const environment: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !REPOSITORY_SELECTING.has(name)) environment[name] = value;
+  }
+  return { ...environment, ...localEnvironment() };
+}
+
 /**
  * One bounded `git`, in its own process group. A fetch hands the network to a
  * helper that inherits the pipes, so killing `git` alone leaves `close` waiting
  * on that helper: the timer kills the group and settles without waiting for it.
  */
-function boundedGit(args: readonly string[], cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<GitResult> {
+function boundedGit(args: readonly string[], cwd: string, env: Record<string, string>, timeoutMs: number, signal?: AbortSignal): Promise<GitResult> {
   return new Promise((resolve) => {
     const failed: GitResult = { exitCode: -1, stdout: Buffer.alloc(0) };
     if (signal?.aborted) { resolve(failed); return; }
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("git", args, { cwd, env: scrubbedEnvironment(), stdio: ["ignore", "pipe", "ignore"], detached: true, windowsHide: true });
+      child = spawn("git", args, { cwd, env, stdio: ["ignore", "pipe", "ignore"], detached: true, windowsHide: true });
     } catch { resolve(failed); return; }
     const chunks: Buffer[] = [];
     let settled = false;
@@ -130,9 +165,26 @@ const unreadable = (baseRef: string, why: string): DeliveryPostureResult => ({
   code: "posture_unreadable",
 });
 
-/** Reads the declaration at one full ref's tip. A full ref, so no tag or branch of a short name can win. */
-async function readAtRef(fullRef: string, baseRef: string, git: (args: readonly string[], timeoutMs: number) => Promise<GitResult>): Promise<DeliveryPostureResult> {
-  const tip = await git(["rev-parse", "--verify", "--quiet", `${fullRef}^{commit}`], LOCAL_TIMEOUT_MS);
+/**
+ * What one exact ref holds: an object, nothing, or `undefined` where git failed.
+ * `for-each-ref` rather than `rev-parse`, whose lookup rules would let a tag or
+ * branch literally named after a missing ref answer for it.
+ */
+async function exactRef(fullRef: string, git: GitRunner): Promise<{ readonly sha: string | null } | undefined> {
+  const listed = await git(["for-each-ref", "--format=%(refname) %(objectname)", fullRef], LOCAL_TIMEOUT_MS);
+  if (listed.exitCode !== 0) return undefined;
+  for (const line of listed.stdout.toString("utf8").split("\n")) {
+    const [name, sha] = line.split(" ");
+    if (name === fullRef && sha !== undefined) return { sha };
+  }
+  return { sha: null };
+}
+
+/** Reads the declaration at one exact ref's tip, so no tag or branch of a similar name can win. */
+async function readAtRef(fullRef: string, baseRef: string, git: GitRunner): Promise<DeliveryPostureResult> {
+  const held = await exactRef(fullRef, git);
+  if (held === undefined || held.sha === null) return unreadable(baseRef, `${fullRef} did not resolve`);
+  const tip = await git(["rev-parse", "--verify", "--quiet", `${held.sha}^{commit}`], LOCAL_TIMEOUT_MS);
   const baseTipSha = tip.stdout.toString("utf8").trim();
   if (tip.exitCode !== 0 || baseTipSha === "") return unreadable(baseRef, `${fullRef} did not resolve`);
 
@@ -165,8 +217,8 @@ async function readAtRef(fullRef: string, baseRef: string, git: (args: readonly 
 }
 
 /** The remote's default branch, or undefined where it can't be determined. Offline, the last-recorded one. */
-async function defaultBranch(git: (args: readonly string[], timeoutMs: number) => Promise<GitResult>, networkTimeoutMs: number): Promise<string | undefined> {
-  const remote = await git(["ls-remote", "--symref", "origin", "HEAD"], networkTimeoutMs);
+async function defaultBranch(git: GitRunner, network: GitRunner, networkTimeoutMs: number): Promise<string | undefined> {
+  const remote = await network(["ls-remote", "--symref", "origin", "HEAD"], networkTimeoutMs);
   if (remote.exitCode === 0) return /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(remote.stdout.toString("utf8"))?.[1];
   const recorded = await git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], LOCAL_TIMEOUT_MS);
   if (recorded.exitCode !== 0) return undefined;
@@ -180,24 +232,27 @@ async function defaultBranch(git: (args: readonly string[], timeoutMs: number) =
 export async function resolveDeliveryPosture(input: ResolveDeliveryPostureInput): Promise<DeliveryPostureResult> {
   const { baseRef, rootDir, signal } = input;
   const networkTimeoutMs = input.networkTimeoutMs ?? DELIVERY_POSTURE_NETWORK_TIMEOUT_MS;
-  const git = (args: readonly string[], timeoutMs: number) => boundedGit(args, rootDir, timeoutMs, signal);
+  const git: GitRunner = (args, timeoutMs) => boundedGit(args, rootDir, localEnvironment(), timeoutMs, signal);
+  const network: GitRunner = (args, timeoutMs) => boundedGit(args, rootDir, networkEnvironment(), timeoutMs, signal);
   try {
     const named = /^origin\/(.+)$/.exec(baseRef)?.[1];
     if (named === undefined) return unreadable(baseRef, "the base does not name origin/<branch>");
-    const branch = await defaultBranch(git, networkTimeoutMs);
+    const url = await network(["config", "--get", "remote.origin.url"], LOCAL_TIMEOUT_MS);
+    if (url.exitCode !== 0 || url.stdout.toString("utf8").trim() === "") return unreadable(baseRef, "origin is not a configured remote");
+    const branch = await defaultBranch(git, network, networkTimeoutMs);
     if (branch === undefined) return unreadable(baseRef, "origin's default branch could not be determined");
     if (branch !== named) return unreadable(baseRef, `the base is not origin's default branch, ${branch}`);
 
     const privateRef = `refs/delivery/posture/${branch}`;
     const trackingRef = `refs/remotes/origin/${branch}`;
-    const fetched = await git(["fetch", "--no-tags", "--refmap=", "origin", `+refs/heads/${branch}:${privateRef}`], networkTimeoutMs);
+    const fetched = await network(["fetch", "--no-tags", "--refmap=", "--no-write-fetch-head", "--no-auto-maintenance", "--no-recurse-submodules", "origin", `+refs/heads/${branch}:${privateRef}`], networkTimeoutMs);
     if (fetched.exitCode === 0) return await readAtRef(privateRef, baseRef, git);
 
     const tracking = await readAtRef(trackingRef, baseRef, git);
     if (tracking.posture !== "focused") return tracking;
-    const held = await git(["for-each-ref", "--format=%(objectname)", privateRef], LOCAL_TIMEOUT_MS);
-    if (held.exitCode !== 0) return unreadable(baseRef, `${privateRef} did not read`);
-    if (held.stdout.length === 0) return tracking;
+    const held = await exactRef(privateRef, git);
+    if (held === undefined) return unreadable(baseRef, `${privateRef} did not read`);
+    if (held.sha === null) return tracking;
     const earlier = await readAtRef(privateRef, baseRef, git);
     return earlier.posture === "focused" ? tracking : earlier;
   } catch {

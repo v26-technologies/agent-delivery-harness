@@ -171,7 +171,9 @@ loads from the candidate's tree and this file doesn't.
 Under `focused`, `verify`, `gate`, `record` and `resume` each exit 0 with one
 outcome, `focused`, naming the posture, its reason, its source and the base tip.
 None of them reads or writes a delivery record or runs an obligation, and the
-outcome is the whole record: no record shape or run event kind is added. Which
+outcome is the whole record: no record shape or run event kind is added, and a
+current run's journal gets no completion, since `gate ok` there would read as a
+gate that passed. Which
 checks a repository runs under `focused` stays the repository's, and
 `resolveDeliveryPosture` from the kernel gives a script the same answer. `admit`,
 `check` and `prepare` behave the same under either posture.
@@ -192,9 +194,11 @@ code and reason, because there a repository declared something and it didn't tak
 `baseRef` is config, so the candidate supplies it and it is checked rather than
 trusted. It must name `origin/<branch>`, and `<branch>` must be the remote's
 default branch, read from `git ls-remote --symref origin HEAD` and, offline, from
-`refs/remotes/origin/HEAD`. Anything else is `posture_unreadable`, so a branch
-that publishes itself as its own `baseRef` gets nothing, and a plain `main` makes
-no network call.
+`refs/remotes/origin/HEAD`. `origin` must also be a configured remote, because
+without one git reads `origin` as a path, and a repository committed at `origin/`
+in the candidate's tree would answer for it. Anything else is
+`posture_unreadable`, so a branch that publishes itself as its own `baseRef` gets
+nothing, and a plain `main` makes no network call.
 
 Reading fetches into a private ref, `refs/delivery/posture/<branch>`, and never
 moves `refs/remotes/origin/<branch>`, so `verify`'s base movement is unaffected.

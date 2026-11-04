@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -78,7 +78,7 @@ async function fixture(options: { readonly baseRef?: string } = {}) {
     const code = await runCli(args, runtime);
     return { code, stdout: out.join(""), stderr: err.join("") };
   };
-  return { root, repo, seed, remote, sentinel, publish, git, cli, config,
+  return { root, repo, seed, remote, sentinel, publish, git, cli, config, runtime,
     tracking: () => git("rev-parse", "refs/remotes/origin/main"),
     /** The candidate-keyed path `verify` expects, as it reports it under `gate`. */
     recordPath: async () => {
@@ -91,24 +91,24 @@ async function fixture(options: { readonly baseRef?: string } = {}) {
 }
 
 /**
- * Every file a command could have written outside git's own bookkeeping. The run
- * store is named by the caller, because the suite's pin is shared with every
- * other test file running at the same time.
+ * Every file a command could have written outside git's own bookkeeping, with its
+ * bytes, so an append to a journal shows as well as a new file. The run store is
+ * named by the caller, because the suite's pin is shared with every other test
+ * file running at the same time.
  */
-async function filesWritten(f: Awaited<ReturnType<typeof fixture>>, runStore: string): Promise<readonly string[]> {
-  const stores = [f.repo, runStore];
-  const names: string[] = [];
-  for (const store of stores) {
+async function filesWritten(f: Awaited<ReturnType<typeof fixture>>, runStore: string): Promise<Readonly<Record<string, string>>> {
+  const written: Record<string, string> = {};
+  for (const store of [f.repo, runStore]) {
     if (!existsSync(store)) continue;
     for (const entry of await readdir(store, { recursive: true, withFileTypes: true })) {
       if (!entry.isFile()) continue;
       const full = path.join(entry.parentPath, entry.name);
       const relative = path.relative(f.repo, full);
-      if (/^\.git\/(objects|refs|logs|hooks|info|branches|packed-refs|FETCH_HEAD|HEAD|ORIG_HEAD|config|description|index)/.test(relative)) continue;
-      names.push(full);
+      if (/^\.git\/(objects|refs|logs|hooks|info|branches|packed-refs|HEAD|ORIG_HEAD|config|description|index)/.test(relative)) continue;
+      written[full] = await readFile(full, "base64");
     }
   }
-  return names.sort();
+  return written;
 }
 
 const expectFocused = (result: { code: number; stdout: string; stderr: string }, tip: string, reason = FOCUSED_REASON) => {
@@ -149,12 +149,63 @@ describe("base focused", () => {
 
     const tip = await f.publish(declaration("focused"));
     const before = await filesWritten(f, runStore);
-    expect(before.filter(file => file.startsWith(runStore))).not.toEqual([]);
+    expect(Object.keys(before).filter(file => file.startsWith(runStore))).not.toEqual([]);
     expectFocused(await f.cli(command), tip);
     expect(await readFile(recordPath, "utf8")).toBe("{ corrupt");
     expect(await filesWritten(f, runStore)).toEqual(before);
     expect(existsSync(f.sentinel)).toBe(false);
   });
+
+  it("the journal check is real: under gate the same commands append to the run", async () => {
+    const f = await fixture();
+    const runStore = path.join(f.root, "run-store");
+    process.env["DELIVERY_HARNESS_RUN_STORE"] = runStore;
+    expect((await f.cli("emit", "run.started", "--json", JSON.stringify({ host: "codex", workflow: { releaseId: "test", profile: "linear" } }))).code).toBe(0);
+    await f.publish(declaration("gate"));
+    const before = await filesWritten(f, runStore);
+    await f.cli("verify");
+    expect(await filesWritten(f, runStore)).not.toEqual(before);
+  });
+
+  it("gates, by the real command, on a bare repository in the candidate's tree when origin isn't configured", async () => {
+    const f = await fixture();
+    const inTree = path.join(f.root, "in-tree.git");
+    await f.git("clone", "-q", "--bare", f.remote, inTree);
+    const work = path.join(f.root, "in-tree-work");
+    await f.git("clone", "-q", inTree, work);
+    await f.git("-C", work, "config", "user.name", "Test"); await f.git("-C", work, "config", "user.email", "test@example.invalid");
+    await mkdir(path.join(work, ".agents"), { recursive: true });
+    await writeFile(path.join(work, DELIVERY_POSTURE_PATH), declaration("focused"));
+    await f.git("-C", work, "add", "-A"); await f.git("-C", work, "-c", "commit.gpgsign=false", "commit", "-qm", "self-declare");
+    await f.git("-C", work, "push", "-q", "origin", "HEAD:refs/heads/main");
+    await cp(inTree, path.join(f.repo, "origin"), { recursive: true });
+    await f.git("add", "-A", "-f", "origin"); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "a remote in the tree");
+    await f.git("remote", "remove", "origin");
+    for (const command of ["verify", "gate"]) {
+      const result = await f.cli(command);
+      expect(result.stdout).not.toContain("outcome: focused");
+      expect(result.code).toBe(1);
+    }
+  });
+
+  it("answers an interrupt during a hanging read with exit 130, killing what it started", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const bin = path.join(f.root, "shim"); await mkdir(bin);
+    const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase "$1" in\n  ls-remote) sleep 120 ;;\nesac\nexec "${real}" "$@"\n`);
+    await chmod(path.join(bin, "git"), 0o755);
+    const original = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${original}`;
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 300);
+      const started = Date.now();
+      const code = await runCli(["verify"], { ...f.runtime, signal: controller.signal });
+      expect(code).toBe(130);
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally { process.env["PATH"] = original; }
+  }, 30_000);
 
   it("the sentinel is real: the same obligation runs it under gate", async () => {
     const f = await fixture();
