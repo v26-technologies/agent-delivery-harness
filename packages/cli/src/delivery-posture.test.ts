@@ -4,14 +4,19 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createArtifactsPort, defineHarnessConfig, DELIVERY_POSTURE_PATH, resolveDeliveryPosture, type HarnessConfigInput } from "@agent-delivery-harness/kernel";
 import adopterConfig from "../../../harness.config.ts";
 import { runCli, type CliRuntime } from "./index.ts";
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
-afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
+let pinnedStore: string | undefined;
+beforeEach(() => { pinnedStore = process.env["DELIVERY_HARNESS_RUN_STORE"]; });
+afterEach(async () => {
+  process.env["DELIVERY_HARNESS_RUN_STORE"] = pinnedStore;
+  await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
+});
 
 const HONOURING = ["verify", "gate", "record", "resume"] as const;
 const FOCUSED_REASON = "The gate is still being optimized.";
@@ -85,9 +90,13 @@ async function fixture(options: { readonly baseRef?: string } = {}) {
   };
 }
 
-/** Every file a command could have written outside git's own bookkeeping. */
-async function filesWritten(f: Awaited<ReturnType<typeof fixture>>): Promise<readonly string[]> {
-  const stores = [f.repo, process.env["DELIVERY_HARNESS_RUN_STORE"]!];
+/**
+ * Every file a command could have written outside git's own bookkeeping. The run
+ * store is named by the caller, because the suite's pin is shared with every
+ * other test file running at the same time.
+ */
+async function filesWritten(f: Awaited<ReturnType<typeof fixture>>, runStore: string): Promise<readonly string[]> {
+  const stores = [f.repo, runStore];
   const names: string[] = [];
   for (const store of stores) {
     if (!existsSync(store)) continue;
@@ -126,6 +135,12 @@ describe("base focused", () => {
 
   it.each(HONOURING)("%s leaves a corrupt record alone, writes nothing and runs nothing", async (command) => {
     const f = await fixture();
+    // A store of this test's own, holding a real current run, so that "no new
+    // file in the run store" is a claim about a store that is in use.
+    const runStore = path.join(f.root, "run-store");
+    process.env["DELIVERY_HARNESS_RUN_STORE"] = runStore;
+    const started = await f.cli("emit", "run.started", "--json", JSON.stringify({ host: "codex", workflow: { releaseId: "test", profile: "linear" } }));
+    expect(started.code, started.stderr).toBe(0);
     const recordPath = await f.recordPath();
     await mkdir(path.dirname(recordPath), { recursive: true });
     await writeFile(recordPath, "{ corrupt");
@@ -133,10 +148,11 @@ describe("base focused", () => {
     expect((await f.cli("verify")).code).toBe(1);
 
     const tip = await f.publish(declaration("focused"));
-    const before = await filesWritten(f);
+    const before = await filesWritten(f, runStore);
+    expect(before.filter(file => file.startsWith(runStore))).not.toEqual([]);
     expectFocused(await f.cli(command), tip);
     expect(await readFile(recordPath, "utf8")).toBe("{ corrupt");
-    expect(await filesWritten(f)).toEqual(before);
+    expect(await filesWritten(f, runStore)).toEqual(before);
     expect(existsSync(f.sentinel)).toBe(false);
   });
 
