@@ -99,7 +99,8 @@ export type CandidateCommandRunner = (
  * dropped rather than a curated list, because the failure mode of missing one
  * is a capture that looks perfectly healthy and is about the wrong tree.
  *
- * Nothing here needs the network, so nothing valuable is lost with them.
+ * Nothing that uses this needs the network, so nothing valuable is lost with
+ * them. The posture reader's network calls keep what they need for themselves.
  */
 const GIT_ENVIRONMENT_PREFIX = "GIT_";
 
@@ -114,7 +115,7 @@ const GIT_ENVIRONMENT_OVERRIDES: Readonly<Record<string, string>> = {
   GIT_OPTIONAL_LOCKS: "0",
 };
 
-function scrubbedEnvironment(): Record<string, string> {
+export function scrubbedEnvironment(): Record<string, string> {
   const environment: Record<string, string> = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (name.startsWith(GIT_ENVIRONMENT_PREFIX) || value === undefined) continue;

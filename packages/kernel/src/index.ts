@@ -38,6 +38,21 @@ export * from "./blockers.ts";
 export * from "./config.ts";
 export { capturePhysicalSource } from "./physical-source.ts";
 
+// The posture a repository declares on its protected base. A repository that
+// chooses its own checks by posture calls this.
+export {
+  DELIVERY_POSTURE_FALLBACK_SOURCE,
+  DELIVERY_POSTURE_MAX_BYTES,
+  DELIVERY_POSTURE_NETWORK_TIMEOUT_MS,
+  DELIVERY_POSTURE_PATH,
+  DELIVERY_POSTURE_SCHEMA,
+  resolveDeliveryPosture,
+  type DeliveryPosture,
+  type DeliveryPostureCode,
+  type DeliveryPostureResult,
+  type ResolveDeliveryPostureInput,
+} from "./delivery-posture.ts";
+
 // The git-private evidence record store, and the fs-free shapes pure modules
 // read it through. The store owns the storage-dir resolver — records and
 // preparation receipts are two leaves of one workspace namespace.

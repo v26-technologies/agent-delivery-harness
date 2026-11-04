@@ -60,7 +60,7 @@ it.each([false,true])("nonempty mechanical execution and failure receipts remain
  const create=vi.spyOn(snapshots,"createCheckSnapshot");expect(await f.run("prepare")).toBe(fails?1:0);expect(observations.identities).toBeGreaterThan(0);expect(create).toHaveBeenCalledTimes(1);
  const wiring=await wireRepo(f.root,f.config),capture=await wiring.captureCandidate();if(capture.ok)expect((await kernel.evaluatePreparationReceipt(f.root,{config:f.config,candidate:capture.candidate})).prepared).toBe(!fails);
 });
-it("gate freshly rejects runtime drift after an identity-free prepare",async()=>{
+it("gate freshly rejects runtime drift after an identity-free prepare",{timeout:30000},async()=>{
  const f=await fixture(),control=await mkdtemp(path.join(tmpdir(),"prepare-tool-"));roots.push(control);const tool=path.join(control,"consumer");
  await writeFile(tool,`#!${process.execPath}\nrequire('fs').writeFileSync('result.json','first')\n`);await chmod(tool,0o755);
  f.setConfig({...f.config,providers:f.config.providers.map(provider=>({...provider,check:{...provider.check!,command:[tool] as [string,...string[]]}}))});

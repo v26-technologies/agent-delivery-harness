@@ -1128,6 +1128,7 @@ describe("waiver wiring", () => {
         }),
         artifacts,
         write: () => {},
+        writeError: () => {},
         classifyContext: () => classifyExecutionContext({ config, env: {}, stdinIsTTY: false, stdoutIsTTY: false }),
       },
       { allowPrompt: true, includeInjectedLiveResults: true },
@@ -1553,6 +1554,7 @@ describe("record refuses when the identity moves under it", () => {
       wire: async () => ({ ...wiring, captureCandidate: drifting }),
       artifacts,
       write: () => {},
+      writeError: () => {},
       classifyContext: () => classifyExecutionContext({ config, env: {}, stdinIsTTY: false, stdoutIsTTY: false }),
     });
 
