@@ -150,6 +150,61 @@ relaxed under any policy.
    policy, no blocked claim, every configured obligation covered, and no
    delivery-owned path in the candidate tree.
 
+## The declared posture
+
+A repository can declare that its deliveries run without this gate, in one file
+at the tip of its protected base, `.agents/delivery-posture.json`:
+
+```json
+{
+  "schemaVersion": "delivery-posture/1",
+  "posture": "focused",
+  "reason": "The gate is still being optimized."
+}
+```
+
+`schemaVersion`, `posture` (`gate` or `focused`) and a non-blank `reason` are
+required for either posture, and any other member is ignored. A candidate that
+changes the file gets nothing until the change is on the base, because config
+loads from the candidate's tree and this file doesn't.
+
+Under `focused`, `verify`, `gate`, `record` and `resume` each exit 0 with one
+outcome, `focused`, naming the posture, its reason, its source and the base tip.
+None of them reads or writes a delivery record or runs an obligation, and the
+outcome is the whole record: no record shape or run event kind is added. Which
+checks a repository runs under `focused` stays the repository's, and
+`resolveDeliveryPosture` from the kernel gives a script the same answer. `admit`,
+`check` and `prepare` behave the same under either posture.
+
+| What the base holds | Posture | Code |
+| --- | --- | --- |
+| A valid `focused` declaration | `focused` | none |
+| A valid `gate` declaration | `gate` | none |
+| No file at the tip | `gate` | `posture_undeclared` |
+| Not valid UTF-8 JSON, an object failing the shape above, or an unknown `posture` | `gate` | `posture_malformed` |
+| A symlink, tree or submodule at that path, or a blob over 64 KiB | `gate` | `posture_malformed` |
+| The base ref can't be resolved or read, or `git` fails or times out | `gate` | `posture_unreadable` |
+
+Under `gate`, each command's output and exit code are what they were before the
+file existed. Only `posture_malformed` adds to them, a line on stderr naming the
+code and reason, because there a repository declared something and it didn't take.
+
+`baseRef` is config, so the candidate supplies it and it is checked rather than
+trusted. It must name `origin/<branch>`, and `<branch>` must be the remote's
+default branch, read from `git ls-remote --symref origin HEAD` and, offline, from
+`refs/remotes/origin/HEAD`. Anything else is `posture_unreadable`, so a branch
+that publishes itself as its own `baseRef` gets nothing, and a plain `main` makes
+no network call.
+
+Reading fetches into a private ref, `refs/delivery/posture/<branch>`, and never
+moves `refs/remotes/origin/<branch>`, so `verify`'s base movement is unaffected.
+When that fetch fails, either ref can be the stale one, so `focused` needs the
+tracking ref and any private ref to both say so, and the base tip reported is the
+tracking ref's. Otherwise the result is the `gate` of the ref that said so, the
+tracking ref first. Each network call is bounded at 15 seconds.
+
+The hosted action calls the record check directly and doesn't read this file.
+
 ## Bounded retention of tracked records
 
 An adopter that creates several per-digest records for one delivery can opt in

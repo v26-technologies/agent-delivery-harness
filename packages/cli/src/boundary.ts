@@ -136,6 +136,8 @@ export interface CommandContext {
   }) => Promise<ProviderRailInvocationResult | undefined>;
   /** Emits one line of operator-facing output to stdout. */
   readonly write: (text: string) => void;
+  /** Emits one line of operator-facing output to stderr, leaving stdout as it is. */
+  readonly writeError: (text: string) => void;
   /** Classifies the execution context from this invocation's env + TTY. */
   classifyContext(): ExecutionContext;
 }
@@ -585,6 +587,7 @@ async function runConfiguredCommand(
         }
       },
       write: (text) => runtime.stdout(`${text}\n`),
+      writeError: (text) => runtime.stderr(`${text}\n`),
       classifyContext: () =>
         classifyExecutionContext({
           config,

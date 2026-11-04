@@ -483,6 +483,49 @@ describe("the composite admit command", () => {
     expect(JSON.parse(Buffer.from(portable.artifacts[outcomeEntry.path], "base64").toString("utf8"))).toEqual(outcome);
   });
 
+  it("still gates and records under a focused base, while the gate and record commands take the focused outcome", { timeout: 120000 }, async () => {
+    const harness = await makeHarness({}, true);
+    const scratch = await mkdtemp(path.join(os.tmpdir(), "dh-admit-focused-"));
+    cleanups.push(scratch);
+    const remote = path.join(scratch, "remote.git"), seed = path.join(scratch, "seed");
+    await mkdir(remote);
+    await git(remote, "init", "-q", "--bare", "-b", "main");
+    await mkdir(path.join(seed, ".agents"), { recursive: true });
+    await git(seed, "init", "-q", "-b", "main");
+    await git(seed, "config", "user.name", "Test");
+    await git(seed, "config", "user.email", "test@example.invalid");
+    await writeFile(path.join(seed, ".agents/delivery-posture.json"), `${JSON.stringify({ schemaVersion: "delivery-posture/1", posture: "focused", reason: "Tuning the gate." })}\n`);
+    await git(seed, "add", "-A");
+    await git(seed, "-c", "commit.gpgsign=false", "commit", "-qm", "focused");
+    await git(seed, "push", "-q", remote, "HEAD:refs/heads/main");
+    await git(harness.dir, "remote", "add", "origin", remote);
+
+    const gated = await harness.cli(["gate"]);
+    expect(gated.code, gated.err).toBe(EXIT_OK);
+    expect(gated.out).toContain("outcome: focused");
+
+    const prepared = await harness.cli(["prepare"]);
+    expect(prepared.code, prepared.err).toBe(EXIT_OK);
+    const reviewed = await harness.cli(["review-context", "--json"]);
+    expect(reviewed.code, reviewed.err).toBe(EXIT_OK);
+    const outcomePath = path.join(scratch, "outcome.json");
+    await writeFile(outcomePath, `${JSON.stringify({
+      spec: "review-outcome/1",
+      contextDigest: (JSON.parse(reviewed.out) as { digest: string }).digest,
+      verdict: "green",
+      reviewers: [{ id: "correctness", result: "approved" }],
+      findings: [],
+    }, null, 2)}\n`);
+
+    const admitted = await harness.cli(["admit", "--outcome", outcomePath]);
+    expect(admitted.code, admitted.err).toBe(EXIT_OK);
+    expect(admitted.out).toContain("gate: admitted");
+    expect(admitted.out).toContain("recorded telemetry/delivery-runs/record--");
+    expect(admitted.out).not.toContain("outcome: focused");
+    const names = (await readdir(path.join(harness.dir, "telemetry/delivery-runs"))).filter((name) => name.startsWith("record--"));
+    expect(names).toHaveLength(1);
+  });
+
   it("refuses an outcome for any other review context before evidence or a record is published", { timeout: 120000 }, async () => {
     const harness = await makeHarness({}, true);
     const scratch = await mkdtemp(path.join(os.tmpdir(), "dh-admit-mismatch-"));
