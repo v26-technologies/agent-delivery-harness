@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DELIVERY_POSTURE_NETWORK_TIMEOUT_MS,
   DELIVERY_POSTURE_PATH,
@@ -12,7 +12,8 @@ import {
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
-const originalPath = process.env["PATH"];
+let originalPath: string | undefined;
+beforeEach(() => { originalPath = process.env["PATH"]; });
 afterEach(async () => {
   process.env["PATH"] = originalPath;
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
