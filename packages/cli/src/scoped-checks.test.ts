@@ -1126,6 +1126,58 @@ it("an abort stops every worker and cleans up every pooled snapshot", async () =
     expect(observed.providers.map(p => p.attempts.at(-1)?.status)).toEqual(["interrupted", "passed", "interrupted"]);
   } finally { spy.mockRestore(); await Promise.all([...roots, ...clones].map(root => rm(root, { recursive: true, force: true }))); }
 }, 60000);
+/** Every process, read-only: a test proves a group is its own before anything signals it. */
+async function processTable() {
+  return (await exec("ps", ["-A", "-o", "pid=,pgid=,command="])).stdout.split("\n").map(line => line.trim().split(/\s+/)).filter(row => row.length > 2)
+    .map(row => ({ pid: Number(row[0]), pgid: Number(row[1]), command: row.slice(2).join(" ") }));
+}
+/**
+ * c1 fails once c2's grandchild is beating; c2 leads its own process group, starts that grandchild (tagged
+ * with a token unique to this test) and sleeps `sleepMs`; c3 is trivial and starts only when a worker frees.
+ */
+async function heartbeatFixture(concurrency: number, sleepMs: number, failFast?: boolean) {
+  const token = `scoped-failfast-heartbeat-${process.pid}-${Date.now()}`;
+  const f = await poolFixture(["1", "2", "3"], concurrency, (id, shared) => {
+    const beat = path.join(shared, "heartbeat"), leader = path.join(shared, "leader");
+    if (id === "c1") return `const fs=require('fs'),end=Date.now()+10000;while(!fs.existsSync(${JSON.stringify(`${beat}.pid`)})){if(Date.now()>end)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}` +
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);console.log('c1 broke');process.exit(3)`;
+    if (id === "c2") return `const fs=require('fs'),cp=require('child_process');fs.writeFileSync(${JSON.stringify(leader)},String(process.pid));` +
+      `cp.spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');fs.writeFileSync(${JSON.stringify(`${beat}.pid`)},String(process.pid));setInterval(()=>fs.appendFileSync(${JSON.stringify(beat)},'.'),25)`)},${JSON.stringify(token)}],{stdio:'ignore'}).unref();` +
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${sleepMs})`;
+    return "";
+  });
+  if (failFast !== undefined) f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } } as unknown as HarnessConfigInput);
+  const beats = async () => (await readFile(path.join(f.shared, "heartbeat"), "utf8").catch(() => "")).length;
+  const leader = async () => Number(await readFile(path.join(f.shared, "leader"), "utf8"));
+  /** Only a pid this test's grandchild wrote, still carrying this test's token, is ever signalled. */
+  const reap = async () => {
+    const pid = Number(await readFile(path.join(f.shared, "heartbeat.pid"), "utf8").catch(() => "0"));
+    if (pid > 0 && (await processTable()).some(row => row.pid === pid && row.command.includes(token))) process.kill(pid, "SIGKILL");
+  };
+  return { ...f, token, beats, leader, reap };
+}
+const lastStatuses = async (f: { dir: string; config: Parameters<typeof import("./index.ts")["readScopedCheckObservations"]>[0]["config"] }) => {
+  const { readScopedCheckObservations } = await import("./index.ts");
+  return (await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => [p.providerId, p.attempts.map(a => a.status)]);
+};
+it.each([undefined])("characterization: with failFast %s, gate runs every check to completion after the first failure", async failFast => {
+  const f = await heartbeatFixture(2, 1500, failFast);
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(await f.run("gate")).toBe(1);
+    const out = f.out.join("\n");
+    expect(out).toMatch(/failed check\.c1: check_command_failed/);
+    expect(out).toMatch(/passed check\.c2:/);
+    expect(out).toMatch(/passed check\.c3:/);
+    expect(out).not.toMatch(/interrupted/);
+    expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["passed"]], ["check.c3", ["passed"]]]);
+    // The sibling's grandchild kept beating for the sibling's whole run, then died with its group.
+    expect(await f.beats()).toBeGreaterThan(20);
+    const leader = await f.leader();
+    expect((await processTable()).filter(row => row.pgid === leader)).toEqual([]);
+    expect(f.err.join("\n").match(/check_command_failed/g)).toHaveLength(1);
+  } finally { await f.reap(); }
+}, 60000);
 it("records an unscoped declared check's evidence during gate alongside scoped providers", async () => {
   const f = await fixture(); f.env["FAIL"] = "0";
   const plain = { id: "check.plain", findingCodes: [], check: { command: [process.execPath, "-e", ""] as [string, ...string[]], timeoutMs: 5000 } };
