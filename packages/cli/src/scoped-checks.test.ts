@@ -1215,6 +1215,27 @@ it("with failFast, gate's first failure signals the running sibling's group and 
     expect(recorded["check.c3"]).toMatchObject({ availability: "available", phase: "snapshot-setup", failure: { code: "check_cancelled" }, command: { unavailable: "not-started" } });
   } finally { await f.reap(); }
 }, 240000);
+it("with failFast, a sibling still in its dependency setup when the failure lands stops before its command", async () => {
+  // c2's own setup holds until c1 has failed, so c1's failure always lands while c2 is in setup.
+  const f = await poolFixture(["1", "2"], 2, (id, shared) => id === "c1"
+    ? `const fs=require('fs'),end=Date.now()+90000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "c2-setup"))})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);fs.writeFileSync(${JSON.stringify(path.join(shared, "failed-at"))},'');process.exit(3)`
+    : "");
+  const setup = `const fs=require('fs'),end=Date.now()+90000;fs.writeFileSync(${JSON.stringify(path.join(f.shared, "c2-setup"))},'');` +
+    `while(!fs.existsSync(${JSON.stringify(path.join(f.shared, "failed-at"))})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500)`;
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true,
+    profiles: f.config.scopedExecution!.profiles.map(p => p.id === "pc2" ? { ...p, dependencies: { command: [process.execPath, "-e", setup] as [string, ...string[]], timeoutMs: 120000 } } : p) } } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n");
+  expect(out).toMatch(/failed check\.c1: check_command_failed/);
+  expect(out).toMatch(/interrupted check\.c2: check_cancelled; attempt/);
+  expect(out).not.toMatch(/checking check\.c2/);
+  expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["interrupted"]]]);
+  const { readScopedCheckDiagnostics, readScopedCheckObservations } = await import("./index.ts");
+  const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
+  const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.map(a => a.attemptId)) });
+  expect(diagnostics.providers.find(p => p.providerId === "check.c2")!.attempts[0]!.diagnostic).toMatchObject({ availability: "available", phase: "pre-command-verification", failure: { code: "check_cancelled" }, command: { unavailable: "not-started" } });
+}, 240000);
 it.each([undefined, true])("on a single worker with failFast %s, a failure leaves the rest to run or records them interrupted unstarted", async failFast => {
   const f = await poolFixture(["1", "1", "1"], 1, (id, shared) => id === "c1" ? `if(require('fs').existsSync(${JSON.stringify(path.join(shared, "fail"))}))process.exit(3)` : "");
   if (failFast !== undefined) f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } } as unknown as HarnessConfigInput);

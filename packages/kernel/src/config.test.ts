@@ -1171,6 +1171,11 @@ describe("scopedExecution.failFast, budgetMs and checkBudgetMs", () => {
       expect(offenders({ budgetMs: 10000, checkBudgetMs: 300 }, [300, 301, 299])).toEqual({ overCap: ["check.s2"], overBudget: [], totalMs: 900 });
     });
     it("counts scoped checks only, and refuses nothing with neither bound set", () => {
+      // An unscoped declared check beside a selection exactly at both bounds is no part of the selection.
+      const input = withScoped({ budgetMs: 900, checkBudgetMs: 300 }, [300, 300, 300]);
+      const unscoped = { id: "check.unscoped", findingCodes: [PROVIDER_CODE], check: { command: ["node", "-e", ""], timeoutMs: 5000 } };
+      const withUnscoped = { ...input, providers: [...input.providers, unscoped], obligations: [...input.obligations, { ...input.obligations.at(-1)!, id: "check.unscoped.passed", providers: [unscoped.id] }] };
+      expect(scopedBudgetOffenders(define(withUnscoped))).toEqual({ overCap: [], overBudget: [], totalMs: 900 });
       expect(offenders({}, [5000, 5000])).toEqual({ overCap: [], overBudget: [], totalMs: 10000 });
       expect(scopedBudgetOffenders(define(validInput()))).toEqual({ overCap: [], overBudget: [], totalMs: 0 });
     });
