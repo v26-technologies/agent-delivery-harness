@@ -5,7 +5,7 @@ import { CheckSnapshotError } from "./check-snapshot.ts";
 import { projectScopedAttempt } from "./scoped-observations.ts";
 
 const phases = ["snapshot-setup", "pre-command-verification", "command", "post-command-verification", "output-capture", "complete"] as const;
-const failureCodes = ["check_snapshot_interrupted", "check_snapshot_timeout", "check_snapshot_unavailable", "check_snapshot_escape", "check_snapshot_drift", "check_snapshot_cleanup_failed", "check_dependency_source_overlap", "check_dependency_failed", "check_command_failed", "check_output_missing", "check_attempt_superseded", "check_artifact_unavailable", "check_evidence_rejected"] as const;
+const failureCodes = ["check_snapshot_interrupted", "check_snapshot_timeout", "check_snapshot_unavailable", "check_snapshot_escape", "check_snapshot_drift", "check_snapshot_cleanup_failed", "check_dependency_source_overlap", "check_dependency_failed", "check_command_failed", "check_output_missing", "check_attempt_superseded", "check_artifact_unavailable", "check_evidence_rejected", "check_cancelled"] as const;
 const executionCodes = ["ENOENT", "EACCES", "EPERM", "ABORT_ERR", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "SIGKILL", "SIGTERM", "execution_failed"] as const;
 export type ScopedDiagnosticPhase = typeof phases[number];
 export type ScopedDiagnosticFailureCode = typeof failureCodes[number];

@@ -61,6 +61,8 @@ function oneAtATime() {
   return <T>(task: () => Promise<T>): Promise<T> => { const result = tail.then(task); tail = result.catch(() => undefined); return result; };
 }
 type AcquiredSetup = Omit<ScopedSetupDiagnostic, "verification" | "phases">;
+/** A fail-fast gate's hold on one check: the signal that cancels it, and the check whose failure did. */
+interface Cancellation { readonly signal: AbortSignal; readonly after: () => string }
 /** One worker's view while it runs a check: the snapshots only it uses, by setup key, and where its lines go. */
 interface Lane { readonly snapshots: Map<string, CheckSnapshot>; readonly write: (text: string) => void }
 export class ScopedChecks {
@@ -279,13 +281,32 @@ export class ScopedChecks {
     await this.pool(ids.slice(0, 1), satisfy);
     await this.pool(ids.slice(1), satisfy);
   }
-  /** Runs the gate's requested checks on the pool. A check's own failure is returned in request order and stops nothing. */
+  /**
+   * Runs the gate's requested checks on the pool. A check's own failure is returned in request order. Without
+   * `scopedExecution.failFast` it stops nothing; with it, the first failure cancels every other check: one not
+   * yet started never starts and one running has its process group signalled, and both are recorded
+   * `interrupted` with `check_cancelled` and left out of the returned failures.
+   */
   async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[]): Promise<CheckSnapshotError[]> {
     const failures = new Map<string, CheckSnapshotError>();
+    const failFast = this.context.config.scopedExecution?.failFast === true;
+    const running = new Map<string, AbortController>(), unstarted: string[] = [];
+    let firstFailure: string | undefined;
     const run = async (id: string, lane: Lane) => {
+      if (firstFailure !== undefined) { unstarted.push(id); return; }
       const request = requests.find(r => r.provider.id === id)!;
-      try { await this.execute(request.provider, request.obligationIds, false, lane); }
-      catch (error) { if (!(error instanceof CheckSnapshotError)) throw error; failures.set(id, error); }
+      const cancel = failFast ? new AbortController() : undefined;
+      if (cancel) running.set(id, cancel);
+      try { await this.execute(request.provider, request.obligationIds, false, lane, cancel && { signal: cancel.signal, after: () => firstFailure! }); }
+      catch (error) {
+        if (!(error instanceof CheckSnapshotError)) throw error;
+        if (error.code === "check_cancelled") return;
+        failures.set(id, error);
+        if (failFast && firstFailure === undefined) {
+          firstFailure = id;
+          for (const [other, controller] of running) if (other !== id) controller.abort();
+        }
+      } finally { running.delete(id); }
     };
     const resource = requests.find(r => this.acceptsApplicability(r.provider, r.obligationIds));
     if (resource) {
@@ -296,7 +317,17 @@ export class ScopedChecks {
       for (const id of serialIds) await run(id, this.serial);
       await this.pool(requests.map(r => r.provider.id).filter(id => !serialIds.includes(id)), run);
     } else await this.pool(requests.map(r => r.provider.id), run);
+    if (firstFailure !== undefined) await this.cancelUnstarted(unstarted, firstFailure);
     return requests.flatMap(r => failures.has(r.provider.id) ? [failures.get(r.provider.id)!] : []);
+  }
+  /** Records each check a fail-fast gate never started as `interrupted`, with `check_cancelled` and no command. */
+  async cancelUnstarted(ids: readonly string[], after: string): Promise<void> {
+    for (const id of ids) {
+      const attempt = this.owned.get(id) ?? await this.allocate(id), store = this.stores.get(id)!;
+      await store.finish(attempt, "interrupted", { outputs: [], durationMs: 0,
+        diagnostic: { availability: "available", phase: "snapshot-setup", failure: { code: "check_cancelled" }, command: { unavailable: "not-started" } }, log: "check_cancelled" });
+      this.context.write(`interrupted ${id}: check_cancelled before it started, after ${after} failed; attempt ${attempt.attemptId} retained at ${store.terminalPath(attempt)}`);
+    }
   }
   async submitMechanical(): Promise<void> { for (const submit of this.submissions) await submit(); this.submissions.length = 0; }
   /** One acquisition path preserves setup sharing, output ownership and worker isolation. A worker's tree
@@ -525,7 +556,8 @@ export class ScopedChecks {
     this.executionTails.set(lane.snapshots, running.catch(() => undefined));
     return running;
   }
-  execute(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission = false, lane: Lane = this.serial): Promise<void> {
+  /** `cancel` is a fail-fast gate's: once it aborts, the check stops and is recorded `interrupted` with `check_cancelled`. */
+  execute(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission = false, lane: Lane = this.serial, cancel?: Cancellation): Promise<void> {
     this.capturePhaseOpen = false;
     return this.onWorker(lane, async () => {
       if (!deferSubmission && this.acceptsApplicability(provider, obligationIds)) {
@@ -542,11 +574,14 @@ export class ScopedChecks {
         }
         if (applicable) { await this.publishInstalledDataApplicability(provider.id, obligationIds); return; }
       }
-      await this.executeInLane(provider, obligationIds, deferSubmission, lane);
+      await this.executeInLane(provider, obligationIds, deferSubmission, lane, cancel);
     });
   }
-  private async executeInLane(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission: boolean, lane: Lane): Promise<void> {
+  private async executeInLane(provider: ProviderRegistration, obligationIds: readonly string[], deferSubmission: boolean, lane: Lane, cancel?: Cancellation): Promise<void> {
     await this.closeCapturePhase();
+    // The command's own signal: the CLI's interruption, or this check's cancellation, whichever comes first.
+    const commandSignal = cancel ? AbortSignal.any([cancel.signal, ...(this.context.signal ? [this.context.signal] : [])]) : this.context.signal;
+    const cancelled = () => cancel?.signal.aborted === true && !this.context.signal?.aborted;
     const started = Date.now(), check = provider.check!, profile = this.context.config.scopedExecution!.profiles.find(p => p.id === check.scope!.profile)!;
     const attempt = this.owned.get(provider.id) ?? await this.allocate(provider.id);
     // Phases up to the command are this attempt's setup; the only verification among them is pre-command.
@@ -580,16 +615,20 @@ export class ScopedChecks {
       } else { await remove(); await snapshot.verify({ outputs: profile.mutableOutputs }); }
       settingUp = false;
       lane.write(`setup ${provider.id}: attempt ${attempt.attemptId}; ${setup.action} on a ${setup.snapshot} tree (clone ${setup.clone}), ${verification} verification; ${Date.now() - started}ms`);
+      // Setup is not this check's to cancel, as its snapshot outlives it on the worker; the command is.
+      if (cancelled()) throw new CheckSnapshotError("check_cancelled", `Declared scoped check ${provider.id} was cancelled before its command, after ${cancel!.after()} failed.`);
       const injected = Object.fromEntries(check.scope!.environment.filter(e => this.context.env[e.name] !== undefined).map(e => [e.name, this.context.env[e.name]!]));
       lane.write(`checking ${provider.id}: attempt ${attempt.attemptId}`);
       diagnostic = { ...diagnostic, phase: "command" };
       const commandHome = path.join(snapshot.commandRoot, attempt.attemptId, "home"), commandTemp = path.join(snapshot.commandRoot, attempt.attemptId, "tmp");
       await mkdir(commandHome, { recursive: true }); await mkdir(commandTemp, { recursive: true });
       diagnostic = { ...diagnostic, command: { unavailable: "not-completed" } };
-      const result = await createExecPort().run({ command: check.command[0], args: check.command.slice(1), cwd: path.join(snapshot.rootDir, check.scope!.cwd), env: { ...snapshot.environment, ...injected, HOME: commandHome, TMPDIR: commandTemp }, timeoutMs: check.timeoutMs, maxBuffer: 1024 * 1024, ...(this.context.signal ? { signal: this.context.signal } : {}) });
+      const result = await createExecPort().run({ command: check.command[0], args: check.command.slice(1), cwd: path.join(snapshot.rootDir, check.scope!.cwd), env: { ...snapshot.environment, ...injected, HOME: commandHome, TMPDIR: commandTemp }, timeoutMs: check.timeoutMs, maxBuffer: 1024 * 1024, ...(commandSignal ? { signal: commandSignal } : {}) });
       executionErrorCode = result.errorCode;
       diagnostic = { ...diagnostic, command: scopedCommandDiagnostic(result, secrets) };
       payload = { outputs: [], durationMs: Date.now() - started, log: redactScopedStreams(result, secrets).slice(-4000), dependencyDigest: snapshot.dependencyDigest };
+      // Only a command the cancellation actually stopped is cancelled; one that ended on its own keeps its result.
+      if (cancelled() && result.errorCode === "ABORT_ERR") throw new CheckSnapshotError("check_cancelled", `Declared scoped check ${provider.id} was cancelled, its process group signalled, after ${cancel!.after()} failed.`);
       if (result.code !== 0 || this.context.signal?.aborted) throw new CheckSnapshotError("check_command_failed", `Declared scoped check ${provider.id} did not complete successfully (exit ${result.code}).`);
       diagnostic = { ...diagnostic, phase: "post-command-verification" };
       await snapshot.verify({ outputs: profile.mutableOutputs });
@@ -631,7 +670,7 @@ export class ScopedChecks {
       if (deferSubmission) this.submissions.push(submit); else await submit();
       lane.write(`passed ${provider.id}: ${Date.now() - started}ms including snapshot setup; retained ${runId}`);
     } catch (error) {
-      const status = this.context.signal?.aborted ? "interrupted" : "failed";
+      const status = this.context.signal?.aborted || (error instanceof CheckSnapshotError && error.code === "check_cancelled") ? "interrupted" : "failed";
       if (!terminal) await store.finish(attempt, status, { ...payload, durationMs: Date.now() - started,
         diagnostic: { ...diagnostic, failure: scopedDiagnosticFailure(error, executionErrorCode) },
         ...(error instanceof CheckSnapshotError ? { log: `${payload.log ?? ""}\n${error.code}`.slice(-4000) } : {}) });

@@ -1,5 +1,6 @@
 import { ScopedChecks } from "../scoped-checks.ts";
 import { CheckSnapshotError } from "../check-snapshot.ts";
+import { refuseOverBudget } from "../scoped-budget.ts";
 /**
  * `prepare` — capture the candidate and publish its preparation receipt.
  *
@@ -36,6 +37,7 @@ export const prepareCommand: CommandDescriptor = {
       return { kind: "usage", message: USAGE };
     }
     if (context.config.providers.some(p => p.check?.scope) && !context.config.scopedExecution) throw new CheckSnapshotError("scoped_executor_required", "Scoped execution profiles are required before preparation commands may run.");
+    refuseOverBudget(context.config);
     let scoped: ScopedChecks | undefined;
     const refreshRecordNeutral = context.args[0] === "--refresh-record-neutral";
     const wiring = await context.wire();

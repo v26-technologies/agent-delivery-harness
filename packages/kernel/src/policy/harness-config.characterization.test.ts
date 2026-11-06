@@ -51,6 +51,15 @@ describe("characterization: the existing HarnessConfig loader", () => {
     expect(blockerCodes(verdict)).toContain("config_dangling_provider");
   });
 
+  it("keeps scopedExecution closed while admitting its optional failFast, budgetMs and checkBudgetMs", () => {
+    const scoped = { version: "scoped-execution/1", mechanicalProviders: [], profiles: [{ id: "p", dependencyInputs: [], mutableOutputs: [], credentialIdentities: {} }] };
+    const unset = validateHarnessConfig({ ...admissionFixture(), scopedExecution: scoped });
+    expect(unset.ok && Object.keys(unset.config.scopedExecution!).sort()).toEqual(["mechanicalProviders", "profiles", "version"]);
+    const set = validateHarnessConfig({ ...admissionFixture(), scopedExecution: { ...scoped, failFast: true, budgetMs: 900000, checkBudgetMs: 300000 } });
+    expect(set.ok && set.config.scopedExecution).toMatchObject({ failFast: true, budgetMs: 900000, checkBudgetMs: 300000 });
+    expect(blockerCodes(validateHarnessConfig({ ...admissionFixture(), scopedExecution: { ...scoped, budget: 900000 } }))).toContain("config_invalid_member");
+  });
+
   it("normalizes deterministically — the same input validates to deep-equal configs", () => {
     const first = validateHarnessConfig(admissionFixture());
     const second = validateHarnessConfig(admissionFixture());
