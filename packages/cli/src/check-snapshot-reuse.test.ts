@@ -112,6 +112,13 @@ it.each(["none", "full"] as const)("verifies a reused %s-Git tree from the index
         ? [["an untracked file listed in the repository's own exclude file", async () => { await appendFile(path.join(snapshot.rootDir, ".git/info/exclude"), "stray.txt\n"); await write(snapshot, "stray.txt", "x"); }, () => unlink(path.join(snapshot.rootDir, "stray.txt"))] as [string, () => Promise<void>, () => Promise<void>]]
         : [["Git metadata in a file-only tree", () => mkdir(path.join(snapshot.rootDir, ".git")), () => rm(path.join(snapshot.rootDir, ".git"), { recursive: true })] as [string, () => Promise<void>, () => Promise<void>]],
     ];
+    // A command can install an fsmonitor hook; verification must neither trust nor run it.
+    const marker = path.join(roots[0]!, ".git", `fsmonitor-ran-${gitContext}`), hook = path.join(roots[0]!, ".git", `fsmonitor-${gitContext}.sh`);
+    await writeFile(hook, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`); await chmod(hook, 0o755);
+    await snapshotGit(snapshot, gitContext, "config", "core.fsmonitor", hook);
+    await reused();
+    await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    await snapshotGit(snapshot, gitContext, "config", "--unset", "core.fsmonitor");
     for (const [name, change, restore] of refused) {
       await change();
       await expect(reused(), name).rejects.toMatchObject(drift);
@@ -137,11 +144,18 @@ it("verifies a reused finite tree by its full inventory", async () => {
 
 it.each(["none", "full"] as const)("a setup that writes the tree's own path into it makes the %s-Git tree unclonable", async gitContext => {
   const { root, headSha, treeSha } = await fixture();
-  const create = (script: string) => createCheckSnapshot({ rootDir: root, candidate: { headSha, treeSha, base: { ref: "origin/main", tipSha: headSha, mergeBaseSha: headSha } }, outputs: [], gitContext, environment: {},
+  const create = (script: string) => createCheckSnapshot({ rootDir: root, candidate: { headSha, treeSha, base: { ref: "origin/main", tipSha: headSha, mergeBaseSha: headSha } }, outputs: [], gitContext, environment: { CREATED_UNDER: tmpdir() },
     dependencies: { command: [process.execPath, "-e", `const fs=require('fs');fs.mkdirSync('node_modules/pkg',{recursive:true});${script}`], timeoutMs: 60000 } });
   const portable = await create("fs.writeFileSync('node_modules/pkg/index.js','relative')");
-  const bound = await create("fs.writeFileSync('node_modules/pkg/shebang','#!'+process.cwd()+'/node_modules/.bin/python')");
+  // Each spelling a setup could write: the resolved tree, the tree as created under the temporary
+  // directory (a symlink on macOS), and its home directory, which for Git-none is outside the tree.
+  const spellings = {
+    resolved: "process.cwd()",
+    created: "require('path').join(process.env.CREATED_UNDER,require('path').basename(process.cwd()))",
+    ...gitContext === "none" ? { home: "process.env.HOME" } : {},
+  };
+  const bound = await Promise.all(Object.values(spellings).map(spelling => create(`fs.writeFileSync('node_modules/pkg/shebang','#!'+${spelling}+'/bin/python')`)));
   try {
-    expect([portable.clonable, bound.clonable]).toEqual([true, false]);
-  } finally { await portable.cleanup(); await bound.cleanup(); }
+    expect([portable, ...bound].map(snapshot => snapshot.clonable)).toEqual([true, ...bound.map(() => false)]);
+  } finally { await portable.cleanup(); for (const snapshot of bound) await snapshot.cleanup(); }
 }, 120000);

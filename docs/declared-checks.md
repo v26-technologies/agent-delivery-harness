@@ -51,16 +51,16 @@ The same facts are printed as a `setup <check>: attempt <id>; …` line before `
 
 A tree this attempt built is verified by its full inventory before the command runs. A cloned or retained tree is verified from Git's index instead:
 
-Git always runs with an explicit Git directory and work tree, with `core.fileMode=true`, and with sparse checkout off, because a full-Git command can edit `.git/config`.
+Git always runs with an explicit Git directory and work tree, with `core.fileMode=true`, and with sparse checkout and fsmonitor off, because a full-Git command can edit `.git/config`.
 
-1. `git update-index --really-refresh` runs first.
+1. `git update-index --refresh` runs first.
 2. Every index entry must be a plain cached one: an assume-unchanged or skip-worktree flag would hide an edit.
 3. `git diff-files` must list nothing: no tracked file was edited, deleted or changed mode.
 4. Every path `git ls-files --others --directory` lists must be accounted for. The listing reads no exclude rules, because a command could write one. Each path must either have been left by the setup, or lie inside the running profile's `mutableOutputs`, or lie inside the outputs of a profile whose check already ran and passed in that tree.
 
 This happens before outputs are removed, so a write to another profile's output is refused, not silently erased. A write inside the running profile's own outputs stays in place for its command, so a profile's own cache (a `tsBuildInfo`, Vitest results) seeds its next run in that tree. After every command, the full inventory still runs. It is the only check that covers installed dependency bytes, links and special files inside outputs, and new content inside a directory the setup left untracked. A reused tree passed it after its last command. Finite snapshots have no Git, so they are always verified by their full inventory.
 
-The isolation is of files only. Host ports, the network and anything outside the temporary directory are shared, so serialize them in the adopter (Athena does this with `scripts/host-port-lock.ts`). A setup that writes absolute paths only outside its tree, such as into its home directory's caches, is not checked for them.
+The isolation is of files only. Host ports, the network and anything outside the temporary directory are shared, so serialize them in the adopter (Athena does this with `scripts/host-port-lock.ts`). The path check reads only the tree's immutable files, and only for the path's plain bytes. A path written elsewhere is not detected, and a later write through it is caught only as drift by a later clone's post-command inventory. That covers a path written into the home directory's caches, into a mutable output, or in another encoding (escaped JSON, UTF-16).
 
 `prepare` runs the first declared of the `mechanicalProviders` first, because that is where a selection guard that must precede every other check belongs. It runs the rest cheapest first. A check's cost is the duration of its most recent passed or failed attempt, less the dependency setup that attempt itself ran. Checks never timed run after timed ones, and ties keep declaration order, so a first `prepare` follows declaration order. Checks then run one dependency setup at a time, in the order each setup first appears in that sequence, so each setup installs once. The first failure stops preparation: no later check starts, checks already running finish, and no receipt is published. The first declared check finishes before any other starts, whatever the concurrency.
 

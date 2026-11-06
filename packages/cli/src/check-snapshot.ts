@@ -236,11 +236,12 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
       clonable = !installed.selfReferenced;
     }
     // Explicit directories and settings: a full-Git command can edit .git/config, and core.worktree,
-    // core.fileMode=false or a sparse checkout would otherwise hide changes from verification.
+    // core.fileMode=false, a sparse checkout or an fsmonitor hook would otherwise hide changes from
+    // verification (and the hook would run inside it).
     const treeGit = (tree: PrivateTree, deadline: number, accepted: readonly number[] = [0], limit?: number) => {
       const gitDir = tree.privateControl ? path.join(tree.privateControl, "repository") : path.join(tree.rootDir, ".git");
       return async (...args: string[]) => {
-        const result = await snapshotProcess("git", [`--git-dir=${gitDir}`, `--work-tree=${tree.rootDir}`, "-c", "core.fileMode=true", "-c", "core.sparseCheckout=false", "-c", "core.symlinks=true", ...args], tree.rootDir, cleanEnv, deadline, input.signal, limit);
+        const result = await snapshotProcess("git", [`--git-dir=${gitDir}`, `--work-tree=${tree.rootDir}`, "-c", "core.fileMode=true", "-c", "core.sparseCheckout=false", "-c", "core.symlinks=true", "-c", "core.fsmonitor=false", ...args], tree.rootDir, cleanEnv, deadline, input.signal, limit);
         if (!accepted.includes(result.code ?? -1)) throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git identity could not be read.");
         return result.stdout;
       };
@@ -264,10 +265,10 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
           // the next one it must still match the index: no tracked edit, and no
           // untracked entry the setup did not leave outside the allowed outputs.
           const allowed = options.unchanged.allowed;
-          // A clone has new inodes, so the refresh rehashes, ignoring assume-unchanged; 1 means a tracked
-          // file differs, which diff-files names. Every entry must be a plain cached one ("H"): an
-          // assume-unchanged (lowercase) or skip-worktree ("S") flag would hide an edit from diff-files.
-          await treeGit(tree, deadline, [0, 1])("update-index", "-q", "--really-refresh");
+          // A clone has new inodes, so the refresh rehashes; 1 means a tracked file differs, which
+          // diff-files names. Every entry must be a plain cached one ("H"): an assume-unchanged
+          // (lowercase) or skip-worktree ("S") flag would hide an edit from both.
+          await treeGit(tree, deadline, [0, 1])("update-index", "-q", "--refresh");
           if (nulSeparated(await treeGit(tree, deadline, [0], 128 * 1024 * 1024)("ls-files", "-v", "-z")).some(entry => !entry.startsWith("H ")))
             throw new CheckSnapshotError("check_snapshot_drift", "A reused snapshot's index hides a tracked path.");
           if (input.gitContext === "none" && await lstat(path.join(tree.rootDir, ".git")).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git absence could not be read."))))
