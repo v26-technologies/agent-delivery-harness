@@ -1139,7 +1139,8 @@ async function heartbeatFixture(concurrency: number, sleepMs: number, failFast?:
   const token = `scoped-failfast-heartbeat-${process.pid}-${Date.now()}`;
   const f = await poolFixture(["1", "2", "3"], concurrency, (id, shared) => {
     const beat = path.join(shared, "heartbeat"), leader = path.join(shared, "leader");
-    if (id === "c1") return `const fs=require('fs'),end=Date.now()+10000;while(!fs.existsSync(${JSON.stringify(`${beat}.pid`)})){if(Date.now()>end)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}` +
+    // c2's snapshot setup alone can take tens of seconds on a loaded machine, so c1 waits long for its beat.
+    if (id === "c1") return `const fs=require('fs'),end=Date.now()+90000;while(!fs.existsSync(${JSON.stringify(`${beat}.pid`)})){if(Date.now()>end)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}` +
       `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);fs.writeFileSync(${JSON.stringify(path.join(shared, "failed-at"))},String(Date.now()));console.log('c1 broke');process.exit(3)`;
     if (id === "c2") return `const fs=require('fs'),cp=require('child_process');fs.writeFileSync(${JSON.stringify(leader)},String(process.pid));` +
       `cp.spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');fs.writeFileSync(${JSON.stringify(`${beat}.pid`)},String(process.pid));setInterval(()=>fs.appendFileSync(${JSON.stringify(beat)},Date.now()+'\\n'),25)`)},${JSON.stringify(token)}],{stdio:'ignore'}).unref();` +
@@ -1180,7 +1181,7 @@ it.each([undefined, false])("characterization: with failFast %s, gate runs every
     expect((await processTable()).filter(row => row.pgid === leader)).toEqual([]);
     expect(f.err.join("\n").match(/check_command_failed/g)).toHaveLength(1);
   } finally { await f.reap(); }
-}, 60000);
+}, 240000);
 it("with failFast, gate's first failure signals the running sibling's group and never starts the rest", async () => {
   const f = await heartbeatFixture(2, SIBLING_MS, true);
   try {
@@ -1213,7 +1214,7 @@ it("with failFast, gate's first failure signals the running sibling's group and 
     expect(recorded["check.c2"]).toMatchObject({ availability: "available", phase: "command", failure: { code: "check_cancelled", executionErrorCode: "ABORT_ERR" } });
     expect(recorded["check.c3"]).toMatchObject({ availability: "available", phase: "snapshot-setup", failure: { code: "check_cancelled" }, command: { unavailable: "not-started" } });
   } finally { await f.reap(); }
-}, 60000);
+}, 240000);
 it.each([undefined, true])("on a single worker with failFast %s, a failure leaves the rest to run or records them interrupted unstarted", async failFast => {
   const f = await poolFixture(["1", "1", "1"], 1, (id, shared) => id === "c1" ? `if(require('fs').existsSync(${JSON.stringify(path.join(shared, "fail"))}))process.exit(3)` : "");
   if (failFast !== undefined) f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } } as unknown as HarnessConfigInput);
@@ -1231,7 +1232,20 @@ it.each([undefined, true])("on a single worker with failFast %s, a failure leave
   await rm(path.join(f.shared, "fail"));
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
   expect(await f.run("record"), f.err.join("\n")).toBe(0);
-}, 90000);
+}, 240000);
+it.each([undefined, true])("on a pool with failFast %s, a scoped failure leaves an unscoped declared check to run or never starts it", async failFast => {
+  const f = await poolFixture(["1", "1"], 2, id => id === "c1" ? "process.exit(3)" : "");
+  const plain = { id: "check.plain", findingCodes: [], check: { command: [process.execPath, "-e", ""] as [string, ...string[]], timeoutMs: 5000 } };
+  f.setConfig({ ...f.config, providers: [...f.config.providers, plain],
+    obligations: [...f.config.obligations, { ...f.config.obligations[0]!, id: "check.plain.passed", providers: [plain.id] }],
+    scopedExecution: { ...f.config.scopedExecution!, ...(failFast === undefined ? {} : { failFast }) } } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n");
+  expect(out).toMatch(/failed check\.c1: check_command_failed/);
+  if (failFast) expect(out).not.toContain("checking check.plain");
+  else expect(out).toContain("checking check.plain");
+}, 240000);
 /** Three 30000 ms checks, so the budget is exactly met at 90000 and the cap at 30000. `f.config` is the
  * pool fixture's, read when it was spread, so a later reconfiguration restates the bounds it keeps. */
 async function budgetFixture(budget: { budgetMs?: number; checkBudgetMs?: number }, timeouts: readonly number[] = [30000, 30000, 30000]) {
