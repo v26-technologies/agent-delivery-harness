@@ -46,9 +46,10 @@ export interface CheckSnapshot {
 /** A materialized tree: the work tree, the Git-none control directory, and the directories cleanup removes. */
 interface PrivateTree { readonly rootDir: string; readonly privateControl?: string; readonly owned: readonly string[] }
 const nulSeparated = (text: string) => text.split("\0").filter(Boolean);
-/** A listed path lies in a declared output: a file output exactly, a directory output (trailing slash) at or below it. */
+/** A listed path (a directory ends in a slash) lies at or below a declared output. As in the
+ * inventory, an output without a trailing slash that is a directory covers what is inside it. */
 function withinOutputs(entry: string, outputs: readonly string[]): boolean {
-  return outputs.some(output => output.endsWith("/") ? entry === output || entry.startsWith(output) : entry === output);
+  return outputs.some(output => { const root = output.replace(/\/$/, ""); return entry === root || entry.startsWith(`${root}/`); });
 }
 function phaseMeter(onPhase?: (phase: SnapshotPhase, durationMs: number) => void) {
   return async <T>(phase: SnapshotPhase, operation: () => Promise<T>): Promise<T> => {

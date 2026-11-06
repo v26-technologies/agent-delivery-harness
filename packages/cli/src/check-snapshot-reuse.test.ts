@@ -70,8 +70,9 @@ it.runIf(method).each(["none", "full"] as const)("two concurrent clones of one w
 it.each(["none", "full"] as const)("verifies a reused %s-Git tree from the index: allowed outputs stay, every other change is refused", async gitContext => {
   const f = await fixture();
   // "other.json" is a sibling profile's output in the same setup; the running profile owns out/ and one cache file.
-  const snapshot = await f.snapshot(gitContext, ["out/", "cache/tsbuildinfo", "other.json"]);
-  const allowed = ["out/", "cache/tsbuildinfo"];
+  const snapshot = await f.snapshot(gitContext, ["out/", "cache/tsbuildinfo", "build", "other.json"]);
+  // "build" has no trailing slash but is a directory; as in the inventory, it covers what is inside it.
+  const allowed = ["out/", "cache/tsbuildinfo", "build"];
   const reused = () => snapshot.verify({ outputs: allowed, unchanged: { allowed } });
   try {
     expect(snapshot.reusedVerification).toBe("index");
@@ -80,13 +81,14 @@ it.each(["none", "full"] as const)("verifies a reused %s-Git tree from the index
     // No inventory worker: the index path never hashes the tree.
     expect(spawned.commands.filter(row => row.args.includes("--eval"))).toHaveLength(0);
     // Allowed: writes inside the running profile's outputs, including a file output inside an untracked directory.
-    await write(snapshot, "out/nested/result.json", "{}"); await write(snapshot, "cache/tsbuildinfo", "warm");
+    await write(snapshot, "out/nested/result.json", "{}"); await write(snapshot, "cache/tsbuildinfo", "warm"); await write(snapshot, "build/bundle.js", "bundle");
     await reused();
     expect(await readFile(path.join(snapshot.rootDir, "cache/tsbuildinfo"), "utf8")).toBe("warm");
     expect(await readFile(path.join(snapshot.rootDir, "out/nested/result.json"), "utf8")).toBe("{}");
     const refused: Array<[string, () => Promise<void>, () => Promise<void>]> = [
       ["a new untracked file no profile declares", () => write(snapshot, "stray.txt", "x"), () => unlink(path.join(snapshot.rootDir, "stray.txt"))],
       ["a new file beside an allowed output in its directory", () => write(snapshot, "cache/other", "x"), () => unlink(path.join(snapshot.rootDir, "cache/other"))],
+      ["a path that only shares an allowed output's prefix", () => write(snapshot, "build-extra/x", "x"), () => rm(path.join(snapshot.rootDir, "build-extra"), { recursive: true })],
       ["a write to another profile's output", () => write(snapshot, "other.json", "{}"), () => unlink(path.join(snapshot.rootDir, "other.json"))],
       ["an unstaged edit to a tracked file", () => writeFile(path.join(snapshot.rootDir, "src/source.txt"), "edited"), () => writeFile(path.join(snapshot.rootDir, "src/source.txt"), "source")],
       ["a tracked file's mode change", () => chmod(path.join(snapshot.rootDir, "src/source.txt"), 0o755), () => chmod(path.join(snapshot.rootDir, "src/source.txt"), 0o644)],
