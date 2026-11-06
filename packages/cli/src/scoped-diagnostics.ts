@@ -22,12 +22,13 @@ const setupPhases = ["materialization", "baseline-inventory", "dependencies", "p
 /** How this attempt got the tree its command ran in, and what that cost up to the command.
  * `executed`: this attempt ran the setup (a tree it built, or the warm base it then cloned);
  * `reused`: the setup had already run (a clone of a warm base another check built, or the
- * worker's tree retained from its previous check). `clone` names the copy-on-write method, or
- * says it is unavailable here (each worker then builds its own) or not used (one worker). */
+ * worker's tree retained from its previous check). `clone` names the copy-on-write method, or says
+ * why each worker built its own tree: cloning is unavailable here, or the setup wrote its own path
+ * into the tree (`path-bound`), or there is one worker (`not-used`). */
 export interface ScopedSetupDiagnostic {
   readonly action: "executed" | "reused";
   readonly snapshot: "built" | "cloned" | "retained";
-  readonly clone: "clonefile" | "reflink" | "unavailable" | "not-used";
+  readonly clone: "clonefile" | "reflink" | "unavailable" | "path-bound" | "not-used";
   /** `index`: Git's index and untracked listing; `inventory`: every immutable byte hashed. */
   readonly verification: "index" | "inventory";
   readonly phases: readonly { readonly phase: typeof setupPhases[number]; readonly durationMs: number }[];
@@ -40,7 +41,7 @@ export interface RecordedScopedAttemptDiagnostic {
   readonly command: ScopedDiagnosticCommand;
   /** Present only when this attempt actually ran dependency setup; never borrowed from a reused snapshot. */
   readonly dependency?: ScopedDependencyDiagnostic;
-  /** Present once this attempt had a tree; absent on attempts recorded before setup was measured. */
+  /** Present once this attempt began getting its tree, so a failed setup keeps its phases; absent on attempts recorded before setup was measured. */
   readonly setup?: ScopedSetupDiagnostic;
 }
 export type ScopedAttemptDiagnostic = RecordedScopedAttemptDiagnostic
@@ -161,7 +162,7 @@ function projectDiagnostic(value: unknown): RecordedScopedAttemptDiagnostic {
     const phasesValue = value["phases"];
     if (!Array.isArray(phasesValue) || phasesValue.length > 16) return corrupt();
     setup = { action: one("action", ["executed", "reused"]), snapshot: one("snapshot", ["built", "cloned", "retained"]),
-      clone: one("clone", ["clonefile", "reflink", "unavailable", "not-used"]), verification: one("verification", ["index", "inventory"]),
+      clone: one("clone", ["clonefile", "reflink", "unavailable", "path-bound", "not-used"]), verification: one("verification", ["index", "inventory"]),
       phases: phasesValue.map(entry => {
         const phase = object(entry);
         if (!(setupPhases as readonly unknown[]).includes(phase["phase"]) || typeof phase["durationMs"] !== "number" || !Number.isSafeInteger(phase["durationMs"]) || phase["durationMs"] < 0) return corrupt();

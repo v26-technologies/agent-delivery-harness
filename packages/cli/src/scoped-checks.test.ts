@@ -1077,7 +1077,8 @@ it("failures, diagnostics, retained attempts, reuse and evidence under concurren
       expect(lines[next], lines.join("\n")).toMatch(new RegExp(`^(passed|failed) ${provider}:`));
     }
     // Setup counts differ with worker reuse; phase values are checked by the dedicated forwarding rows.
-    const out = f.out.filter(line => !line.startsWith("snapshot ")).map(line => normalized(f, line));
+    // So do how each check got its tree and what that cost; the dedicated setup rows pin those.
+    const out = f.out.filter(line => !line.startsWith("snapshot ") && !line.startsWith("setup ")).map(line => normalized(f, line));
     const failedGate = { out: [...out].sort(), err: f.err.map(line => normalized(f, line)) };
     const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
     const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.map(a => a.attemptId)) });
@@ -1086,7 +1087,7 @@ it("failures, diagnostics, retained attempts, reuse and evidence under concurren
         command: "unavailable" in a.diagnostic.command ? a.diagnostic.command : { exitCode: a.diagnostic.command.exitCode, outputTail: a.diagnostic.command.outputTail } } : a.diagnostic })) }));
     await rm(path.join(f.shared, "fail"));
     expect(await f.run("gate"), f.err.join("\n")).toBe(0);
-    const passedGate = f.out.filter(line => !line.startsWith("snapshot ")).map(line => normalized(f, line)).sort();
+    const passedGate = f.out.filter(line => !line.startsWith("snapshot ") && !line.startsWith("setup ")).map(line => normalized(f, line)).sort();
     expect(await f.run("record"), f.err.join("\n")).toBe(0);
     await f.git("add", ".");
     expect(await f.run("verify"), f.err.join("\n")).toBe(0);
@@ -1408,10 +1409,15 @@ it.each([{ planted: "own", name: "keeps a write in the running profile's own out
   let plant: ((root: string) => Promise<void>) | undefined = planted === "own"
     ? async root => { await mkdir(path.join(root, "cache-c"), { recursive: true }); await writeFile(path.join(root, "cache-c/seed"), "warm"); }
     : async root => { await writeFile(path.join(root, "result-d.json"), "stray"); };
-  // Plant just before the first verification of a reused tree, which is c's.
+  // Plant right after a's post-command verification (the tree's second full one), so the write is
+  // already there when c takes the tree, before its outputs are removed.
   const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
     const snapshot = await create(input);
-    return { ...snapshot, verify: async options => { if (options?.unchanged && plant) { await plant(snapshot.rootDir); plant = undefined; } return snapshot.verify(options); } };
+    let full = 0;
+    return { ...snapshot, verify: async options => {
+      await snapshot.verify(options);
+      if (!options?.unchanged && ++full === 2 && plant) { await plant(snapshot.rootDir); plant = undefined; }
+    } };
   });
   try {
     if (planted === "own") {
@@ -1428,10 +1434,13 @@ it.each([{ planted: "own", name: "keeps a write in the running profile's own out
     expect(c).toMatchObject({ phase: "pre-command-verification", failure: { code: "check_snapshot_drift" }, command: { unavailable: "not-started" }, setup: { action: "reused", snapshot: "retained", verification: "index" } });
   } finally { spy.mockRestore(); }
 }, 90000);
-it("a dependency-input change invalidates the warm base, which rebuilds once", async () => {
-  const f = await poolFixture(["1", "1"], 2, (_, shared) => barrier(shared, 2));
+it("a dependency-input change invalidates the warm base, which rebuilds once from the changed input", async () => {
+  // Warm bases live for one invocation; what this pins is that each gate builds one, from its own
+  // candidate's inputs: every check reads the installed copy of the lock and needs it current.
+  const f = await poolFixture(["1", "1"], 2, (_, shared) => `${barrier(shared, 2)};if(fs.readFileSync('node_modules/lock.txt','utf8')!==fs.readFileSync('deps.lock','utf8'))process.exit(9)`);
   const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
-  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, dependencyInputs: ["deps.lock"] })) } });
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, dependencyInputs: ["deps.lock"],
+    dependencies: { ...p.dependencies!, command: [process.execPath, "-e", `${p.dependencies!.command[2]};require('fs').mkdirSync('node_modules',{recursive:true});require('fs').copyFileSync('deps.lock','node_modules/lock.txt')`] as [string, ...string[]], timeoutMs: 60000 } })) } });
   await writeFile(path.join(f.dir, "deps.lock"), "one"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "lock");
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
@@ -1443,3 +1452,32 @@ it("a dependency-input change invalidates the warm base, which rebuilds once", a
   expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
   expect(await f.installs("1")).toBe(2 * perGate);
 }, 120000);
+
+it("a setup that writes its own path into the tree is not shared, and each worker builds its own", async () => {
+  const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
+  const f = await poolFixture(["1", "1"], 2, (_, shared) => barrier(shared, 2));
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p,
+    dependencies: { command: [process.execPath, "-e", `${p.dependencies!.command[2]};const fs=require('fs');fs.mkdirSync('node_modules/.bin',{recursive:true});fs.writeFileSync('node_modules/.bin/tool','#!'+process.cwd()+'/node_modules/.venv/bin/python')`] as [string, ...string[]], timeoutMs: 60000 } })) } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  expect(await f.installs("1")).toBe(2);
+  expect((await latestSetups(f)).map(d => { const { phases: _, ...setup } = d!.setup!; return setup; })).toEqual([0, 1].map(() => ({ action: "executed", snapshot: "built", clone: method ? "path-bound" : "unavailable", verification: "inventory" })));
+}, 90000);
+it("a worker waiting on a warm base whose setup failed sets up again itself", async () => {
+  const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
+  const f = await poolFixture(["1", "1"], 2, () => "");
+  const once = JSON.stringify(path.join(f.shared, "failed-once"));
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p,
+    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');if(!fs.existsSync(${once})){fs.writeFileSync(${once},'');process.exit(3)}${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n");
+  // One check's setup failed; the other, whichever worker it was on, set up and passed.
+  expect(out.match(/(passed|failed) check\.c\d/g)?.map(line => line.split(" ")[0]).sort()).toEqual(["failed", "passed"]);
+  expect(await f.installs("1")).toBe(1);
+  const setups = await latestSetups(f);
+  const failed = setups.find(d => d!.failure && "code" in d!.failure)!;
+  expect(failed).toMatchObject({ phase: "snapshot-setup", failure: { code: "check_dependency_failed" }, dependency: { command: { exitCode: 3 } }, setup: { action: "executed" } });
+  expect(failed.setup!.phases.map(p => p.phase)).toContain("dependencies");
+  if (method) expect(out).toContain("shared setup failed (check_dependency_failed); setting up again");
+}, 90000);

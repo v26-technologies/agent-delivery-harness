@@ -34,27 +34,33 @@ A check that declares a `scope` runs in a private snapshot of the prepared tree 
 
 ### Snapshot setup and reuse
 
-With more than one worker, a setup runs once per invocation, not once per worker. The first check that needs a setup builds a warm base for it, and no command ever runs in that base. Every worker, including that first one, takes a copy-on-write clone of the base: `clonefile(2)` on macOS (APFS), a reflink copy (`cp --reflink=always`) on Linux. Each clone is private, so a write in one clone reaches neither the base nor any other clone. Where the temporary directory supports neither method, each worker builds its own tree as before, and the record says so.
+With more than one worker, a setup runs once per invocation, not once per worker. The first check that needs a setup builds a warm base for it: the dependency setup runs there, and no check command ever does. Every worker, including that first one, takes a copy-on-write clone of the base: `clonefile(2)` on macOS (APFS), a reflink copy (`cp --reflink=always`) on Linux. Each clone is private, so a write in one clone reaches neither the base nor any other clone. Each worker builds its own tree as before, and the record says why, in two cases:
+
+- The temporary directory supports neither cloning method.
+- The setup wrote the tree's own absolute path into one of its files. A Python virtual environment's scripts are one example. A clone would still read and write the base through that path. The inventory that hashes the installed tree finds such files.
 
 Each attempt's retained diagnostic carries `setup`:
 
 - `action`: `executed` when this attempt ran the setup, or `reused` when it did not.
 - `snapshot`: `built`, `cloned` or `retained` (the worker's tree from its previous check).
-- `clone`: `clonefile`, `reflink`, `unavailable` or `not-used` (one worker).
+- `clone`: `clonefile`, `reflink`, `unavailable`, `path-bound` or `not-used` (one worker).
 - `verification`: what was checked before the command.
-- The timed `phases` up to the command. These are the build phases, `warm-base-wait`, `clone` and `pre-command-verification`.
+- The timed `phases` up to the command. These are the build phases, `warm-base-wait`, `clone` and `pre-command-verification`. They are kept even when the setup fails.
 
 The same facts are printed as a `setup <check>: attempt <id>; …` line before `checking`.
 
 A tree this attempt built is verified by its full inventory before the command runs. A cloned or retained tree is verified from Git's index instead:
 
-1. `git update-index --refresh` runs first.
-2. `git diff-files` must list nothing: no tracked file was edited, deleted or changed mode.
-3. Every path `git ls-files --others --directory` lists must be accounted for. The listing reads no exclude rules, because a command could write one. Each path must either have been left by the setup, or lie inside the running profile's `mutableOutputs`, or lie inside the outputs of a profile whose check already ran and passed in that tree.
+Git always runs with an explicit Git directory and work tree, with `core.fileMode=true`, and with sparse checkout off, because a full-Git command can edit `.git/config`.
 
-This happens before outputs are removed, so a write to another profile's output is refused, not silently erased. A write inside the running profile's own outputs stays in place for its command, so a profile's own cache (a `tsBuildInfo`, Vitest results) seeds its next run in that tree. After every command, the full inventory still runs, and it is the only check that covers installed dependency bytes. Finite snapshots have no Git, so they are always verified by their full inventory.
+1. `git update-index --really-refresh` runs first.
+2. Every index entry must be a plain cached one: an assume-unchanged or skip-worktree flag would hide an edit.
+3. `git diff-files` must list nothing: no tracked file was edited, deleted or changed mode.
+4. Every path `git ls-files --others --directory` lists must be accounted for. The listing reads no exclude rules, because a command could write one. Each path must either have been left by the setup, or lie inside the running profile's `mutableOutputs`, or lie inside the outputs of a profile whose check already ran and passed in that tree.
 
-The isolation is of files only. Host ports, the network and anything outside the temporary directory are shared, so serialize them in the adopter (Athena does this with `scripts/host-port-lock.ts`). Absolute paths that a setup writes into its own tree point every clone back at the base; a Python virtual environment's script shebangs are one example. A write through such a path changes the base. Later clones then fail their post-command verification as drift; they never silently see the write.
+This happens before outputs are removed, so a write to another profile's output is refused, not silently erased. A write inside the running profile's own outputs stays in place for its command, so a profile's own cache (a `tsBuildInfo`, Vitest results) seeds its next run in that tree. After every command, the full inventory still runs. It is the only check that covers installed dependency bytes, links and special files inside outputs, and new content inside a directory the setup left untracked. A reused tree passed it after its last command. Finite snapshots have no Git, so they are always verified by their full inventory.
+
+The isolation is of files only. Host ports, the network and anything outside the temporary directory are shared, so serialize them in the adopter (Athena does this with `scripts/host-port-lock.ts`). A setup that writes absolute paths only outside its tree, such as into its home directory's caches, is not checked for them.
 
 `prepare` runs the first declared of the `mechanicalProviders` first, because that is where a selection guard that must precede every other check belongs. It runs the rest cheapest first. A check's cost is the duration of its most recent passed or failed attempt, less the dependency setup that attempt itself ran. Checks never timed run after timed ones, and ties keep declaration order, so a first `prepare` follows declaration order. Checks then run one dependency setup at a time, in the order each setup first appears in that sequence, so each setup installs once. The first failure stops preparation: no later check starts, checks already running finish, and no receipt is published. The first declared check finishes before any other starts, whatever the concurrency.
 

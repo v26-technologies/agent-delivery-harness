@@ -33,6 +33,9 @@ export interface CheckSnapshot {
   readonly rootDir: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly dependencyDigest: string;
+  /** False when the setup wrote this tree's own absolute path into one of its files: a clone would
+   * still read and write this tree through that path, so each worker builds its own instead. */
+  readonly clonable: boolean;
   /** What `verify` checks when given `unchanged`: Git's index and untracked listing, or (finite snapshots, which have no Git) the full inventory. */
   readonly reusedVerification: "index" | "inventory";
   /** `outputs` narrows the writable paths to one profile's within a snapshot shared by several.
@@ -107,7 +110,7 @@ function inside(root: string, target: string): boolean {
 /** Kill the owned read-only process and await close before callers may clean up.
  * AbortSignal is handled here: child_process's early AbortError event is not
  * proof that the process has stopped touching the snapshot. */
-async function snapshotProcess(command: string, args: string[], cwd: string, env: Readonly<Record<string, string>>, deadline: number, signal?: AbortSignal): Promise<{ code: number | null; stdout: string }> {
+async function snapshotProcess(command: string, args: string[], cwd: string, env: Readonly<Record<string, string>>, deadline: number, signal?: AbortSignal, limit = 64 * 1024): Promise<{ code: number | null; stdout: string }> {
   if (signal?.aborted) throw new CheckSnapshotError("check_snapshot_interrupted", "Snapshot verification was interrupted.");
   const remaining = deadline - performance.now();
   if (remaining <= 0) throw new CheckSnapshotError("check_snapshot_timeout", "Snapshot verification exceeded its deadline.");
@@ -124,7 +127,7 @@ async function snapshotProcess(command: string, args: string[], cwd: string, env
     if (signal?.aborted) abort();
     child.stdout.on("data", (bytes: Buffer) => {
       size += bytes.length;
-      if (size > 64 * 1024) stop("check_snapshot_unavailable", "Snapshot verifier output exceeded its limit.");
+      if (size > limit) stop("check_snapshot_unavailable", "Snapshot verifier output exceeded its limit.");
       else stdout += bytes.toString();
     });
     child.stderr.on("data", () => {}); // Drain; never expose private paths or source bytes.
@@ -140,13 +143,18 @@ async function snapshotProcess(command: string, args: string[], cwd: string, env
 export async function snapshotInventory(root: string, outputs: readonly string[], excludeDependencies = false, deadline = performance.now() + SNAPSHOT_TIMEOUT_MS, signal?: AbortSignal, forbidGit = false, absentInputs: readonly string[] = []): Promise<string> {
   return (await snapshotDigests(root, outputs, excludeDependencies, deadline, signal, forbidGit, false, absentInputs)).digest;
 }
-async function snapshotDigests(root: string, outputs: readonly string[], excludeDependencies: boolean, deadline: number, signal?: AbortSignal, forbidGit = false, includeSource = false, absentInputs: readonly string[] = []): Promise<{ digest: string; sourceDigest?: string }> {
+async function snapshotDigests(root: string, outputs: readonly string[], excludeDependencies: boolean, deadline: number, signal?: AbortSignal, forbidGit = false, includeSource = false, absentInputs: readonly string[] = [], selfReferences: readonly string[] = []): Promise<{ digest: string; sourceDigest?: string; selfReferenced: boolean }> {
   const result = await snapshotProcess(process.execPath, ["--input-type=module", "--eval", snapshotInventoryWorker], root,
-    { PATH: process.env["PATH"] ?? "/usr/bin:/bin", DELIVERY_SNAPSHOT_REQUEST: JSON.stringify({ root, outputs, excludeDependencies, forbidGit, includeSource, absentInputs }) }, deadline, signal);
-  let parsed: { code?: string; digest?: string; sourceDigest?: string };
+    { PATH: process.env["PATH"] ?? "/usr/bin:/bin", DELIVERY_SNAPSHOT_REQUEST: JSON.stringify({ root, outputs, excludeDependencies, forbidGit, includeSource, absentInputs, selfReferences }) }, deadline, signal);
+  let parsed: { code?: string; digest?: string; sourceDigest?: string; selfReferenced?: boolean };
   try { parsed = JSON.parse(result.stdout); } catch { throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot inventory returned no valid result."); }
   if (result.code !== 0 || !/^[a-f0-9]{64}$/.test(parsed.digest ?? "") || (includeSource && !/^[a-f0-9]{64}$/.test(parsed.sourceDigest ?? ""))) throw new CheckSnapshotError(["check_snapshot_escape", "check_snapshot_drift"].includes(parsed.code ?? "") ? parsed.code! : "check_snapshot_unavailable", "Snapshot inventory could not verify private bytes and links.");
-  return { digest: parsed.digest!, ...(includeSource ? { sourceDigest: parsed.sourceDigest! } : {}) };
+  if (selfReferences.length && typeof parsed.selfReferenced !== "boolean") throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot inventory returned no valid result.");
+  return { digest: parsed.digest!, ...(includeSource ? { sourceDigest: parsed.sourceDigest! } : {}), selfReferenced: parsed.selfReferenced === true };
+}
+/** The spellings of a tree's absolute paths a setup could write: as created under the temporary directory and resolved. */
+function selfReferences(...created: (string | undefined)[]): string[] {
+  return [...new Set(created.flatMap(dir => dir === undefined ? [] : [dir, path.join(tmpdir(), path.basename(dir))]))];
 }
 export function executionPath(root: string, value: string): string {
   return value.split(path.delimiter).filter(p => p && path.isAbsolute(p) && !inside(root, p) && !p.split(path.sep).includes("node_modules")).join(path.delimiter) || "/usr/bin:/bin";
@@ -209,7 +217,7 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
     report("materialization", materializationStarted);
     // Setup needs a source baseline only when a dependency command can mutate it.
     const baseline = await measured("baseline-inventory", () => inventory(rootDir, input.outputs, Boolean(input.dependencies)));
-    let dependencyDigest = baseline;
+    let dependencyDigest = baseline, clonable = true;
     const environmentFor = (root: string, control: string): Record<string, string> => ({ ...input.environment, PATH: `${path.join(root, "node_modules/.bin")}${path.delimiter}${cleanEnv["PATH"]}`, HOME: path.join(control, "home"), TMPDIR: path.join(control, "tmp"), GIT_CEILING_DIRECTORIES: path.dirname(root),
       ...(input.gitContext === "none" ? {} : {
       DELIVERY_CHECK_BASE_REF: baseRef, DELIVERY_CHECK_CANDIDATE_REF: candidateRef, DELIVERY_CHECK_ORIGIN_HEAD: input.candidate.headSha, DELIVERY_CHECK_ORIGIN_TREE: input.candidate.treeSha, DELIVERY_CHECK_MERGE_BASE: input.candidate.base.mergeBaseSha }) });
@@ -222,14 +230,17 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
       if (result.code !== 0 || input.signal?.aborted) throw new CheckSnapshotError("check_dependency_failed", "Private dependency installation did not complete successfully.");
       // Both digests use the same tuples from one safety walk, hashing each
       // immutable file once. Source comparison still excludes node_modules.
-      const installed = await measured("post-dependency-inventory", () => snapshotDigests(rootDir, input.outputs, false, performance.now() + SNAPSHOT_TIMEOUT_MS, input.signal, input.gitContext === "none", true));
+      const installed = await measured("post-dependency-inventory", () => snapshotDigests(rootDir, input.outputs, false, performance.now() + SNAPSHOT_TIMEOUT_MS, input.signal, input.gitContext === "none", true, [], selfReferences(rootDir, privateControl)));
       if (baseline !== installed.sourceDigest) throw new CheckSnapshotError("check_snapshot_drift", "Dependency setup changed prepared source bytes.");
       dependencyDigest = installed.digest;
+      clonable = !installed.selfReferenced;
     }
-    const treeGit = (tree: PrivateTree, deadline: number, accepted: readonly number[] = [0]) => {
-      const gitDir = tree.privateControl ? path.join(tree.privateControl, "repository") : undefined;
+    // Explicit directories and settings: a full-Git command can edit .git/config, and core.worktree,
+    // core.fileMode=false or a sparse checkout would otherwise hide changes from verification.
+    const treeGit = (tree: PrivateTree, deadline: number, accepted: readonly number[] = [0], limit?: number) => {
+      const gitDir = tree.privateControl ? path.join(tree.privateControl, "repository") : path.join(tree.rootDir, ".git");
       return async (...args: string[]) => {
-        const result = await snapshotProcess("git", gitDir ? [`--git-dir=${gitDir}`, `--work-tree=${tree.rootDir}`, ...args] : args, tree.rootDir, cleanEnv, deadline, input.signal);
+        const result = await snapshotProcess("git", [`--git-dir=${gitDir}`, `--work-tree=${tree.rootDir}`, "-c", "core.fileMode=true", "-c", "core.sparseCheckout=false", "-c", "core.symlinks=true", ...args], tree.rootDir, cleanEnv, deadline, input.signal, limit);
         if (!accepted.includes(result.code ?? -1)) throw new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git identity could not be read.");
         return result.stdout;
       };
@@ -253,8 +264,12 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
           // the next one it must still match the index: no tracked edit, and no
           // untracked entry the setup did not leave outside the allowed outputs.
           const allowed = options.unchanged.allowed;
-          // A clone has new inodes, so refresh rehashes; 1 means a tracked file differs, which diff-files names.
-          await treeGit(tree, deadline, [0, 1])("update-index", "-q", "--refresh");
+          // A clone has new inodes, so the refresh rehashes, ignoring assume-unchanged; 1 means a tracked
+          // file differs, which diff-files names. Every entry must be a plain cached one ("H"): an
+          // assume-unchanged (lowercase) or skip-worktree ("S") flag would hide an edit from diff-files.
+          await treeGit(tree, deadline, [0, 1])("update-index", "-q", "--really-refresh");
+          if (nulSeparated(await treeGit(tree, deadline, [0], 128 * 1024 * 1024)("ls-files", "-v", "-z")).some(entry => !entry.startsWith("H ")))
+            throw new CheckSnapshotError("check_snapshot_drift", "A reused snapshot's index hides a tracked path.");
           if (input.gitContext === "none" && await lstat(path.join(tree.rootDir, ".git")).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(new CheckSnapshotError("check_snapshot_unavailable", "Snapshot Git absence could not be read."))))
             throw new CheckSnapshotError("check_snapshot_drift", "A file-only snapshot gained Git metadata.");
           if (nulSeparated(await verifyGit("diff-files", "--name-only", "-z")).length) throw new CheckSnapshotError("check_snapshot_drift", "A reused snapshot changed tracked source.");
@@ -273,7 +288,7 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
         const identities = (await verifyGit("rev-parse", "HEAD", `${candidateRef}^{tree}`, baseRef)).trim().split("\n");
         if (indexTree !== input.candidate.treeSha || identities.length !== 3 || identities[0] !== candidateCommit || identities[1] !== input.candidate.treeSha || identities[2] !== input.candidate.base.tipSha) throw new CheckSnapshotError("check_snapshot_drift", "Execution changed the private source, dependencies or pinned Git context.");
       });
-      return { rootDir: tree.rootDir, commandRoot: path.join(control, "commands"), environment: environmentFor(tree.rootDir, control), dependencyDigest, reusedVerification, verify,
+      return { rootDir: tree.rootDir, commandRoot: path.join(control, "commands"), environment: environmentFor(tree.rootDir, control), dependencyDigest, clonable, reusedVerification, verify,
         clone: (method, onClonePhase) => cloneSnapshot(tree, method, input.signal, onClonePhase, open), cleanup: () => removeTrees(tree.owned) };
     };
     return open({ rootDir, ...(privateControl ? { privateControl } : {}), owned: [rootDir, ...(privateControl ? [privateControl] : [])] }, input.onPhase);
@@ -357,7 +372,7 @@ async function createFiniteCheckSnapshot(input: SnapshotRequest): Promise<CheckS
       if (result.code !== 0 || input.signal?.aborted) throw new CheckSnapshotError("check_dependency_failed", "Private finite dependency installation failed.");
     }
     const installed = input.dependencies ? await measured("post-dependency-inventory", () =>
-      snapshotDigests(rootDir, input.outputs, false, performance.now() + SNAPSHOT_TIMEOUT_MS, input.signal, true, true, source.absentInputs)) : { digest: baseline, sourceDigest: baseline };
+      snapshotDigests(rootDir, input.outputs, false, performance.now() + SNAPSHOT_TIMEOUT_MS, input.signal, true, true, source.absentInputs, selfReferences(rootDir, control))) : { digest: baseline, sourceDigest: baseline, selfReferenced: false };
     if (baseline !== installed.sourceDigest) throw new CheckSnapshotError("check_snapshot_drift", "Dependency setup changed finite source bytes or modes.");
     // Without Git there is no index to compare, so a reused finite tree is verified by its full inventory.
     const open = (tree: PrivateTree, onPhase?: SnapshotRequest["onPhase"]): CheckSnapshot => {
@@ -368,7 +383,7 @@ async function createFiniteCheckSnapshot(input: SnapshotRequest): Promise<CheckS
         if (await inventory(tree.rootDir, options.outputs ?? input.outputs, false, performance.now() + timeout) !== installed.digest)
           throw new CheckSnapshotError("check_snapshot_drift", "Finite source or installed dependencies changed.");
       });
-      return { rootDir: tree.rootDir, commandRoot: path.join(controlDir, "commands"), environment: environmentFor(tree.rootDir, controlDir), dependencyDigest: installed.digest, reusedVerification: "inventory", verify,
+      return { rootDir: tree.rootDir, commandRoot: path.join(controlDir, "commands"), environment: environmentFor(tree.rootDir, controlDir), dependencyDigest: installed.digest, clonable: !installed.selfReferenced, reusedVerification: "inventory", verify,
         clone: (method, onClonePhase) => cloneSnapshot(tree, method, input.signal, onClonePhase, open), cleanup: () => removeTrees(tree.owned) };
     };
     return open({ rootDir, privateControl: control, owned: [rootDir, control] }, input.onPhase);

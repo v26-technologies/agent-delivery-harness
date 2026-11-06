@@ -60,6 +60,7 @@ function oneAtATime() {
   let tail: Promise<unknown> = Promise.resolve();
   return <T>(task: () => Promise<T>): Promise<T> => { const result = tail.then(task); tail = result.catch(() => undefined); return result; };
 }
+type AcquiredSetup = Omit<ScopedSetupDiagnostic, "verification" | "phases">;
 /** One worker's view while it runs a check: the snapshots only it uses, by setup key, and where its lines go. */
 interface Lane { readonly snapshots: Map<string, CheckSnapshot>; readonly write: (text: string) => void }
 export class ScopedChecks {
@@ -235,7 +236,9 @@ export class ScopedChecks {
     const cost = new Map<string, number>();
     for (const id of ids) {
       const last = (await this.stores.get(id)!.read()).filter(r => r.attempt.status === "passed" || r.attempt.status === "failed").at(-1)?.payload;
-      cost.set(id, last?.durationMs === undefined ? Infinity : last.durationMs - (last.diagnostic?.dependency?.durationMs ?? 0));
+      // A check that waited on another's warm base did not pay that setup either.
+      const waited = last?.diagnostic?.setup?.phases.filter(p => p.phase === "warm-base-wait").reduce((sum, p) => sum + p.durationMs, 0) ?? 0;
+      cost.set(id, last?.durationMs === undefined ? Infinity : last.durationMs - (last.diagnostic?.dependency?.durationMs ?? 0) - waited);
     }
     const [first, ...rest] = ids;
     if (first === undefined) return [];
@@ -297,17 +300,18 @@ export class ScopedChecks {
   }
   async submitMechanical(): Promise<void> { for (const submit of this.submissions) await submit(); this.submissions.length = 0; }
   /** One acquisition path preserves setup sharing, output ownership and worker isolation. A worker's tree
-   * for a setup key is built here, cloned from the warm base, or retained from its previous check. */
-  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"]): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[]; setup: Omit<ScopedSetupDiagnostic, "verification" | "phases"> }> {
+   * for a setup key is built here, cloned from the warm base, or retained from its previous check.
+   * `onSetup` hears how the tree is being got before any setup runs, so a failed setup is attributed. */
+  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"], onSetup: (setup: AcquiredSetup) => void = () => {}): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[]; setup: AcquiredSetup }> {
     const key = setupKey(profile, physicalSource);
     // Every scoped check's profile sharing this setup may write its own outputs in the shared tree;
     // only those profiles passed the overlap refusal in create().
     const sharedOutputs = [...new Set(this.context.config.scopedExecution!.profiles
       .filter(p => this.context.config.providers.some(q => q.check?.scope?.profile === p.id && setupKey(p, q.check.physicalSource) === key)).flatMap(p => p.mutableOutputs))];
     const method = this.concurrency === 1 ? undefined : await (this.cloning ??= snapshotCloneMethod());
-    const clone = this.concurrency === 1 ? "not-used" as const : method ?? "unavailable" as const;
+    const acquired = (snapshot: CheckSnapshot, setup: AcquiredSetup) => { lane.snapshots.set(key, snapshot); onSetup(setup); return { snapshot, sharedOutputs, setup }; };
     const retained = lane.snapshots.get(key);
-    if (retained) return { snapshot: retained, sharedOutputs, setup: { action: "reused", snapshot: "retained", clone } };
+    if (retained) return acquired(retained, { action: "reused", snapshot: "retained", clone: this.concurrency === 1 ? "not-used" : method ?? "unavailable" });
     // A single worker retains only consecutive same-setup reuse; durable outputs no longer
     // need the private tree. A pool keeps each worker's snapshots until cleanup().
     if (this.concurrency === 1) for (const [previousKey, previous] of lane.snapshots) {
@@ -321,7 +325,7 @@ export class ScopedChecks {
     };
     const build = (dependencyResult?: SnapshotRequest["onDependencyResult"]) => createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(physicalSource ? { physicalSource } : {}), ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
       onPhase, ...(dependencyResult ? { onDependencyResult: dependencyResult } : {}) });
-    let executed = false;
+    let executed = false, clone: AcquiredSetup["clone"] = this.concurrency === 1 ? "not-used" : "unavailable";
     if (method) {
       let base = this.bases.get(key);
       if (!base) {
@@ -332,22 +336,33 @@ export class ScopedChecks {
         const failed = base;
         failed.catch(() => { if (this.bases.get(key) === failed) this.bases.delete(key); });
       }
-      const waiting = performance.now(), warm = await base;
+      onSetup({ action: executed ? "executed" : "reused", snapshot: "cloned", clone: method });
+      const waiting = performance.now();
+      let warm: CheckSnapshot | undefined;
+      try { warm = await base; }
+      catch (error) {
+        // Another check's setup failed; this worker sets up again itself, as it would have on its own.
+        if (executed || !(error instanceof CheckSnapshotError) || this.context.signal?.aborted) throw error;
+        lane.write(`snapshot ${profile.id}: shared setup failed (${error.code}); setting up again`);
+      }
       if (!executed) onPhase("warm-base-wait", performance.now() - waiting);
-      try {
-        const snapshot = await warm.clone(method, onPhase);
-        lane.snapshots.set(key, snapshot);
-        return { snapshot, sharedOutputs, setup: { action: executed ? "executed" : "reused", snapshot: "cloned", clone } };
-      } catch (error) {
-        if (!(error instanceof CheckSnapshotError) || this.context.signal?.aborted) throw error;
-        // The base stays for other workers; this one sets up its own tree, as without cloning.
-        lane.write(`snapshot ${profile.id}: clone unavailable; ${error.code}`);
+      if (warm && !warm.clonable) {
+        // The setup wrote the base's own path into it, so clones would still share the base through it.
+        clone = "path-bound";
+        lane.write(`snapshot ${profile.id}: setup wrote its own path into the tree; each worker builds its own`);
+        if (executed) return acquired(warm, { action: "executed", snapshot: "built", clone });
+      } else if (warm) {
+        try { return acquired(await warm.clone(method, onPhase), { action: executed ? "executed" : "reused", snapshot: "cloned", clone: method }); }
+        catch (error) {
+          if (!(error instanceof CheckSnapshotError) || this.context.signal?.aborted) throw error;
+          // The base stays for other workers; this one sets up its own tree, as without cloning.
+          lane.write(`snapshot ${profile.id}: clone unavailable; ${error.code}`);
+        }
       }
     }
     // A dependency result belongs to this attempt only for the first setup it ran.
-    const snapshot = await build(executed ? undefined : onDependencyResult);
-    lane.snapshots.set(key, snapshot);
-    return { snapshot, sharedOutputs, setup: { action: "executed", snapshot: "built", clone: method ? "unavailable" : clone } };
+    onSetup({ action: "executed", snapshot: "built", clone });
+    return acquired(await build(executed ? undefined : onDependencyResult), { action: "executed", snapshot: "built", clone });
   }
   private scheduleCapture<T>(task: () => Promise<T>, executionStage = false): Promise<T> {
     if (this.cleanupStarted || (!this.capturePhaseOpen && !executionStage)) return Promise.reject(new CheckSnapshotError("installed_data_capture_closed", "Resource capture must finish before execution or cleanup begins."));
@@ -547,8 +562,11 @@ export class ScopedChecks {
     const store = this.stores.get(provider.id)!;
     const secrets = check.scope!.environment.filter(e => e.kind === "credential").map(e => this.context.env[e.name]).filter((v): v is string => !!v);
     try {
+      // A reused tree is verified as its kind allows: from the index, or (a finite tree) by its inventory.
+      const verificationOf = (setup: AcquiredSetup) => setup.snapshot === "built" || check.physicalSource ? "inventory" as const : "index" as const;
       const { snapshot, sharedOutputs, setup } = await this.acquireSnapshot(profile, lane,
-        (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; }, check.physicalSource);
+        (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; }, check.physicalSource,
+        setup => { diagnostic = { ...diagnostic, setup: { ...setup, verification: verificationOf(setup), phases } }; });
       const verification = setup.snapshot === "built" ? "inventory" : snapshot.reusedVerification;
       diagnostic = { ...diagnostic, phase: "pre-command-verification", setup: { ...setup, verification, phases } };
       // A sibling or dependency setup cannot supply this command's result, and

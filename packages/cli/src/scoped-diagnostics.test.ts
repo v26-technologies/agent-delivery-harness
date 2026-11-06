@@ -283,3 +283,33 @@ it("omits arbitrary dependency causes and preserves genuine numeric dependency e
   expect(scopedDependencyDiagnostic({ code: 1, stdout: "", stderr: "", errorCode: "private-unknown-cause" }, 9, [])).toEqual({ durationMs: 9, command: { unavailable: "not-completed" } });
   expect(scopedDependencyDiagnostic({ code: 7, stdout: "", stderr: "", errorCode: "7" }, 9, [])).toEqual({ durationMs: 9, command: { exitCode: 7, outputTail: "\n", truncated: false } });
 });
+
+const setup = { action: "reused", snapshot: "cloned", clone: "clonefile", verification: "index", phases: [{ phase: "warm-base-wait", durationMs: 4 }, { phase: "clone", durationMs: 12 }, { phase: "pre-command-verification", durationMs: 30 }] } as const;
+it("returns a recorded setup and strips its unknown properties", async () => {
+  const f = await fixture(), a = f.store("a"), attempt = await a.allocate(f.input("a"));
+  await a.finish(attempt, "failed", { outputs: [], diagnostic: { ...diagnostic, setup } } as AttemptPayload);
+  const file = path.join(a.root, "1/terminal.json"), row = JSON.parse(await readFile(file, "utf8"));
+  row.entry.payload.diagnostic.setup.root = "/private/path"; row.entry.payload.diagnostic.setup.phases[0].path = "/private/path";
+  row.digest = digestCanonical(row.entry); await writeFile(file, JSON.stringify(row));
+  const result = await readScopedCheckDiagnostics({ ...f, attemptIds: [attempt.attemptId] });
+  expect(result.providers[0]!.attempts[0]!.diagnostic).toEqual({ ...diagnostic, setup });
+  expect(JSON.stringify(result)).not.toContain("/private/path");
+});
+it.each([
+  ["action", "skipped"], ["snapshot", "shared"], ["clone", "cp"], ["verification", "status"], ["phases", "none"],
+  ["phases", [{ phase: "command", durationMs: 1 }]], ["phases", [{ phase: "clone", durationMs: -1 }]], ["phases", [{ phase: "clone", durationMs: 1.5 }]],
+  ["phases", [{ phase: "clone", durationMs: "1" }]], ["phases", Array.from({ length: 17 }, () => ({ phase: "clone", durationMs: 1 }))], ["phases", ["clone"]],
+] as const)("refuses a malformed recorded setup %s %j", async (member, value) => {
+  const f = await fixture(), a = f.store("a"), attempt = await a.allocate(f.input("a"));
+  await a.finish(attempt, "failed", { outputs: [], diagnostic: { ...diagnostic, setup } } as AttemptPayload);
+  const file = path.join(a.root, "1/terminal.json"), row = JSON.parse(await readFile(file, "utf8"));
+  row.entry.payload.diagnostic.setup[member] = value; row.digest = digestCanonical(row.entry); await writeFile(file, JSON.stringify(row));
+  await expect(readScopedCheckDiagnostics({ ...f, attemptIds: [attempt.attemptId] })).rejects.toMatchObject({ code: "check_attempt_corrupt" });
+});
+it("refuses a recorded setup that is not an object", async () => {
+  const f = await fixture(), a = f.store("a"), attempt = await a.allocate(f.input("a"));
+  await a.finish(attempt, "failed", { outputs: [], diagnostic: { ...diagnostic, setup } } as AttemptPayload);
+  const file = path.join(a.root, "1/terminal.json"), row = JSON.parse(await readFile(file, "utf8"));
+  row.entry.payload.diagnostic.setup = "reused"; row.digest = digestCanonical(row.entry); await writeFile(file, JSON.stringify(row));
+  await expect(readScopedCheckDiagnostics({ ...f, attemptIds: [attempt.attemptId] })).rejects.toMatchObject({ code: "check_attempt_corrupt" });
+});

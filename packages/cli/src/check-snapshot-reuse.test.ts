@@ -29,6 +29,8 @@ async function fixture() {
 }
 const write = async (snapshot: CheckSnapshot, file: string, text: string) => { await mkdir(path.dirname(path.join(snapshot.rootDir, file)), { recursive: true }); await writeFile(path.join(snapshot.rootDir, file), text); };
 const drift = { code: "check_snapshot_drift" };
+/** Git run against a snapshot's own repository: in the tree for full Git, beside it for Git-none. */
+const snapshotGit = (snapshot: CheckSnapshot, gitContext: "none" | "full", ...args: string[]) => exec("git", [...gitContext === "none" ? [`--git-dir=${path.join(path.dirname(snapshot.environment["HOME"]!), "repository")}`, `--work-tree=${snapshot.rootDir}`] : [], ...args], { cwd: snapshot.rootDir, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
 
 it.runIf(method)("names the copy-on-write method the temporary directory supports", () => {
   expect(method).toBe(process.platform === "darwin" ? "clonefile" : "reflink");
@@ -95,6 +97,17 @@ it.each(["none", "full"] as const)("verifies a reused %s-Git tree from the index
       ["a deleted tracked file", () => unlink(path.join(snapshot.rootDir, "src/source.txt")), () => writeFile(path.join(snapshot.rootDir, "src/source.txt"), "source")],
       ["an untracked file hidden by its own new .gitignore", async () => { await write(snapshot, "hidden/.gitignore", "*\n"); await write(snapshot, "hidden/file", "x"); }, () => rm(path.join(snapshot.rootDir, "hidden"), { recursive: true })],
       ["an untracked file under an ignored but undeclared path", () => write(snapshot, "out-of-scope/node_modules/x", "x"), () => rm(path.join(snapshot.rootDir, "out-of-scope"), { recursive: true })],
+      ["a tracked edit hidden by assume-unchanged", async () => { await snapshotGit(snapshot, gitContext, "update-index", "--assume-unchanged", "src/source.txt"); await writeFile(path.join(snapshot.rootDir, "src/source.txt"), "edited"); },
+        async () => { await writeFile(path.join(snapshot.rootDir, "src/source.txt"), "source"); await snapshotGit(snapshot, gitContext, "update-index", "--no-assume-unchanged", "src/source.txt"); }],
+      ["a tracked edit hidden by skip-worktree", async () => { await snapshotGit(snapshot, gitContext, "update-index", "--skip-worktree", "src/source.txt"); await writeFile(path.join(snapshot.rootDir, "src/source.txt"), "edited"); },
+        async () => { await writeFile(path.join(snapshot.rootDir, "src/source.txt"), "source"); await snapshotGit(snapshot, gitContext, "update-index", "--no-skip-worktree", "src/source.txt"); }],
+      ["a mode change hidden by core.fileMode=false", async () => { await snapshotGit(snapshot, gitContext, "config", "core.fileMode", "false"); await chmod(path.join(snapshot.rootDir, "src/source.txt"), 0o755); },
+        async () => { await chmod(path.join(snapshot.rootDir, "src/source.txt"), 0o644); await snapshotGit(snapshot, gitContext, "config", "--unset", "core.fileMode"); }],
+      ["a tracked edit behind core.worktree pointing at a clean tree", async () => {
+        const clean = await mkdtemp(path.join(tmpdir(), "scoped-reuse-clean-")); roots.push(clean);
+        await mkdir(path.join(clean, "src")); await writeFile(path.join(clean, "src/source.txt"), "source"); await writeFile(path.join(clean, ".gitignore"), "out/\ncache/\nnode_modules/\n");
+        await snapshotGit(snapshot, gitContext, "config", "core.worktree", clean); await writeFile(path.join(snapshot.rootDir, "src/source.txt"), "edited");
+      }, async () => { await writeFile(path.join(snapshot.rootDir, "src/source.txt"), "source"); await snapshotGit(snapshot, gitContext, "config", "--unset", "core.worktree"); }],
       ...gitContext === "full"
         ? [["an untracked file listed in the repository's own exclude file", async () => { await appendFile(path.join(snapshot.rootDir, ".git/info/exclude"), "stray.txt\n"); await write(snapshot, "stray.txt", "x"); }, () => unlink(path.join(snapshot.rootDir, "stray.txt"))] as [string, () => Promise<void>, () => Promise<void>]]
         : [["Git metadata in a file-only tree", () => mkdir(path.join(snapshot.rootDir, ".git")), () => rm(path.join(snapshot.rootDir, ".git"), { recursive: true })] as [string, () => Promise<void>, () => Promise<void>]],
@@ -121,3 +134,14 @@ it("verifies a reused finite tree by its full inventory", async () => {
     await expect(snapshot.verify({ outputs: ["out/"], unchanged: { allowed: ["out/"] } })).rejects.toMatchObject(drift);
   } finally { await snapshot.cleanup(); }
 }, 60000);
+
+it.each(["none", "full"] as const)("a setup that writes the tree's own path into it makes the %s-Git tree unclonable", async gitContext => {
+  const { root, headSha, treeSha } = await fixture();
+  const create = (script: string) => createCheckSnapshot({ rootDir: root, candidate: { headSha, treeSha, base: { ref: "origin/main", tipSha: headSha, mergeBaseSha: headSha } }, outputs: [], gitContext, environment: {},
+    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');fs.mkdirSync('node_modules/pkg',{recursive:true});${script}`], timeoutMs: 60000 } });
+  const portable = await create("fs.writeFileSync('node_modules/pkg/index.js','relative')");
+  const bound = await create("fs.writeFileSync('node_modules/pkg/shebang','#!'+process.cwd()+'/node_modules/.bin/python')");
+  try {
+    expect([portable.clonable, bound.clonable]).toEqual([true, false]);
+  } finally { await portable.cleanup(); await bound.cleanup(); }
+}, 120000);
