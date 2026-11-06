@@ -7,10 +7,10 @@ import { deliveryRecordPathFor, recordOutputProvider, computeDeliverableIdentity
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
 import { AttemptStore, type AttemptPayload, type StoredAttempt } from "./scoped-attempts.ts";
-import { CheckSnapshotError, createCheckSnapshot, executionPath, type CheckSnapshot, type SnapshotRequest } from "./check-snapshot.ts";
+import { CheckSnapshotError, createCheckSnapshot, executionPath, snapshotCloneMethod, type CheckSnapshot, type CloneMethod, type SnapshotRequest } from "./check-snapshot.ts";
 import { captureInstalledDataBinding, type InstalledDataSourceTree } from "./scoped-installed-data.ts";
 import { captureOwnedInstalledDataResources } from "./installed-data-resources.ts";
-import { redactScopedStreams, scopedCommandDiagnostic, scopedDependencyDiagnostic, scopedDiagnosticFailure, type RecordedScopedAttemptDiagnostic } from "./scoped-diagnostics.ts";
+import { redactScopedStreams, scopedCommandDiagnostic, scopedDependencyDiagnostic, scopedDiagnosticFailure, type RecordedScopedAttemptDiagnostic, type ScopedSetupDiagnostic } from "./scoped-diagnostics.ts";
 export function scopedCandidate(candidate: CandidateBinding): RecordCandidateBinding {
   return { treeSha: candidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: candidate.workspaceId };
 }
@@ -76,6 +76,12 @@ export class ScopedChecks {
   private captureTail: Promise<unknown> = Promise.resolve();
   private capturePhaseOpen = true;
   private cleanupStarted = false;
+  /** With more than one worker: one read-only warm base per setup key, which no command runs in. Each
+   * worker takes a copy-on-write clone of it; without cloning each worker builds its own, as before. */
+  private readonly bases = new Map<string, Promise<CheckSnapshot>>();
+  private cloning?: Promise<CloneMethod | undefined>;
+  /** Profiles whose checks a tree has run and verified since it was made: their outputs may be in it. */
+  private readonly ranOutputs = new WeakMap<CheckSnapshot, Set<string>>();
   private readonly executionLocks = new Map<Map<string, CheckSnapshot>, ReturnType<typeof oneAtATime>>();
   private readonly executionTails = new Map<Map<string, CheckSnapshot>, Promise<unknown>>();
   private retainedResourceBindings?: Promise<Readonly<Record<string, ResourceApplicabilityBinding>>>;
@@ -290,32 +296,58 @@ export class ScopedChecks {
     return requests.flatMap(r => failures.has(r.provider.id) ? [failures.get(r.provider.id)!] : []);
   }
   async submitMechanical(): Promise<void> { for (const submit of this.submissions) await submit(); this.submissions.length = 0; }
-  /** One acquisition path preserves setup sharing, output ownership and worker isolation. */
-  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"]): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[] }> {
+  /** One acquisition path preserves setup sharing, output ownership and worker isolation. A worker's tree
+   * for a setup key is built here, cloned from the warm base, or retained from its previous check. */
+  private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"]): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[]; setup: Omit<ScopedSetupDiagnostic, "verification" | "phases"> }> {
     const key = setupKey(profile, physicalSource);
     // Every scoped check's profile sharing this setup may write its own outputs in the shared tree;
     // only those profiles passed the overlap refusal in create().
     const sharedOutputs = [...new Set(this.context.config.scopedExecution!.profiles
       .filter(p => this.context.config.providers.some(q => q.check?.scope?.profile === p.id && setupKey(p, q.check.physicalSource) === key)).flatMap(p => p.mutableOutputs))];
-    let snapshot = lane.snapshots.get(key);
-    if (!snapshot) {
-      // A single worker retains only consecutive same-setup reuse; durable outputs no longer
-      // need the private tree. A pool keeps each worker's snapshots until cleanup().
-      if (this.concurrency === 1) for (const [previousKey, previous] of lane.snapshots) {
-        await previous.cleanup();
-        lane.snapshots.delete(previousKey);
-      }
-      snapshot = await createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(physicalSource ? { physicalSource } : {}), ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
-        onPhase: (phase, durationMs) => {
-          const write = this.phaseWriters.get(lane.snapshots);
-          if (write) write(phase, durationMs);
-          else lane.write(`snapshot ${profile.id}: bootstrap ${phase} ${Math.round(durationMs)}ms`);
-        },
-        ...(onDependencyResult ? { onDependencyResult } : {}),
-      });
-      lane.snapshots.set(key, snapshot);
+    const method = this.concurrency === 1 ? undefined : await (this.cloning ??= snapshotCloneMethod());
+    const clone = this.concurrency === 1 ? "not-used" as const : method ?? "unavailable" as const;
+    const retained = lane.snapshots.get(key);
+    if (retained) return { snapshot: retained, sharedOutputs, setup: { action: "reused", snapshot: "retained", clone } };
+    // A single worker retains only consecutive same-setup reuse; durable outputs no longer
+    // need the private tree. A pool keeps each worker's snapshots until cleanup().
+    if (this.concurrency === 1) for (const [previousKey, previous] of lane.snapshots) {
+      await previous.cleanup();
+      lane.snapshots.delete(previousKey);
     }
-    return { snapshot, sharedOutputs };
+    const onPhase = (phase: string, durationMs: number) => {
+      const write = this.phaseWriters.get(lane.snapshots);
+      if (write) write(phase, durationMs);
+      else lane.write(`snapshot ${profile.id}: bootstrap ${phase} ${Math.round(durationMs)}ms`);
+    };
+    const build = (dependencyResult?: SnapshotRequest["onDependencyResult"]) => createCheckSnapshot({ rootDir: this.context.rootDir, candidate: this.candidate, outputs: sharedOutputs, gitContext: profile.gitContext ?? "full", environment: { PATH: this.context.env["PATH"] ?? process.env["PATH"] ?? "/usr/bin:/bin" }, ...(physicalSource ? { physicalSource } : {}), ...(profile.dependencies ? { dependencies: profile.dependencies } : {}), ...(this.context.signal ? { signal: this.context.signal } : {}),
+      onPhase, ...(dependencyResult ? { onDependencyResult: dependencyResult } : {}) });
+    let executed = false;
+    if (method) {
+      let base = this.bases.get(key);
+      if (!base) {
+        executed = true;
+        base = build(onDependencyResult);
+        this.bases.set(key, base);
+        // A failed setup is not shared: the next check of this key sets up again, as it would on its own worker.
+        const failed = base;
+        failed.catch(() => { if (this.bases.get(key) === failed) this.bases.delete(key); });
+      }
+      const waiting = performance.now(), warm = await base;
+      if (!executed) onPhase("warm-base-wait", performance.now() - waiting);
+      try {
+        const snapshot = await warm.clone(method, onPhase);
+        lane.snapshots.set(key, snapshot);
+        return { snapshot, sharedOutputs, setup: { action: executed ? "executed" : "reused", snapshot: "cloned", clone } };
+      } catch (error) {
+        if (!(error instanceof CheckSnapshotError) || this.context.signal?.aborted) throw error;
+        // The base stays for other workers; this one sets up its own tree, as without cloning.
+        lane.write(`snapshot ${profile.id}: clone unavailable; ${error.code}`);
+      }
+    }
+    // A dependency result belongs to this attempt only for the first setup it ran.
+    const snapshot = await build(executed ? undefined : onDependencyResult);
+    lane.snapshots.set(key, snapshot);
+    return { snapshot, sharedOutputs, setup: { action: "executed", snapshot: "built", clone: method ? "unavailable" : clone } };
   }
   private scheduleCapture<T>(task: () => Promise<T>, executionStage = false): Promise<T> {
     if (this.cleanupStarted || (!this.capturePhaseOpen && !executionStage)) return Promise.reject(new CheckSnapshotError("installed_data_capture_closed", "Resource capture must finish before execution or cleanup begins."));
@@ -502,20 +534,34 @@ export class ScopedChecks {
     await this.closeCapturePhase();
     const started = Date.now(), check = provider.check!, profile = this.context.config.scopedExecution!.profiles.find(p => p.id === check.scope!.profile)!;
     const attempt = this.owned.get(provider.id) ?? await this.allocate(provider.id);
-    this.phaseWriters.set(lane.snapshots, (phase, durationMs) => lane.write(`snapshot ${provider.id}: attempt ${attempt.attemptId}; ${phase} ${Math.round(durationMs)}ms`));
+    // Phases up to the command are this attempt's setup; the only verification among them is pre-command.
+    const phases: { phase: ScopedSetupDiagnostic["phases"][number]["phase"]; durationMs: number }[] = [];
+    let settingUp = true;
+    this.phaseWriters.set(lane.snapshots, (phase, durationMs) => {
+      if (settingUp) phases.push({ phase: (phase === "verification" ? "pre-command-verification" : phase) as ScopedSetupDiagnostic["phases"][number]["phase"], durationMs: Math.round(durationMs) });
+      lane.write(`snapshot ${provider.id}: attempt ${attempt.attemptId}; ${phase} ${Math.round(durationMs)}ms`);
+    });
     let payload: AttemptPayload = { outputs: [] }, terminal = false;
     let diagnostic: RecordedScopedAttemptDiagnostic = { availability: "available", phase: "snapshot-setup", failure: { unavailable: "not-failed" }, command: { unavailable: "not-started" } };
     let executionErrorCode: string | undefined;
     const store = this.stores.get(provider.id)!;
     const secrets = check.scope!.environment.filter(e => e.kind === "credential").map(e => this.context.env[e.name]).filter((v): v is string => !!v);
     try {
-      const { snapshot, sharedOutputs } = await this.acquireSnapshot(profile, lane,
+      const { snapshot, sharedOutputs, setup } = await this.acquireSnapshot(profile, lane,
         (result, durationMs) => { diagnostic = { ...diagnostic, dependency: scopedDependencyDiagnostic(result, durationMs, secrets) }; }, check.physicalSource);
-      diagnostic = { ...diagnostic, phase: "pre-command-verification" };
+      const verification = setup.snapshot === "built" ? "inventory" : snapshot.reusedVerification;
+      diagnostic = { ...diagnostic, phase: "pre-command-verification", setup: { ...setup, verification, phases } };
       // A sibling or dependency setup cannot supply this command's result, and
       // another profile's outputs are not this profile's to read or write.
-      for (const output of [...check.outputs ?? [], ...sharedOutputs.filter(o => !profile.mutableOutputs.includes(o))]) await rm(path.join(snapshot.rootDir, output), { recursive: true, force: true });
-      await snapshot.verify({ outputs: profile.mutableOutputs });
+      const removed = [...check.outputs ?? [], ...sharedOutputs.filter(o => !profile.mutableOutputs.includes(o))];
+      const remove = async () => { for (const output of removed) await rm(path.join(snapshot.rootDir, output), { recursive: true, force: true }); };
+      if (verification === "index") {
+        // Checked before removal, so a stray write to an output no check here produced is refused, not erased.
+        await snapshot.verify({ outputs: profile.mutableOutputs, unchanged: { allowed: [...profile.mutableOutputs, ...this.ranOutputs.get(snapshot) ?? []] } });
+        await remove();
+      } else { await remove(); await snapshot.verify({ outputs: profile.mutableOutputs }); }
+      settingUp = false;
+      lane.write(`setup ${provider.id}: attempt ${attempt.attemptId}; ${setup.action} on a ${setup.snapshot} tree (clone ${setup.clone}), ${verification} verification; ${Date.now() - started}ms`);
       const injected = Object.fromEntries(check.scope!.environment.filter(e => this.context.env[e.name] !== undefined).map(e => [e.name, this.context.env[e.name]!]));
       lane.write(`checking ${provider.id}: attempt ${attempt.attemptId}`);
       diagnostic = { ...diagnostic, phase: "command" };
@@ -529,6 +575,9 @@ export class ScopedChecks {
       if (result.code !== 0 || this.context.signal?.aborted) throw new CheckSnapshotError("check_command_failed", `Declared scoped check ${provider.id} did not complete successfully (exit ${result.code}).`);
       diagnostic = { ...diagnostic, phase: "post-command-verification" };
       await snapshot.verify({ outputs: profile.mutableOutputs });
+      const ran = this.ranOutputs.get(snapshot) ?? new Set<string>();
+      for (const output of profile.mutableOutputs) ran.add(output);
+      this.ranOutputs.set(snapshot, ran);
       diagnostic = { ...diagnostic, phase: "output-capture" };
       const outputs = await captureCheckOutputSnapshots(snapshot.rootDir, check.outputs ?? []);
       if (!outputs || outputs.some(o => secrets.some(secret => Buffer.from(o.base64, "base64").includes(Buffer.from(secret))))) throw new CheckSnapshotError("check_output_missing", "A retained output is absent, corrupt, escaped or contains credential bytes.");
@@ -586,5 +635,7 @@ export class ScopedChecks {
     await this.closeCapturePhase();
     await Promise.all(this.executionTails.values());
     for (const snapshots of this.workers) { for (const snapshot of snapshots.values()) await snapshot.cleanup(); snapshots.clear(); }
+    const bases = [...this.bases.values()]; this.bases.clear();
+    for (const base of bases) await (await base.catch(() => undefined))?.cleanup();
   }
 }

@@ -55,9 +55,13 @@ it.each([1, 2])("forwards existing snapshot phase timings with the active check 
   })) } });
   const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
   const observations: { phase: string; durationMs: number }[] = [];
-  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(input => create({ ...input, onPhase: (phase, durationMs) => {
-    observations.push({ phase, durationMs: Math.round(durationMs) }); input.onPhase?.(phase, durationMs);
-  } }));
+  const tee = <P extends string>(forward?: (phase: P, durationMs: number) => void) => (phase: P, durationMs: number) => { observations.push({ phase, durationMs: Math.round(durationMs) }); forward?.(phase, durationMs); };
+  // A clone reports its own phases (clone, verification) to the worker that took it.
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
+    const snapshot = await create({ ...input, onPhase: tee(input.onPhase) });
+    return { ...snapshot, clone: (method, onPhase) => snapshot.clone(method, tee(onPhase)) };
+  });
+  const cloned = concurrency > 1 && await snapshots.snapshotCloneMethod() !== undefined;
   try {
     expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
     expect(spy).toHaveBeenCalledTimes(1);
@@ -66,7 +70,10 @@ it.each([1, 2])("forwards existing snapshot phase timings with the active check 
     expect(parsed.length).toBeGreaterThan(0);
     expect(parsed.every(match => match !== null)).toBe(true);
     expect(parsed.map(match => ({ phase: match![3], durationMs: Number(match![4]) }))).toEqual(observations);
-    expect([...new Set(parsed.map(match => match![3]))].sort()).toEqual(["baseline-inventory", "dependencies", "materialization", "post-dependency-inventory", "verification"]);
+    // With cloning each worker clones the warm base; one that did not build it also records its wait,
+    // but b may land on the worker a used and keep that worker's tree.
+    expect([...new Set(parsed.map(match => match![3]))].filter(phase => phase !== "warm-base-wait").sort()).toEqual(["baseline-inventory", ...cloned ? ["clone"] : [], "dependencies", "materialization", "post-dependency-inventory", "verification"]);
+    if (!cloned) expect(parsed.map(match => match![3])).not.toContain("warm-base-wait");
     const { readScopedCheckObservations } = await import("./index.ts");
     const recorded = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
     for (const provider of recorded.providers) {
@@ -1094,7 +1101,11 @@ it("an abort stops every worker and cleans up every pooled snapshot", async () =
   const f = await poolFixture(["1", "2", "3"], 2, (id, shared) => id === "c2" ? "" : `require('fs').writeFileSync(${JSON.stringify(shared)}+'/started-${id}','');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20000)`);
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const snapshots = await import("./check-snapshot.ts"), original = snapshots.createCheckSnapshot, roots: string[] = [];
-  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => { const snapshot = await original(input); roots.push(snapshot.rootDir); return snapshot; });
+  const clones: string[] = [];
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
+    const snapshot = await original(input); roots.push(snapshot.rootDir);
+    return { ...snapshot, clone: async (method, onPhase) => { const clone = await snapshot.clone(method, onPhase); clones.push(clone.rootDir); return clone; } };
+  });
   const { access, readdir } = await import("node:fs/promises");
   try {
     const controller = new AbortController();
@@ -1106,11 +1117,13 @@ it("an abort stops every worker and cleans up every pooled snapshot", async () =
     controller.abort();
     expect(await gate).toBe(130);
     expect(roots).toHaveLength(3);
-    for (const root of roots) await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
+    // Every warm base and every worker's clone of one is removed.
+    if (await snapshots.snapshotCloneMethod()) expect(clones).toHaveLength(3);
+    for (const root of [...roots, ...clones]) await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
     const { readScopedCheckObservations } = await import("./index.ts");
     const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
     expect(observed.providers.map(p => p.attempts.at(-1)?.status)).toEqual(["interrupted", "passed", "interrupted"]);
-  } finally { spy.mockRestore(); await Promise.all(roots.map(root => rm(root, { recursive: true, force: true }))); }
+  } finally { spy.mockRestore(); await Promise.all([...roots, ...clones].map(root => rm(root, { recursive: true, force: true }))); }
 }, 60000);
 it("records an unscoped declared check's evidence during gate alongside scoped providers", async () => {
   const f = await fixture(); f.env["FAIL"] = "0";
@@ -1315,3 +1328,118 @@ it("portable origin-tree transport rejects undeclared nonneutral drift", async (
   record.candidateBinding.treeSha = changed.treeSha;
   await expect(capturePortableVerificationInputs(f.dir, f.config, changed, record)).rejects.toMatchObject({ blockers: [expect.objectContaining({ code: "portable_scoped_inputs_invalid" })] });
 }, 30000);
+
+/** The setup each provider's most recent attempt recorded, in provider order. */
+async function latestSetups(f: { dir: string; config: ReturnType<typeof defineHarnessConfig> }) {
+  const { readScopedCheckObservations, readScopedCheckDiagnostics } = await import("./index.ts");
+  const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
+  const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.slice(-1).map(a => a.attemptId)) });
+  return diagnostics.providers.map(p => { const diagnostic = p.attempts.at(-1)?.diagnostic; return diagnostic?.availability === "available" ? diagnostic : undefined; });
+}
+it("concurrency 2 on one setup key installs once across workers and records the second check's setup as reused on a clone", async () => {
+  const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
+  const f = await poolFixture(["1", "1"], 2, (_, shared) => barrier(shared, 2));
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  const setups = (await latestSetups(f)).map(d => d!.setup!);
+  const lines = f.out.flatMap(line => line.split("\n")).filter(line => line.startsWith("setup "));
+  expect(lines).toHaveLength(2);
+  if (!method) {
+    // Without copy-on-write each worker builds its own tree, and the record says why.
+    expect(await f.installs("1")).toBe(2);
+    expect(setups.map(({ phases: _, ...s }) => s)).toEqual([0, 1].map(() => ({ action: "executed", snapshot: "built", clone: "unavailable", verification: "inventory" })));
+    return;
+  }
+  expect(await f.installs("1")).toBe(1);
+  const executed = setups.find(s => s.action === "executed")!, reused = setups.find(s => s.action === "reused")!;
+  expect([executed, reused].map(({ phases: _, ...s }) => s)).toEqual([
+    { action: "executed", snapshot: "cloned", clone: method, verification: "index" },
+    { action: "reused", snapshot: "cloned", clone: method, verification: "index" }]);
+  expect(executed.phases.map(p => p.phase)).toEqual(["materialization", "baseline-inventory", "dependencies", "post-dependency-inventory", "clone", "pre-command-verification"]);
+  expect(reused.phases.map(p => p.phase)).toEqual(["warm-base-wait", "clone", "pre-command-verification"]);
+  expect(lines.some(line => /^setup check\.c[12]: attempt \S+; reused on a cloned tree \(clone (clonefile|reflink)\), index verification; \d+ms$/.test(line)), lines.join("\n")).toBe(true);
+  // Only the attempt that ran the dependency setup carries its result.
+  expect((await latestSetups(f)).filter(d => d!.dependency !== undefined)).toHaveLength(1);
+}, 90000);
+it("without copy-on-write each worker sets up its own tree and the record says cloning is unavailable", async () => {
+  const snapshots = await import("./check-snapshot.ts");
+  const probe = vi.spyOn(snapshots, "snapshotCloneMethod").mockResolvedValue(undefined);
+  try {
+    const f = await poolFixture(["1", "1"], 2, (_, shared) => barrier(shared, 2));
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+    expect(await f.installs("1")).toBe(2);
+    expect((await latestSetups(f)).map(d => { const { phases, ...setup } = d!.setup!; return { ...setup, phases: phases.map(p => p.phase) }; })).toEqual([0, 1].map(() => ({ action: "executed", snapshot: "built", clone: "unavailable", verification: "inventory",
+      phases: ["materialization", "baseline-inventory", "dependencies", "post-dependency-inventory", "pre-command-verification"] })));
+  } finally { probe.mockRestore(); }
+}, 90000);
+it.each([true, false])("two concurrent checks of one profile write the same output path and each reads back only its own (cloning %s)", async cloning => {
+  const snapshots = await import("./check-snapshot.ts");
+  const probe = cloning ? undefined : vi.spyOn(snapshots, "snapshotCloneMethod").mockResolvedValue(undefined);
+  try {
+    const f = await fixture(); f.env["FAIL"] = "0";
+    const shared = await mkdtemp(path.join(tmpdir(), "scoped-same-output-")); dirs.push(shared);
+    const template = f.config.providers[0]!, profile = f.config.scopedExecution!.profiles[0]!;
+    const ready = (id: string) => JSON.stringify(path.join(shared, `ready-${id}`));
+    const providers = ["c1", "c2"].map(id => ({ ...template, id: `check.${id}`, check: { ...template.check!, timeoutMs: 30000,
+      command: [process.execPath, "-e", `const fs=require('fs');fs.writeFileSync('shared.json',${JSON.stringify(id)});fs.writeFileSync(${ready(id)},'');` +
+        `const end=Date.now()+20000;while(!(fs.existsSync(${ready("c1")})&&fs.existsSync(${ready("c2")}))){if(Date.now()>end)process.exit(7)}` +
+        `if(fs.readFileSync('shared.json','utf8')!==${JSON.stringify(id)})process.exit(9)`] as [string, ...string[]],
+      outputs: ["shared.json"], scope: { ...template.check!.scope!, environment: [], profile: "one" } } }));
+    f.setConfig({ ...f.config, providers, obligations: providers.map(p => ({ ...f.config.obligations[0]!, id: `${p.id}.passed`, providers: [p.id] })),
+      scopedExecution: { ...f.config.scopedExecution!, concurrency: 2, mechanicalProviders: [],
+        profiles: [{ ...profile, id: "one", mutableOutputs: ["shared.json"], dependencies: { command: [process.execPath, "-e", "0"], timeoutMs: 30000 } }] } });
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+    expect(f.out.join("\n").match(/passed check\.c\d/g)?.sort()).toEqual(["passed check.c1", "passed check.c2"]);
+  } finally { probe?.mockRestore(); }
+}, 90000);
+it.each([{ planted: "own", name: "keeps a write in the running profile's own outputs for its command" }, { planted: "other", name: "refuses a stray write to another profile's output before the command" }] as const)("a reused snapshot's pre-command verification $name", async ({ planted }) => {
+  // Serial, so c runs in the tree a left; d shares their setup but has not run yet.
+  const f = await sharedSetupFixture(id => id === "c" ? "const fs=require('fs');if(!fs.existsSync('cache-c/seed'))process.exit(5);fs.writeFileSync('result-c.json','{}')" : `require('fs').writeFileSync('result-${id}.json','{}')`);
+  const template = f.config.providers[0]!;
+  const d = { ...template, id: "check.d", check: { ...template.check!, command: [process.execPath, "-e", "require('fs').writeFileSync('result-d.json','{}')"] as [string, ...string[]], outputs: ["result-d.json"], scope: { ...template.check!.scope!, profile: "pd" } } };
+  const profiles = f.config.scopedExecution!.profiles;
+  f.setConfig({ ...f.config, providers: [...f.config.providers, d].map(p => ({ ...p, check: { ...p.check!, timeoutMs: 60000 } })), obligations: [...f.config.obligations, { ...f.config.obligations[0]!, id: "check.d.passed", providers: ["check.d"] }],
+    scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a", "check.c", "check.d", "check.b"],
+      profiles: [...profiles.map(p => p.id === "pc" ? { ...p, mutableOutputs: ["result-c.json", "cache-c/"] } : p), { ...profiles.find(p => p.id === "pa")!, id: "pd", mutableOutputs: ["result-d.json"] }]
+        .map(p => ({ ...p, dependencies: { ...p.dependencies!, timeoutMs: 60000 } })) } });
+  const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
+  let plant: ((root: string) => Promise<void>) | undefined = planted === "own"
+    ? async root => { await mkdir(path.join(root, "cache-c"), { recursive: true }); await writeFile(path.join(root, "cache-c/seed"), "warm"); }
+    : async root => { await writeFile(path.join(root, "result-d.json"), "stray"); };
+  // Plant just before the first verification of a reused tree, which is c's.
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
+    const snapshot = await create(input);
+    return { ...snapshot, verify: async options => { if (options?.unchanged && plant) { await plant(snapshot.rootDir); plant = undefined; } return snapshot.verify(options); } };
+  });
+  try {
+    if (planted === "own") {
+      // Allowed: a write inside c's own outputs passes and is still there when c's command runs.
+      expect(await f.run("prepare"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+      expect(f.out.join("\n").match(/checking check\.\w/g)).toEqual(["checking check.a", "checking check.c", "checking check.d", "checking check.b"]);
+      return;
+    }
+    // Refused: a write to d's output that no check here produced fails c before its command; it is not erased.
+    expect(await f.run("prepare")).toBe(1);
+    expect(f.err.join("\n")).toContain("check_snapshot_drift");
+    expect(f.out.join("\n").match(/checking check\.\w/g)).toEqual(["checking check.a"]);
+    const c = (await latestSetups(f))[2]!;
+    expect(c).toMatchObject({ phase: "pre-command-verification", failure: { code: "check_snapshot_drift" }, command: { unavailable: "not-started" }, setup: { action: "reused", snapshot: "retained", verification: "index" } });
+  } finally { spy.mockRestore(); }
+}, 90000);
+it("a dependency-input change invalidates the warm base, which rebuilds once", async () => {
+  const f = await poolFixture(["1", "1"], 2, (_, shared) => barrier(shared, 2));
+  const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p, dependencyInputs: ["deps.lock"] })) } });
+  await writeFile(path.join(f.dir, "deps.lock"), "one"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "lock");
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  const perGate = method ? 1 : 2;
+  expect(await f.installs("1")).toBe(perGate);
+  await rm(path.join(f.shared, "arrived"), { recursive: true, force: true });
+  await writeFile(path.join(f.dir, "deps.lock"), "two"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "lock two");
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  expect(await f.installs("1")).toBe(2 * perGate);
+}, 120000);
