@@ -67,7 +67,8 @@ export class InstalledDataResourceError extends Error {
   readonly code: InstalledDataResourceErrorCode;
   constructor(code: InstalledDataResourceErrorCode, message: string) { super(message); this.code = code; this.name = "InstalledDataResourceError"; }
 }
-const fail = (code: InstalledDataResourceErrorCode, message: string): never => { throw new InstalledDataResourceError(code, message); };
+// A declaration, not an arrow: only a declared `never` function ends control flow for narrowing.
+function fail(code: InstalledDataResourceErrorCode, message: string): never { throw new InstalledDataResourceError(code, message); }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const keys = <const K extends readonly string[]>(v: unknown, expected: K): v is Record<K[number], unknown> => object(v) && Object.keys(v).sort().join("\0") === [...expected].sort().join("\0");
 const text = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 1024 && !/[\x00-\x1f\x7f]/u.test(v);

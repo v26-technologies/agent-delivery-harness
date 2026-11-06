@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { captureCheckBindings, captureCheckOutputSnapshots, digestCanonical, classifyCandidateDrift, computeCheckWiringFingerprint, createBlocker, createExecPort, sha256Hex, submitManifest, type Blocker, type CandidateBinding, type CheckBindingOptions, type ProviderRegistration } from "@agent-delivery-harness/kernel";
+import { captureCheckBindings, captureCheckOutputSnapshots, digestCanonical, classifyCandidateDrift, computeCheckWiringFingerprint, createBlocker, createExecPort, sha256Hex, submitManifest, type Blocker, type CandidateBinding, type CheckBindingOptions, type ProviderRegistration, type SubmissionOptions } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
 
 /** Runs one declared argv check and submits its product-constructed terminal evidence. */
-export async function runDeclaredCheck(context: CommandContext, provider: ProviderRegistration, obligationIds: readonly string[], before: CandidateBinding, scoped: Pick<CheckBindingOptions, "scopedPlan" | "readOutput"> = {}): Promise<readonly Blocker[]> {
+export async function runDeclaredCheck(context: CommandContext, provider: ProviderRegistration, obligationIds: readonly string[], before: CandidateBinding, scoped: Pick<CheckBindingOptions, "scopedPlan" | "readOutput"> & Pick<SubmissionOptions, "resourceBindings"> = {}): Promise<readonly Blocker[]> {
   const check = provider.check!;
   const wiring = await context.wire();
   const fail = (code: string, summary: string, details?: string): readonly Blocker[] => [createBlocker({ code, source: { kind: "command", id: "delivery-harness.cli.gate" }, summary,

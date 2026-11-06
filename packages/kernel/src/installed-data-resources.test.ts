@@ -52,7 +52,7 @@ describe('installed package data kernel',()=>{
   it('portable validation refuses byte tamper and dropped files or directory members even with refreshed outer digest',async()=>{
     const c=await captured();
     for(const mutate of [(v:any)=>v.resources[0].entries.find((e:any)=>e.path===root+'/wght.css').bytesBase64='Yg==',(v:any)=>v.resources[0].entries.splice(v.resources[0].entries.findIndex((e:any)=>e.path===root+'/wght.css'),1),(v:any)=>v.resources[0].entries.find((e:any)=>e.path===root+'/files').members.push('new-normal.woff2')]) {
-      const v=structuredClone(c);mutate(v);const {digest,...body}=v;v.digest=digestCanonical(body);expect(()=>validateInstalledDataResourceCapture(v)).toThrow();
+      const v:any=structuredClone(c);mutate(v);const {digest,...body}=v;v.digest=digestCanonical(body);expect(()=>validateInstalledDataResourceCapture(v)).toThrow();
     }
   });
   it('refuses bounded count/bytes rather than truncating',async()=>{

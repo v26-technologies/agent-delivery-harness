@@ -26,10 +26,10 @@ describe("owned installed-data observation",()=>{
   it("captures public package resolution, complete directory names and exact binary bytes between verification fences",async()=>{
     const f=await fixture(); const value=await captureOwnedInstalledDataResources(f.snapshot,[request],context);
     expect(f.count()).toBe(2);
-    expect(value.resources[0].resolution.search.map((row:any)=>row.path)).toEqual(["packages/app/node_modules/@fonts/demo","packages/node_modules/@fonts/demo","node_modules/@fonts/demo"]);
-    const entries=value.resources[0].entries;
-    expect(entries.find((row:any)=>row.path.endsWith("/files")).members).toEqual(["a-italic.woff2","a-normal.woff2"]);
-    expect(entries.find((row:any)=>row.path.endsWith("a-normal.woff2")).bytesBase64).toBe("AP8BgA==");
+    expect(value.resources[0]!.resolution.search.map((row:any)=>row.path)).toEqual(["packages/app/node_modules/@fonts/demo","packages/node_modules/@fonts/demo","node_modules/@fonts/demo"]);
+    const entries=value.resources[0]!.entries;
+    expect(entries.find((row:any)=>row.path.endsWith("/files"))!.members).toEqual(["a-italic.woff2","a-normal.woff2"]);
+    expect(entries.find((row:any)=>row.path.endsWith("a-normal.woff2"))!.bytesBase64).toBe("AP8BgA==");
     expect(entries.some((row:any)=>row.path.endsWith("a-italic.woff2"))).toBe(false);
     expect(JSON.stringify(value)).not.toContain(f.root);
   });
@@ -39,7 +39,7 @@ describe("owned installed-data observation",()=>{
     expect(bytes.digest).not.toBe(first.digest);
     await writeFile(path.join(f.pkg,"files/b-normal.woff2"),"added");const names=await captureOwnedInstalledDataResources(f.snapshot,[request],context);
     expect(names.digest).not.toBe(bytes.digest);
-    expect(names.resources[0].entries.find((row:any)=>row.path.endsWith("/files")).members).toContain("b-normal.woff2");
+    expect(names.resources[0]!.entries.find((row:any)=>row.path.endsWith("/files"))!.members).toContain("b-normal.woff2");
   });
   it("refuses closer packages, unexported manifests and resource links without observing an author installation",async()=>{
     for(const mode of ["closer","exports","link"]){

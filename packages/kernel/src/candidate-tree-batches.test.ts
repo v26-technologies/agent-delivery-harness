@@ -191,6 +191,7 @@ it("passes finite stdin bytes and reports unstartable commands and stdin pipe fa
   expect(closed.exitCode).toBe(-1); expect(closed.stderr).not.toBe("");
 });
 
+// Writes and twice reads an artifact one byte over the portable limit: about 4 s locally, more on CI runners.
 it("preserves native source size policy, pre-body evidence refusal, and path/link refusals", async () => {
   const f = fixture(), large = Buffer.alloc(MAX_PORTABLE_ARTIFACT_BYTES + 1, 137); writeFileSync(path.join(f.root, "large"), large);
   f.git("add", "large"); const tree = f.git("write-tree").toString().trim();
@@ -201,4 +202,4 @@ it("preserves native source size policy, pre-body evidence refusal, and path/lin
   expect(f.calls().slice(before).map(call => call.args.slice(0, 2))).toEqual([["cat-file", "-s"]]);
   for (const name of ["../escape", "escape", "cycle"]) await expect(source(name)).rejects.toMatchObject({ blockers: [{ code: "portable_tree_unreadable" }] });
   expect(await source("dangling")).toBeNull();
-});
+}, 30_000);
