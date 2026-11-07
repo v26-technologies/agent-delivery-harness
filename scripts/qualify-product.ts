@@ -2364,7 +2364,9 @@ export async function runScopedRuntimeQualification(runtimeRoot: string): Promis
     const receipt = JSON.stringify({ release });
     write(files, ".agent-skills/active.json", receipt); await cli(files, "prepare");
     write(files, ".agent-skills/active.json", JSON.stringify({ release, padding: "x".repeat(2 * 1024 * 1024) }));
-    const oversizedReceipt = await cli(files, "prepare", 1);
+    // No mechanical provider is selected, so preparation defers source identity
+    // to the gate (V26-2347); the gate is where the bound must still refuse.
+    await cli(files, "prepare"); const oversizedReceipt = await cli(files, "gate", 1);
     requireObservation(oversizedReceipt.stderr.includes("portable_tree_unreadable"), "valid oversized release metadata must use the bounded evidence reader");
     write(files, ".agent-skills/active.json", receipt); await cli(files, "prepare");
     proven.add("bounded-release-metadata");
