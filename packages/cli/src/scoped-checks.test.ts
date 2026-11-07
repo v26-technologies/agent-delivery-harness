@@ -362,11 +362,16 @@ it('nonreusable credentials portable fresh clone',async()=>{
  await exec('git',['clone','--no-local',f.dir,foreign]);await exec('git',['update-ref','refs/remotes/origin/main',await f.git('rev-parse','origin/main')],{cwd:foreign});
  const verified=await runCli(['verify'],{...f.runtime,cwd:foreign});expect(verified).toBe(0);
 },60000);
-it.each(['check', 'dependencies'])('rejects an absolute authoring executable in %s before setup', async kind => {
+// Zero mechanical preparation defers runtime identities to the gate (V26-2347),
+// so the refusal lands in prepare only when the check is mechanical.
+it.each([['check', true], ['dependencies', true], ['check', false], ['dependencies', false]] as const)('rejects an absolute authoring executable in %s before setup (mechanical: %s)', async (kind, mechanical) => {
  const f=await fixture(); const script=path.join(f.dir,'check.cjs'); await writeFile(script,`#!${process.execPath}\nprocess.exit(7);\n`);
  const a=f.config.providers[0]!;
- f.setConfig(kind==='check' ? {...f.config,providers:[{...a,check:{...a.check!,command:[script]}},f.config.providers[1]!]} : {...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,dependencies:{command:[script],timeoutMs:5000}}]}});
- expect(await f.run('prepare')).toBe(1);expect(f.err.join('\n')).toContain('check_runtime_author_path');
+ const scopedExecution={...f.config.scopedExecution!,mechanicalProviders:mechanical?['check.a']:[]};
+ f.setConfig(kind==='check' ? {...f.config,scopedExecution,providers:[{...a,check:{...a.check!,command:[script]}},f.config.providers[1]!]} : {...f.config,scopedExecution:{...scopedExecution,profiles:[{...scopedExecution.profiles[0]!,dependencies:{command:[script],timeoutMs:5000}}]}});
+ if (mechanical) expect(await f.run('prepare')).toBe(1);
+ else { expect(await f.run('prepare'),f.err.join('\n')).toBe(0); expect(await f.run('gate')).toBe(1); }
+ expect(f.err.join('\n')).toContain('check_runtime_author_path');
 },60000);
 it('missing dependency input is a named preflight blocker',async()=>{
  const f=await fixture();f.setConfig({...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,dependencyInputs:['missing.lock']}]}});
