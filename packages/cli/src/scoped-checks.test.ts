@@ -200,15 +200,19 @@ it("retains A across B failure, retry and report replan, then records portable e
   expect(await f.run("verify")).toBe(1);
   expect(f.err.join("\n")).toContain("portable_scoped_inputs_invalid");
 }, 60000);
-it("keeps valid workflow release receipts bounded separately from scoped source inputs", async () => {
+// Zero mechanical preparation defers source identity to the gate (V26-2347),
+// so the oversized receipt is refused at prepare only when the check is mechanical.
+it.each([true, false])("keeps valid workflow release receipts bounded separately from scoped source inputs (mechanical: %s)", async mechanical => {
   const f = await fixture(); f.env["FAIL"] = "0";
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: mechanical ? ["check.a"] : [] } });
   await mkdir(path.join(f.dir, ".agent-skills"), { recursive: true });
   const release = { releaseId: "test-release", profile: "linear", archiveSha256: "a".repeat(64), metadataSha256: "b".repeat(64) };
   const receipt = path.join(f.dir, ".agent-skills/active.json");
   await writeFile(receipt, JSON.stringify({ release }));
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   await writeFile(receipt, JSON.stringify({ release, padding: "x".repeat(2 * 1024 * 1024) }));
-  expect(await f.run("prepare"), f.err.join("\n")).toBe(1);
+  if (mechanical) expect(await f.run("prepare"), f.err.join("\n")).toBe(1);
+  else { expect(await f.run("prepare"), f.err.join("\n")).toBe(0); expect(await f.run("gate"), f.err.join("\n")).toBe(1); }
   expect(f.err.join("\n")).toContain("portable_tree_unreadable");
   await writeFile(receipt, JSON.stringify({ release }));
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
@@ -369,9 +373,13 @@ it.each([['check', true], ['dependencies', true], ['check', false], ['dependenci
  const a=f.config.providers[0]!;
  const scopedExecution={...f.config.scopedExecution!,mechanicalProviders:mechanical?['check.a']:[]};
  f.setConfig(kind==='check' ? {...f.config,scopedExecution,providers:[{...a,check:{...a.check!,command:[script]}},f.config.providers[1]!]} : {...f.config,scopedExecution:{...scopedExecution,profiles:[{...scopedExecution.profiles[0]!,dependencies:{command:[script],timeoutMs:5000}}]}});
- if (mechanical) expect(await f.run('prepare')).toBe(1);
- else { expect(await f.run('prepare'),f.err.join('\n')).toBe(0); expect(await f.run('gate')).toBe(1); }
- expect(f.err.join('\n')).toContain('check_runtime_author_path');
+ const snapshots=await import('./check-snapshot.ts'),created=vi.spyOn(snapshots,'createCheckSnapshot');
+ try {
+  if (mechanical) expect(await f.run('prepare')).toBe(1);
+  else { expect(await f.run('prepare'),f.err.join('\n')).toBe(0); expect(await f.run('gate')).toBe(1); }
+  expect(f.err.join('\n')).toContain('check_runtime_author_path');
+  expect(created).not.toHaveBeenCalled();
+ } finally { created.mockRestore(); }
 },60000);
 it('missing dependency input is a named preflight blocker',async()=>{
  const f=await fixture();f.setConfig({...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,dependencyInputs:['missing.lock']}]}});

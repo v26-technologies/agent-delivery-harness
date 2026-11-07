@@ -39,6 +39,10 @@ const CLEAN_TREE: Readonly<Record<string, string>> = {
   "packages/kernel/src/candidate.types.ts": `export interface CandidateShape { digest: string }\n`,
   "packages/kernel/src/records.types.ts": `export interface RecordShape { id: string }\n`,
   "packages/kernel/src/artifacts.types.ts": `export interface ArtifactsPort { read(p: string): Promise<string> }\n`,
+  // The finite installed-DATA grammar and its applicability evidence, each pure.
+  "packages/kernel/src/portable-limits.ts": `export const MAX_PORTABLE_ARTIFACT_BYTES = 1;\n`,
+  "packages/kernel/src/installed-data-resources.ts": `import { sha256 } from "./digest.ts";\nimport { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";\nexport const normalizeInstalledDataResourceRequests = (v: string): string => sha256(v) + MAX_PORTABLE_ARTIFACT_BYTES;\n`,
+  "packages/kernel/src/installed-data-evidence.ts": `import { normalizeInstalledDataResourceRequests } from "./installed-data-resources.ts";\nexport const binding = (v: string): string => normalizeInstalledDataResourceRequests(v);\n`,
 
   // Kernel modules that legitimately touch the filesystem.
   "packages/kernel/src/identity.ts": `import { execFileSync } from "node:child_process";\nexport const lsTree = (): string => String(execFileSync("git", ["ls-tree"]));\n`,
