@@ -1126,6 +1126,184 @@ it("an abort stops every worker and cleans up every pooled snapshot", async () =
     expect(observed.providers.map(p => p.attempts.at(-1)?.status)).toEqual(["interrupted", "passed", "interrupted"]);
   } finally { spy.mockRestore(); await Promise.all([...roots, ...clones].map(root => rm(root, { recursive: true, force: true }))); }
 }, 60000);
+/** Every process, read-only: a test proves a group is its own before anything signals it. */
+async function processTable() {
+  return (await exec("ps", ["-A", "-o", "pid=,pgid=,command="])).stdout.split("\n").map(line => line.trim().split(/\s+/)).filter(row => row.length > 2)
+    .map(row => ({ pid: Number(row[0]), pgid: Number(row[1]), command: row.slice(2).join(" ") }));
+}
+/**
+ * c1 fails once c2's grandchild is beating; c2 leads its own process group, starts that grandchild (tagged
+ * with a token unique to this test) and sleeps `sleepMs`; c3 is trivial and starts only when a worker frees.
+ */
+async function heartbeatFixture(concurrency: number, sleepMs: number, failFast?: boolean) {
+  const token = `scoped-failfast-heartbeat-${process.pid}-${Date.now()}`;
+  const f = await poolFixture(["1", "2", "3"], concurrency, (id, shared) => {
+    const beat = path.join(shared, "heartbeat"), leader = path.join(shared, "leader");
+    // c2's snapshot setup alone can take tens of seconds on a loaded machine, so c1 waits long for its beat.
+    if (id === "c1") return `const fs=require('fs'),end=Date.now()+90000;while(!fs.existsSync(${JSON.stringify(`${beat}.pid`)})){if(Date.now()>end)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}` +
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);fs.writeFileSync(${JSON.stringify(path.join(shared, "failed-at"))},String(Date.now()));console.log('c1 broke');process.exit(3)`;
+    if (id === "c2") return `const fs=require('fs'),cp=require('child_process');fs.writeFileSync(${JSON.stringify(leader)},String(process.pid));` +
+      `cp.spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');fs.writeFileSync(${JSON.stringify(`${beat}.pid`)},String(process.pid));setInterval(()=>fs.appendFileSync(${JSON.stringify(beat)},Date.now()+'\\n'),25)`)},${JSON.stringify(token)}],{stdio:'ignore'}).unref();` +
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${sleepMs})`;
+    return "";
+  });
+  if (failFast !== undefined) f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } } as unknown as HarnessConfigInput);
+  const beats = async () => (await readFile(path.join(f.shared, "heartbeat"), "utf8").catch(() => "")).split("\n").filter(Boolean).map(Number);
+  const failedAt = async () => Number(await readFile(path.join(f.shared, "failed-at"), "utf8"));
+  const leader = async () => Number(await readFile(path.join(f.shared, "leader"), "utf8"));
+  /** Only a pid this test's grandchild wrote, still carrying this test's token, is ever signalled. */
+  const reap = async () => {
+    const pid = Number(await readFile(path.join(f.shared, "heartbeat.pid"), "utf8").catch(() => "0"));
+    if (pid > 0 && (await processTable()).some(row => row.pid === pid && row.command.includes(token))) process.kill(pid, "SIGKILL");
+  };
+  return { ...f, token, beats, failedAt, leader, reap };
+}
+const lastStatuses = async (f: { dir: string; config: Parameters<typeof import("./index.ts")["readScopedCheckObservations"]>[0]["config"] }) => {
+  const { readScopedCheckObservations } = await import("./index.ts");
+  return (await readScopedCheckObservations({ rootDir: f.dir, config: f.config })).providers.map(p => [p.providerId, p.attempts.map(a => a.status)]);
+};
+/** How long the sibling sleeps, and the most a fail-fast cancellation may take to silence its grandchild. */
+const SIBLING_MS = 4000, KILL_BOUND_MS = 1500;
+it.each([undefined, false])("characterization: with failFast %s, gate runs every check to completion after the first failure", async failFast => {
+  const f = await heartbeatFixture(2, SIBLING_MS, failFast);
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(await f.run("gate")).toBe(1);
+    const out = f.out.join("\n");
+    expect(out).toMatch(/failed check\.c1: check_command_failed/);
+    expect(out).toMatch(/passed check\.c2:/);
+    expect(out).toMatch(/passed check\.c3:/);
+    expect(out).not.toMatch(/interrupted/);
+    expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["passed"]], ["check.c3", ["passed"]]]);
+    // The sibling's grandchild kept beating for the sibling's whole run, then died with its group.
+    expect((await f.beats()).at(-1)! - await f.failedAt()).toBeGreaterThan(KILL_BOUND_MS);
+    const leader = await f.leader();
+    expect((await processTable()).filter(row => row.pgid === leader)).toEqual([]);
+    expect(f.err.join("\n").match(/check_command_failed/g)).toHaveLength(1);
+  } finally { await f.reap(); }
+}, 240000);
+it("with failFast, gate's first failure signals the running sibling's group and never starts the rest", async () => {
+  const f = await heartbeatFixture(2, SIBLING_MS, true);
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(await f.run("gate")).toBe(1);
+    const out = f.out.join("\n");
+    expect(out).toMatch(/failed check\.c1: check_command_failed/);
+    expect(out).toMatch(/interrupted check\.c2: check_cancelled; attempt/);
+    expect(out).toMatch(/interrupted check\.c3: check_cancelled before it started, after check\.c1 failed/);
+    expect(out).not.toMatch(/checking check\.c3/);
+    expect(out).not.toMatch(/passed check\./);
+    expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["interrupted"]], ["check.c3", ["interrupted"]]]);
+    // The grandchild was beating when c1 failed, stopped within the bound, and nothing of its group survives.
+    const beats = await f.beats(), failedAt = await f.failedAt();
+    expect(beats.length).toBeGreaterThan(0);
+    expect(beats.at(-1)! - failedAt).toBeLessThan(KILL_BOUND_MS);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(await f.beats()).toEqual(beats);
+    const leader = await f.leader();
+    expect(leader).not.toBe(process.pid);
+    expect((await processTable()).filter(row => row.pgid === leader)).toEqual([]);
+    // The gate is blocked by the one failure; the cancellations are not failures of their own.
+    const err = f.err.join("\n");
+    expect(err.match(/check_command_failed/g)).toHaveLength(1);
+    expect(err).not.toMatch(/check_cancelled/);
+    const { readScopedCheckDiagnostics, readScopedCheckObservations } = await import("./index.ts");
+    const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
+    const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.map(a => a.attemptId)) });
+    const recorded = Object.fromEntries(diagnostics.providers.map(p => [p.providerId, p.attempts[0]!.diagnostic]));
+    expect(recorded["check.c2"]).toMatchObject({ availability: "available", phase: "command", failure: { code: "check_cancelled", executionErrorCode: "ABORT_ERR" } });
+    expect(recorded["check.c3"]).toMatchObject({ availability: "available", phase: "snapshot-setup", failure: { code: "check_cancelled" }, command: { unavailable: "not-started" } });
+  } finally { await f.reap(); }
+}, 240000);
+it("with failFast, a sibling still in its dependency setup when the failure lands stops before its command", async () => {
+  // c2's own setup holds until c1 has failed, so c1's failure always lands while c2 is in setup.
+  const f = await poolFixture(["1", "2"], 2, (id, shared) => id === "c1"
+    ? `const fs=require('fs'),end=Date.now()+90000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "c2-setup"))})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);fs.writeFileSync(${JSON.stringify(path.join(shared, "failed-at"))},'');process.exit(3)`
+    : "");
+  const setup = `const fs=require('fs'),end=Date.now()+90000;fs.writeFileSync(${JSON.stringify(path.join(f.shared, "c2-setup"))},'');` +
+    `while(!fs.existsSync(${JSON.stringify(path.join(f.shared, "failed-at"))})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500)`;
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true,
+    profiles: f.config.scopedExecution!.profiles.map(p => p.id === "pc2" ? { ...p, dependencies: { command: [process.execPath, "-e", setup] as [string, ...string[]], timeoutMs: 120000 } } : p) } } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n");
+  expect(out).toMatch(/failed check\.c1: check_command_failed/);
+  expect(out).toMatch(/interrupted check\.c2: check_cancelled; attempt/);
+  expect(out).not.toMatch(/checking check\.c2/);
+  expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["interrupted"]]]);
+  const { readScopedCheckDiagnostics, readScopedCheckObservations } = await import("./index.ts");
+  const observed = await readScopedCheckObservations({ rootDir: f.dir, config: f.config });
+  const diagnostics = await readScopedCheckDiagnostics({ rootDir: f.dir, config: f.config, attemptIds: observed.providers.flatMap(p => p.attempts.map(a => a.attemptId)) });
+  expect(diagnostics.providers.find(p => p.providerId === "check.c2")!.attempts[0]!.diagnostic).toMatchObject({ availability: "available", phase: "pre-command-verification", failure: { code: "check_cancelled" }, command: { unavailable: "not-started" } });
+}, 240000);
+it.each([undefined, true])("on a single worker with failFast %s, a failure leaves the rest to run or records them interrupted unstarted", async failFast => {
+  const f = await poolFixture(["1", "1", "1"], 1, (id, shared) => id === "c1" ? `if(require('fs').existsSync(${JSON.stringify(path.join(shared, "fail"))}))process.exit(3)` : "");
+  if (failFast !== undefined) f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  await writeFile(path.join(f.shared, "fail"), "");
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n");
+  expect(out).toMatch(/failed check\.c1: check_command_failed/);
+  if (failFast) {
+    expect(out).not.toMatch(/checking check\.c[23]/);
+    expect(out).toMatch(/interrupted check\.c2: check_cancelled before it started, after check\.c1 failed/);
+    expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["interrupted"]], ["check.c3", ["interrupted"]]]);
+  } else expect(await lastStatuses(f)).toEqual([["check.c1", ["failed"]], ["check.c2", ["passed"]], ["check.c3", ["passed"]]]);
+  // A cancelled attempt fences nothing: once c1 is fixed, the same gate admits and records.
+  await rm(path.join(f.shared, "fail"));
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  expect(await f.run("record"), f.err.join("\n")).toBe(0);
+}, 240000);
+it.each([undefined, true])("on a pool with failFast %s, a scoped failure leaves an unscoped declared check to run or never starts it", async failFast => {
+  const f = await poolFixture(["1", "1"], 2, id => id === "c1" ? "process.exit(3)" : "");
+  const plain = { id: "check.plain", findingCodes: [], check: { command: [process.execPath, "-e", ""] as [string, ...string[]], timeoutMs: 5000 } };
+  f.setConfig({ ...f.config, providers: [...f.config.providers, plain],
+    obligations: [...f.config.obligations, { ...f.config.obligations[0]!, id: "check.plain.passed", providers: [plain.id] }],
+    scopedExecution: { ...f.config.scopedExecution!, ...(failFast === undefined ? {} : { failFast }) } } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n");
+  expect(out).toMatch(/failed check\.c1: check_command_failed/);
+  if (failFast) expect(out).not.toContain("checking check.plain");
+  else expect(out).toContain("checking check.plain");
+}, 240000);
+/** Three 30000 ms checks, so the budget is exactly met at 90000 and the cap at 30000. `f.config` is the
+ * pool fixture's, read when it was spread, so a later reconfiguration restates the bounds it keeps. */
+async function budgetFixture(budget: { budgetMs?: number; checkBudgetMs?: number }, timeouts: readonly number[] = [30000, 30000, 30000]) {
+  const f = await poolFixture(["1", "1", "1"], 2, () => "");
+  f.setConfig({ ...f.config, providers: f.config.providers.map((p, i) => ({ ...p, check: { ...p.check!, timeoutMs: timeouts[i]! } })),
+    scopedExecution: { ...f.config.scopedExecution!, ...budget } } as unknown as HarnessConfigInput);
+  return f;
+}
+it("a selection at exactly budgetMs, every check at exactly checkBudgetMs, prepares and gate runs it", async () => {
+  const f = await budgetFixture({ budgetMs: 90000, checkBudgetMs: 30000 });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  expect(f.out.join("\n").match(/passed check\.c\d/g)?.sort()).toEqual(["passed check.c1", "passed check.c2", "passed check.c3"]);
+}, 90000);
+it.each(["prepare", "gate"])("%s refuses a selection one millisecond over budgetMs, naming only the check that pushes it over", async command => {
+  const f = await budgetFixture({ budgetMs: 90000, checkBudgetMs: 30000 });
+  if (command === "gate") expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  f.setConfig({ ...f.config, providers: f.config.providers.map(p => ({ ...p, check: { ...p.check!, timeoutMs: 30000 } })), scopedExecution: { ...f.config.scopedExecution!, budgetMs: 89999, checkBudgetMs: 30000 } } as unknown as HarnessConfigInput);
+  expect(await f.run(command)).toBe(1);
+  const err = f.err.join("\n");
+  expect(err).toContain("scoped_budget_exceeded");
+  expect(err).toContain("check.c3 pushes the declared total to 90000ms over budgetMs 89999");
+  expect(err).not.toMatch(/check\.c[12]\b/);
+  expect(f.out.join("\n")).not.toMatch(/checking /);
+}, 90000);
+it.each(["prepare", "gate"])("%s refuses a selection under budget with one check over checkBudgetMs, naming only that check", async command => {
+  const f = await budgetFixture({ budgetMs: 1000000, checkBudgetMs: 30000 });
+  if (command === "gate") expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  f.setConfig({ ...f.config, providers: f.config.providers.map(p => ({ ...p, check: { ...p.check!, timeoutMs: p.id === "check.c2" ? 30001 : 30000 } })),
+    scopedExecution: { ...f.config.scopedExecution!, budgetMs: 1000000, checkBudgetMs: 30000 } } as unknown as HarnessConfigInput);
+  expect(await f.run(command)).toBe(1);
+  const err = f.err.join("\n");
+  expect(err).toContain("scoped_budget_exceeded");
+  expect(err).toContain("check.c2 declares timeoutMs 30001 over checkBudgetMs 30000");
+  expect(err).not.toMatch(/check\.c[13]\b/);
+  expect(f.out.join("\n")).not.toMatch(/checking /);
+}, 90000);
 it("records an unscoped declared check's evidence during gate alongside scoped providers", async () => {
   const f = await fixture(); f.env["FAIL"] = "0";
   const plain = { id: "check.plain", findingCodes: [], check: { command: [process.execPath, "-e", ""] as [string, ...string[]], timeoutMs: 5000 } };

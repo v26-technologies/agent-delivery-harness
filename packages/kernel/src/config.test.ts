@@ -34,6 +34,7 @@ import {
   emittableFindingCodes,
   matchesNeutralSet,
   isInstalledDataConsumerDefinition,
+  scopedBudgetOffenders,
   validateHarnessConfig,
   type HarnessConfig,
   type HarnessConfigInput,
@@ -1126,4 +1127,57 @@ it('installed consumer applicability protocol requires cold checks fallback and 
  const {installedData,...check}=input.providers[0]!.check;
  expectOnly({...input,providers:[{...input.providers[0]!,check}],obligations:[{...input.obligations[0]!,acceptedPayloadSpecs:specs}]},'config_invalid_member');
  expect(codesFor({...input,providers:[{...input.providers[0]!,check}],obligations:[{...input.obligations[0]!,acceptedPayloadSpecs:['checks.passed/1','checks.passed/1']}]})).toEqual(expect.arrayContaining(['config_invalid_member','config_duplicate_id']));
+});
+
+describe("scopedExecution.failFast, budgetMs and checkBudgetMs", () => {
+  const profile = { id: "fixture", dependencyInputs: [], mutableOutputs: [], credentialIdentities: {} };
+  const scope = { version: "scoped-check/1", files: [], memberships: [], tests: [], cwd: ".", profile: "fixture", environment: [] };
+  const withScoped = (members: Record<string, unknown>, timeouts: readonly number[] = []) => {
+    const base = validInput();
+    const providers = timeouts.map((timeoutMs, i) => ({ id: `check.s${i + 1}`, findingCodes: [PROVIDER_CODE], check: { command: ["node", "-e", ""], timeoutMs, scope } }));
+    return { ...base, providers: [...base.providers, ...providers],
+      obligations: [...base.obligations, ...providers.map(p => ({ ...base.obligations[0]!, id: `${p.id}.passed`, providers: [p.id], freshness: "exact_candidate", acceptedPayloadSpecs: ["checks.passed/1"] }))],
+      scopedExecution: { version: "scoped-execution/1", mechanicalProviders: [], profiles: [profile], ...members } };
+  };
+  it("leaves all three absent when unset, so an existing config normalizes as before", () => {
+    const scoped = define(withScoped({})).scopedExecution!;
+    expect(Object.keys(scoped).sort()).toEqual(["mechanicalProviders", "profiles", "version"]);
+  });
+  it("accepts a boolean failFast and positive integer budgets", () => {
+    for (const failFast of [true, false]) expect(define(withScoped({ failFast })).scopedExecution?.failFast).toBe(failFast);
+    expect(define(withScoped({ budgetMs: 900000, checkBudgetMs: 300000 })).scopedExecution).toMatchObject({ budgetMs: 900000, checkBudgetMs: 300000 });
+    expect(define(withScoped({ budgetMs: 1, checkBudgetMs: 1 })).scopedExecution).toMatchObject({ budgetMs: 1, checkBudgetMs: 1 });
+  });
+  it.each(["budgetMs", "checkBudgetMs"])("refuses a %s that is not a positive safe integer", member => {
+    for (const invalid of [0, -1, 1.5, "300000", null, Number.MAX_SAFE_INTEGER + 1]) expectOnly(withScoped({ [member]: invalid }), "config_invalid_member");
+  });
+  it("refuses a failFast that is not a boolean", () => {
+    for (const invalid of ["true", 1, 0, null]) expectOnly(withScoped({ failFast: invalid }), "config_invalid_member");
+  });
+  it("does not refuse an over-budget selection at load: the command receiving it does", () => {
+    expect(define(withScoped({ budgetMs: 10, checkBudgetMs: 5 }, [6, 6])).scopedExecution).toMatchObject({ budgetMs: 10, checkBudgetMs: 5 });
+  });
+  describe("scopedBudgetOffenders", () => {
+    const offenders = (members: Record<string, unknown>, timeouts: readonly number[]) => scopedBudgetOffenders(define(withScoped(members, timeouts)));
+    it("refuses nothing at exactly the budget with every check at exactly the cap", () => {
+      expect(offenders({ budgetMs: 900, checkBudgetMs: 300 }, [300, 300, 300])).toEqual({ overCap: [], overBudget: [], totalMs: 900 });
+    });
+    it("names only the checks at which the declared running total passes the budget", () => {
+      expect(offenders({ budgetMs: 900 }, [300, 300, 300, 1])).toEqual({ overCap: [], overBudget: ["check.s4"], totalMs: 901 });
+      expect(offenders({ budgetMs: 899 }, [300, 300, 300])).toEqual({ overCap: [], overBudget: ["check.s3"], totalMs: 900 });
+      expect(offenders({ budgetMs: 500 }, [300, 300, 300])).toEqual({ overCap: [], overBudget: ["check.s2", "check.s3"], totalMs: 900 });
+    });
+    it("names only the checks over the cap", () => {
+      expect(offenders({ budgetMs: 10000, checkBudgetMs: 300 }, [300, 301, 299])).toEqual({ overCap: ["check.s2"], overBudget: [], totalMs: 900 });
+    });
+    it("counts scoped checks only, and refuses nothing with neither bound set", () => {
+      // An unscoped declared check beside a selection exactly at both bounds is no part of the selection.
+      const input = withScoped({ budgetMs: 900, checkBudgetMs: 300 }, [300, 300, 300]);
+      const unscoped = { id: "check.unscoped", findingCodes: [PROVIDER_CODE], check: { command: ["node", "-e", ""], timeoutMs: 5000 } };
+      const withUnscoped = { ...input, providers: [...input.providers, unscoped], obligations: [...input.obligations, { ...input.obligations.at(-1)!, id: "check.unscoped.passed", providers: [unscoped.id] }] };
+      expect(scopedBudgetOffenders(define(withUnscoped))).toEqual({ overCap: [], overBudget: [], totalMs: 900 });
+      expect(offenders({}, [5000, 5000])).toEqual({ overCap: [], overBudget: [], totalMs: 10000 });
+      expect(scopedBudgetOffenders(define(validInput()))).toEqual({ overCap: [], overBudget: [], totalMs: 0 });
+    });
+  });
 });

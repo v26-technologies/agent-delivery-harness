@@ -2,6 +2,7 @@ import { ScopedChecks } from "../scoped-checks.ts";
 import { CheckSnapshotError } from "../check-snapshot.ts";
 import { commandBlocker } from "../boundary.ts";
 import { runDeclaredCheck } from "../declared-checks.ts";
+import { refuseOverBudget } from "../scoped-budget.ts";
 /**
  * `gate` — evaluate the delivery gate and, under a TTY, offer a scoped waiver.
  *
@@ -61,8 +62,11 @@ async function providerAdmission(
   const attemptBlockers: Blocker[] = [];
   let admission = await admit(input, admissionOptions);
   await session?.explainReuse((admission.decision?.resolutions ?? []).flatMap(r => r.kind === "satisfied_evidence" ? [r.providerId] : []));
+  // Under `scopedExecution.failFast` the first failing scoped check ends the run of checks: nothing further starts.
+  const failFast = context.config.scopedExecution?.failFast === true;
+  let failedFast = false;
 
-  while (!admission.admitted && admission.decision !== undefined && admission.candidate !== undefined) {
+  while (!failedFast && !admission.admitted && admission.decision !== undefined && admission.candidate !== undefined) {
     const requested = new Map<string, { obligationIds: string[]; requiresEvidence: boolean; needsLiveResult: boolean }>();
     for (const resolution of admission.decision.resolutions) {
       if (resolution.kind !== "blocked") continue;
@@ -88,6 +92,7 @@ async function providerAdmission(
       for (const [id] of scoped) attempted.add(id);
       const failures = await session.executeAll(scoped.map(([id, request]) => ({ provider: context.config.providers.find(p => p.id === id)!, obligationIds: request.obligationIds })));
       attemptBlockers.push(...failures.map(scopedCheckBlocker));
+      failedFast = failFast && failures.length > 0;
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }
@@ -104,6 +109,10 @@ async function providerAdmission(
         catch (error) {
           if (!(error instanceof CheckSnapshotError)) throw error;
           attemptBlockers.push(scopedCheckBlocker(error));
+          if (failFast) {
+            failedFast = true;
+            await session.cancelUnstarted([...requested.keys()].filter(id => !attempted.has(id) && context.config.providers.find(p => p.id === id)!.check?.scope), providerId);
+          }
         }
       } else attemptBlockers.push(...await runDeclaredCheck(context, registration, request.obligationIds, admission.candidate, session ? { scopedPlan: await session.plan(), readOutput: session.readOutput, resourceBindings: await session.resourceBindings() } : {}));
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
@@ -147,6 +156,8 @@ async function providerAdmission(
 }
 
 export async function runProviderBackedAdmission(context: CommandContext, options: { readonly allowPrompt: boolean; readonly includeInjectedLiveResults: boolean }): Promise<AdmissionResult & { readonly observedLiveResults?: readonly LiveProviderResult[] }> {
+  // Before any capture or check: a selection over its declared budget runs nothing.
+  refuseOverBudget(context.config);
   let session: ScopedChecks | undefined;
   try {
     if (context.config.providers.some(p => p.check?.scope)) {

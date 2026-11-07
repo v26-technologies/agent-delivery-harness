@@ -298,10 +298,33 @@ export interface ScopedExecutionDefinition {
   readonly repairCommands?: readonly PreparationCommand[];
   /** How many scoped checks may run at once, each in a snapshot its worker owns; unset means one. */
   readonly concurrency?: number;
+  /** In `gate`, the first failing scoped check cancels the rest: unstarted ones never start, running ones
+   * have their process group signalled, and both are recorded `interrupted`. Unset runs every check. */
+  readonly failFast?: boolean;
+  /** The most the scoped checks' summed `timeoutMs` may declare; a larger selection is refused. */
+  readonly budgetMs?: number;
+  /** The most any one scoped check's `timeoutMs` may declare; a larger check is refused. */
+  readonly checkBudgetMs?: number;
+}
+/**
+ * The scoped checks a selection's declared budget refuses, by provider id. `overCap` are the checks whose
+ * own `timeoutMs` exceeds `checkBudgetMs`. `overBudget` are the checks that push the declared total past
+ * `budgetMs`: walking the scoped checks in declaration order, each one at which the running total exceeds
+ * the budget. A selection at exactly either bound is within it; with neither bound set nothing is refused.
+ */
+export function scopedBudgetOffenders(config: Pick<HarnessConfig, "providers" | "scopedExecution">): { readonly overCap: readonly string[]; readonly overBudget: readonly string[]; readonly totalMs: number } {
+  const checks = config.providers.filter(p => p.check?.scope).map(p => ({ id: p.id, timeoutMs: p.check!.timeoutMs }));
+  const { budgetMs, checkBudgetMs } = config.scopedExecution ?? {};
+  let totalMs = 0;
+  const overBudget: string[] = [];
+  for (const check of checks) { totalMs += check.timeoutMs; if (budgetMs !== undefined && totalMs > budgetMs) overBudget.push(check.id); }
+  return { overCap: checkBudgetMs === undefined ? [] : checks.filter(c => c.timeoutMs > checkBudgetMs).map(c => c.id), overBudget, totalMs };
 }
 function isScopedExecution(value: unknown): value is ScopedExecutionDefinition {
-  if (!isRecord(value) || Object.keys(value).some(k => !["mechanicalProviders", "profiles", "version", "repairCommands", "concurrency"].includes(k)) || value["version"] !== "scoped-execution/1" || !Array.isArray(value["profiles"]) || !Array.isArray(value["mechanicalProviders"])) return false;
+  if (!isRecord(value) || Object.keys(value).some(k => !["mechanicalProviders", "profiles", "version", "repairCommands", "concurrency", "failFast", "budgetMs", "checkBudgetMs"].includes(k)) || value["version"] !== "scoped-execution/1" || !Array.isArray(value["profiles"]) || !Array.isArray(value["mechanicalProviders"])) return false;
   if (value["concurrency"] !== undefined && (!Number.isSafeInteger(value["concurrency"]) || Number(value["concurrency"]) < 1)) return false;
+  if (value["failFast"] !== undefined && typeof value["failFast"] !== "boolean") return false;
+  if (["budgetMs", "checkBudgetMs"].some(k => value[k] !== undefined && (!Number.isSafeInteger(value[k]) || Number(value[k]) < 1))) return false;
   const repairs = value["repairCommands"];
   if (repairs !== undefined && (!Array.isArray(repairs) || new Set(repairs.map(r => isRecord(r) ? r["id"] : null)).size !== repairs.length || !repairs.every(r => isRecord(r) && Object.keys(r).sort().join(",") === "command,id,timeoutMs" && typeof r["id"] === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(r["id"]) && Array.isArray(r["command"]) && r["command"].length > 0 && r["command"].every(a => typeof a === "string" && a.length > 0 && !a.includes("\0")) && Number.isSafeInteger(r["timeoutMs"]) && Number(r["timeoutMs"]) > 0 && Number(r["timeoutMs"]) <= 3600000))) return false;
   const safe = (v: unknown) => typeof v === "string" && v.length > 0 && !v.startsWith("/") && !v.includes("\\") && !v.includes("\0") && !v.replace(/\/$/, "").split("/").some(p => p === ".." || p === "." || p === "") && !v.split("/").includes(".git") && !v.split("/").includes("node_modules");
