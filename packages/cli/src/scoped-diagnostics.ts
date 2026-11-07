@@ -18,6 +18,21 @@ export interface ScopedDependencyDiagnostic {
   readonly executionErrorCode?: ScopedDiagnosticExecutionCode;
   readonly command: ScopedDiagnosticCommand;
 }
+const setupPhases = ["materialization", "baseline-inventory", "dependencies", "post-dependency-inventory", "warm-base-wait", "clone", "pre-command-verification"] as const;
+/** How this attempt got the tree its command ran in, and what that cost up to the command.
+ * `executed`: this attempt ran the setup (a tree it built, or the warm base it then cloned);
+ * `reused`: the setup had already run (a clone of a warm base another check built, or the
+ * worker's tree retained from its previous check). `clone` names the copy-on-write method, or says
+ * why each worker built its own tree: cloning is unavailable here, or the setup wrote its own path
+ * into the tree (`path-bound`), or there is one worker (`not-used`). */
+export interface ScopedSetupDiagnostic {
+  readonly action: "executed" | "reused";
+  readonly snapshot: "built" | "cloned" | "retained";
+  readonly clone: "clonefile" | "reflink" | "unavailable" | "path-bound" | "not-used";
+  /** `index`: Git's index and untracked listing; `inventory`: every immutable byte hashed. */
+  readonly verification: "index" | "inventory";
+  readonly phases: readonly { readonly phase: typeof setupPhases[number]; readonly durationMs: number }[];
+}
 export interface RecordedScopedAttemptDiagnostic {
   readonly availability: "available";
   readonly phase: ScopedDiagnosticPhase;
@@ -26,6 +41,8 @@ export interface RecordedScopedAttemptDiagnostic {
   readonly command: ScopedDiagnosticCommand;
   /** Present only when this attempt actually ran dependency setup; never borrowed from a reused snapshot. */
   readonly dependency?: ScopedDependencyDiagnostic;
+  /** Present once this attempt began getting its tree, so a failed setup keeps its phases; absent on attempts recorded before setup was measured. */
+  readonly setup?: ScopedSetupDiagnostic;
 }
 export type ScopedAttemptDiagnostic = RecordedScopedAttemptDiagnostic
   | { readonly availability: "unavailable"; readonly reason: "legacy" | "running" };
@@ -138,8 +155,22 @@ function projectDiagnostic(value: unknown): RecordedScopedAttemptDiagnostic {
     dependency = { durationMs: value["durationMs"], command: commandDiagnostic(value["command"]),
       ...("executionErrorCode" in value ? { executionErrorCode: value["executionErrorCode"] as ScopedDiagnosticExecutionCode } : {}) };
   }
+  let setup: ScopedSetupDiagnostic | undefined;
+  if ("setup" in row) {
+    const value = object(row["setup"]);
+    const one = <T extends string>(field: string, allowed: readonly T[]): T => (allowed as readonly unknown[]).includes(value[field]) ? value[field] as T : corrupt();
+    const phasesValue = value["phases"];
+    if (!Array.isArray(phasesValue) || phasesValue.length > 16) return corrupt();
+    setup = { action: one("action", ["executed", "reused"]), snapshot: one("snapshot", ["built", "cloned", "retained"]),
+      clone: one("clone", ["clonefile", "reflink", "unavailable", "path-bound", "not-used"]), verification: one("verification", ["index", "inventory"]),
+      phases: phasesValue.map(entry => {
+        const phase = object(entry);
+        if (!(setupPhases as readonly unknown[]).includes(phase["phase"]) || typeof phase["durationMs"] !== "number" || !Number.isSafeInteger(phase["durationMs"]) || phase["durationMs"] < 0) return corrupt();
+        return { phase: phase["phase"] as typeof setupPhases[number], durationMs: phase["durationMs"] };
+      }) };
+  }
   return { availability: "available", phase: row["phase"] as ScopedDiagnosticPhase, failure: safeFailure, command: commandDiagnostic(row["command"]),
-    ...(dependency === undefined ? {} : { dependency }) };
+    ...(dependency === undefined ? {} : { dependency }), ...(setup === undefined ? {} : { setup }) };
 }
 
 /** Read at most 100 explicit attempts. No logs from legacy payloads, no writes,

@@ -4,7 +4,10 @@ export const snapshotInventoryWorker = String.raw`
 import { lstat, readFile, readdir, readlink, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-const { root, outputs, excludeDependencies, forbidGit, includeSource, absentInputs = [] } = JSON.parse(process.env.DELIVERY_SNAPSHOT_REQUEST);
+const { root, outputs, excludeDependencies, forbidGit, includeSource, absentInputs = [], selfReferences = [] } = JSON.parse(process.env.DELIVERY_SNAPSHOT_REQUEST);
+// A setup that writes this tree's own absolute path into a file binds the tree to where it is.
+const references = selfReferences.map(reference => Buffer.from(reference));
+let selfReferenced = false;
 const entries = [];
 const sourceEntries = [];
 const record = (relative, tuple) => {
@@ -136,7 +139,11 @@ const walk = async () => {
       slot.children = (await readdir(absolute)).sort().map(name => ({ relative: relative ? relative + '/' + name : name, mutable }));
       return slot.children;
     } else if (stat.isFile()) {
-      if (!mutable) slot.tuple = [relative, Number(stat.mode & 0o111n), createHash('sha256').update(await readFile(absolute)).digest('hex')];
+      if (!mutable) {
+        const bytes = await readFile(absolute);
+        if (!selfReferenced && references.some(reference => bytes.includes(reference))) selfReferenced = true;
+        slot.tuple = [relative, Number(stat.mode & 0o111n), createHash('sha256').update(bytes).digest('hex')];
+      }
     } else escape();
   });
   // Completion order grants no directory authority and cannot change digest
@@ -167,7 +174,7 @@ try {
   // Tuples contain only arrays, strings and permission integers: JSON.stringify
   // has exactly the same bytes as canonical JSON for this restricted shape.
   const digest = tuples => createHash('sha256').update(JSON.stringify(tuples)).digest('hex');
-  process.stdout.write(JSON.stringify({ digest: digest(entries), ...(includeSource ? { sourceDigest: digest(sourceEntries) } : {}) }));
+  process.stdout.write(JSON.stringify({ digest: digest(entries), ...(includeSource ? { sourceDigest: digest(sourceEntries) } : {}), ...(references.length ? { selfReferenced } : {}) }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ code: ['check_snapshot_escape', 'check_snapshot_drift'].includes(error.code) ? error.code : 'check_snapshot_unavailable' }));
   process.exitCode = 1;

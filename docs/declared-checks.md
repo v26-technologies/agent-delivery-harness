@@ -28,9 +28,39 @@ Repository policy continues to declare its review lenses, mechanical commands, v
 
 ## Scoped execution
 
-A check that declares a `scope` runs in a private snapshot of the prepared tree under one of the `scopedExecution` profiles. Profiles that declare the same dependency setup — the same `dependencies` command, the same `dependencyInputs` and the same `gitContext` — share one snapshot, so that setup installs once and every check in those profiles runs against the same installed bytes. Each check may still write only its own profile's `mutableOutputs`: before a check runs, its declared outputs and every output path of the other sharing profiles are removed, and afterwards the snapshot is verified with only its own profile's outputs excluded, so a write to another profile's output is drift. One snapshot is live at a time; moving to a different setup discards the previous snapshot before the next is created.
+A check that declares a `scope` runs in a private snapshot of the prepared tree under one of the `scopedExecution` profiles. Profiles that declare the same dependency setup — the same `dependencies` command, the same `dependencyInputs` and the same `gitContext` — share one snapshot, so that setup installs once and every check in those profiles runs against the same installed bytes. Each check may still write only its own profile's `mutableOutputs`: before a check runs, its declared outputs and every output path of the other sharing profiles are removed, and afterwards the snapshot is verified with only its own profile's outputs excluded, so a write to another profile's output is drift. With one worker, one snapshot is live at a time: moving to a different setup discards the previous snapshot before the next is created.
 
-`scopedExecution.concurrency` (a positive integer, default `1`) runs that many scoped checks at once, in both `prepare` and `gate`. Each worker takes the next check when it is free and owns its snapshots: it creates one per dependency setup the first time it needs it and reuses it for its later checks until the invocation ends, so a setup installs at most once per worker and two checks never share a snapshot at the same time. Each check's lines are printed together when it finishes. A failing check does not stop the others that are running, and an interruption removes every worker's snapshots. With `1` the checks run one at a time exactly as described above.
+`scopedExecution.concurrency` (a positive integer, default `1`) runs that many scoped checks at once, in both `prepare` and `gate`. Each worker takes the next check when it is free and owns its trees: it gets one per dependency setup the first time it needs it and reuses it for its later checks until the invocation ends, so two checks never share a tree at the same time. Each check's lines are printed together when it finishes. A failing check does not stop the others that are running, and an interruption removes every worker's trees. With `1` the checks run one at a time exactly as described above.
+
+### Snapshot setup and reuse
+
+With more than one worker, a setup runs once per invocation, not once per worker. The first check that needs a setup builds a warm base for it: the dependency setup runs there, and no check command ever does. Every worker, including that first one, takes a copy-on-write clone of the base: `clonefile(2)` on macOS (APFS), a reflink copy (`cp --reflink=always`) on Linux. Each clone is private, so a write in one clone reaches neither the base nor any other clone. Each worker builds its own tree as before, and the record says why, in two cases:
+
+- The temporary directory supports neither cloning method.
+- The setup wrote the tree's own absolute path into one of its files. A Python virtual environment's scripts are one example. A clone would still read and write the base through that path. The inventory that hashes the installed tree finds such files.
+
+Each attempt's retained diagnostic carries `setup`:
+
+- `action`: `executed` when this attempt ran the setup, or `reused` when it did not.
+- `snapshot`: `built`, `cloned` or `retained` (the worker's tree from its previous check).
+- `clone`: `clonefile`, `reflink`, `unavailable`, `path-bound` or `not-used` (one worker).
+- `verification`: what was checked before the command.
+- The timed `phases` up to the command. These are the build phases, `warm-base-wait`, `clone` and `pre-command-verification`. They are kept even when the setup fails.
+
+The same facts are printed as a `setup <check>: attempt <id>; …` line before `checking`.
+
+A tree this attempt built is verified by its full inventory before the command runs. A cloned or retained tree is verified from Git's index instead:
+
+Git always runs with an explicit Git directory and work tree, with `core.fileMode=true`, and with sparse checkout and fsmonitor off, because a full-Git command can edit `.git/config`.
+
+1. `git update-index --refresh` runs first.
+2. Every index entry must be a plain cached one: an assume-unchanged or skip-worktree flag would hide an edit.
+3. `git diff-files` must list nothing: no tracked file was edited, deleted or changed mode.
+4. Every path `git ls-files --others --directory` lists must be accounted for. The listing reads no exclude rules, because a command could write one. Each path must either have been left by the setup, or lie inside the running profile's `mutableOutputs`, or lie inside the outputs of a profile whose check already ran and passed in that tree.
+
+This happens before outputs are removed, so a write to another profile's output is refused, not silently erased. A write inside the running profile's own outputs stays in place for its command, so a profile's own cache (a `tsBuildInfo`, Vitest results) seeds its next run in that tree. After every command, the full inventory still runs. It is the only check that covers installed dependency bytes, links and special files inside outputs, and new content inside a directory the setup left untracked. A reused tree passed it after its last command. Finite snapshots have no Git, so they are always verified by their full inventory.
+
+The isolation is of files only. Host ports, the network and anything outside the temporary directory are shared, so serialize them in the adopter (Athena does this with `scripts/host-port-lock.ts`). The path check reads only the tree's immutable files, and only for the path's plain bytes. A path written elsewhere is not detected, and a later write through it is caught only as drift by a later clone's post-command inventory. That covers a path written into the home directory's caches, into a mutable output, or in another encoding (escaped JSON, UTF-16).
 
 `prepare` runs the first declared of the `mechanicalProviders` first, because that is where a selection guard that must precede every other check belongs. It runs the rest cheapest first. A check's cost is the duration of its most recent passed or failed attempt, less the dependency setup that attempt itself ran. Checks never timed run after timed ones, and ties keep declaration order, so a first `prepare` follows declaration order. Checks then run one dependency setup at a time, in the order each setup first appears in that sequence, so each setup installs once. The first failure stops preparation: no later check starts, checks already running finish, and no receipt is published. The first declared check finishes before any other starts, whatever the concurrency.
 
