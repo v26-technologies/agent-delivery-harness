@@ -408,7 +408,8 @@ it('mutable output cannot hide a tracked source directory',async()=>{
  const a=f.config.providers[0]!;f.setConfig({...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,mutableOutputs:['src','result-a.json','result-b.json']}]},providers:[{...a,check:{...a.check!,command:[process.execPath,'-e',"require('fs').writeFileSync('src/app.txt','drift');require('fs').writeFileSync('result-a.json','{}')"],scope:{...a.check!.scope!,files:['src/app.txt']}}},f.config.providers[1]!]});
  const prepared=await f.run('prepare');const gate=prepared===0?await f.run('gate'):prepared;expect(gate).toBe(1);
 },60000);
-// Takes 3.6 to 4.6 s alone or under local suite load, and 5.0 to 5.2 s on loaded CI runners, past the 5 s default.
+// Runs about 185 git and node subprocesses in series, so its time follows host spawn latency: 3.6 to 4.8 s on an
+// idle machine, 5.0 to 5.2 s on loaded CI runners and up to about 8 s on a loaded laptop, past the 5 s default.
 it("captures explicit repairs before validators and scoped mechanics", async () => {
   const f = await fixture(); f.env["FAIL"] = "0";
   f.setConfig({ ...f.config, obligations: f.config.obligations.slice(0, 1), providers: f.config.providers.slice(0, 1), scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"], repairCommands: [{ id: "repair-source", command: [process.execPath, "-e", "require('fs').writeFileSync('source.txt','repaired')"], timeoutMs: 5000 }] }, preparationCommands: [{ id: "validate-source", command: [process.execPath, "-e", "if(require('fs').readFileSync('source.txt','utf8')!=='repaired')process.exit(1)"], timeoutMs: 5000 }] });
@@ -428,7 +429,8 @@ it.each(["src", "src/"])("refuses output ancestor %s", async output => {
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: [{ ...f.config.scopedExecution!.profiles[0]!, mutableOutputs: [output, "result-a.json", "result-b.json"] }] } });
   expect(await f.run("prepare")).toBe(1); expect(f.err.join("\n")).toContain("check_output_overlaps_source");
 });
-// Takes 3.6 to 4.6 s alone or under local suite load, and 5.0 to 5.2 s on loaded CI runners, past the 5 s default.
+// Runs about 185 git and node subprocesses in series, so its time follows host spawn latency: 3.6 to 4.8 s on an
+// idle machine, 5.0 to 5.2 s on loaded CI runners and up to about 8 s on a loaded laptop, past the 5 s default.
 it("injects declared flags and credentials while excluding an explicitly supplied undeclared variable", async () => {
   const f = await fixture(); f.env["FLAG"] = "yes"; f.env["TOKEN"] = "secret-sentinel"; f.env["UNDECLARED"] = "must-not-reach-command"; f.env["FAIL"] = "0";
   const a = f.config.providers[0]!;
