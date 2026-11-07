@@ -12,7 +12,8 @@ import { deliveryRecordPathFor, isScopedCheckDefinition, type HarnessConfig, typ
 import type { ScopedCheckAttempt, RecordCandidateBinding } from "./records.types.ts";
 import type { ReviewInputReader } from "./review-inputs.ts";
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const refuse = (): never => { throw new Error("Retained installed resource origin or current source authority is invalid."); };
+// A declaration, not an arrow: only a declared `never` function ends control flow for narrowing.
+function refuse(): never { throw new Error("Retained installed resource origin or current source authority is invalid."); }
 export async function reconstructResourceApplicability(
   config: HarnessConfig, provider: ProviderRegistration, candidate: CapturedCandidate, proof: unknown,
   sourceTree: (tree: string) => Promise<InstalledDataSourceTree>, readEvidence: ReviewInputReader,

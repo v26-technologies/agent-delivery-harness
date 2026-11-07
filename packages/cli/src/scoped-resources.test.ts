@@ -34,13 +34,21 @@ async function fixture(installed = false, applicability = false, finite = false,
   return {dir,git,config,runtime,errors,messages,setupCount,commandCount};
 }
 async function duringCreation(hook:(session:ScopedChecks)=>Promise<void>) {
-  const create=ScopedChecks.create;let hookFailure:unknown;
+  const create=ScopedChecks.create,validate=ScopedChecks.validatePreparation;let hookFailure:unknown,ran=false;
   vi.spyOn(ScopedChecks,'create').mockImplementation(async(...args)=>{
     const session=await create(...args);
+    ran=true;
     try {await hook(session!);}catch(error){hookFailure=error;throw error;}
     return session;
   });
-  return ()=>{if(hookFailure)throw hookFailure;};
+  // A prepare with no mechanical checks validates without a session (V26-2347),
+  // so these rows open one where prepare once did. They inspect attempts and
+  // plans, not evidence, so what a hook defers is dropped with the session.
+  vi.spyOn(ScopedChecks,'validatePreparation').mockImplementation(async(context,candidate)=>{
+    await validate(context,candidate);
+    await (await ScopedChecks.create(context,candidate))?.cleanup();
+  });
+  return ()=>{if(hookFailure)throw hookFailure;if(!ran)throw new Error('the hook never ran in a scoped session');};
 }
 describe('native scoped installed resources',()=>{
   it('retains actual historical scope when ordinary broad membership grows across resource reuse',async()=>{
@@ -167,7 +175,7 @@ describe('native scoped installed resources',()=>{
   },60000);
   it('parallel gate keeps cold resource execution on its capture worker and shares setup with the first check',async()=>{
     const f=await fixture(true,true),font=f.config.providers[0]!;
-    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',"const fs=require('fs');fs.writeFileSync('result.json','peer allowed cache');fs.writeFileSync('peer.json','peer retained');"],timeoutMs:5000,outputs:['peer.json'],scope:font.check!.scope}};
+    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',"const fs=require('fs');fs.writeFileSync('result.json','peer allowed cache');fs.writeFileSync('peer.json','peer retained');"] as [string,...string[]],timeoutMs:5000,outputs:['peer.json'],scope:font.check!.scope}};
     const config=defineHarnessConfig({...f.config,providers:[peer,font],obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],scopedExecution:{...f.config.scopedExecution!,concurrency:2,profiles:f.config.scopedExecution!.profiles.map(p=>({...p,mutableOutputs:[...p.mutableOutputs,'peer.json']}))}});
     const runtime={...f.runtime,loadConfig:async()=>config};
     expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
@@ -187,7 +195,7 @@ describe('native scoped installed resources',()=>{
   },60000);
   it('serial different-setup gate captures at the consumer and retains one-setup seed plus unrelated omission',async()=>{
     const f=await fixture(true,true),font=f.config.providers[0]!;
-    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',''],timeoutMs:5000,scope:{...font.check!.scope!,profile:'other'}}};
+    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',''] as [string,...string[]],timeoutMs:5000,scope:{...font.check!.scope!,profile:'other'}}};
     const config=defineHarnessConfig({...f.config,providers:[peer,font],obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],scopedExecution:{...f.config.scopedExecution!,concurrency:1,profiles:[{id:'other',gitContext:'full',dependencyInputs:[],mutableOutputs:[],credentialIdentities:{}},...f.config.scopedExecution!.profiles]}});
     const runtime={...f.runtime,loadConfig:async()=>config};
     expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);

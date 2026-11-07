@@ -47,6 +47,7 @@ it.each([1,2])("finite physical source separates same-setup envelopes and privat
     expect(await f.run('verify'),f.err.join('\n')).toBe(0);
   }finally{observer.mockRestore();}
 },60000);
+// Runs at about the 5 s default on its own; bun runners have timed it out.
 it.each([1, 2])("forwards existing snapshot phase timings with the active check and attempt at concurrency %s", async concurrency => {
   const f = await fixture(); f.env["FAIL"] = "0";
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, concurrency, mechanicalProviders: ["check.a", "check.b"], profiles: f.config.scopedExecution!.profiles.map(profile => ({ ...profile,
@@ -74,7 +75,7 @@ it.each([1, 2])("forwards existing snapshot phase timings with the active check 
       expect([...new Set(own.map(match => match![2]))]).toEqual([provider.attempts[0]!.attemptId]);
     }
   } finally { spy.mockRestore(); }
-});
+}, 30000);
 it.each(["none", "full"] as const)("prepares and verifies portable evidence from a shallow source with %s Git context", async gitContext => {
   const f = await fixture(); f.env["FAIL"] = "0";
   await writeFile(path.join(f.dir, "source.txt"), "boundary"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "boundary");
@@ -199,15 +200,19 @@ it("retains A across B failure, retry and report replan, then records portable e
   expect(await f.run("verify")).toBe(1);
   expect(f.err.join("\n")).toContain("portable_scoped_inputs_invalid");
 }, 60000);
-it("keeps valid workflow release receipts bounded separately from scoped source inputs", async () => {
+// Zero mechanical preparation defers source identity to the gate (V26-2347),
+// so the oversized receipt is refused at prepare only when the check is mechanical.
+it.each([true, false])("keeps valid workflow release receipts bounded separately from scoped source inputs (mechanical: %s)", async mechanical => {
   const f = await fixture(); f.env["FAIL"] = "0";
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: mechanical ? ["check.a"] : [] } });
   await mkdir(path.join(f.dir, ".agent-skills"), { recursive: true });
   const release = { releaseId: "test-release", profile: "linear", archiveSha256: "a".repeat(64), metadataSha256: "b".repeat(64) };
   const receipt = path.join(f.dir, ".agent-skills/active.json");
   await writeFile(receipt, JSON.stringify({ release }));
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   await writeFile(receipt, JSON.stringify({ release, padding: "x".repeat(2 * 1024 * 1024) }));
-  expect(await f.run("prepare"), f.err.join("\n")).toBe(1);
+  if (mechanical) expect(await f.run("prepare"), f.err.join("\n")).toBe(1);
+  else { expect(await f.run("prepare"), f.err.join("\n")).toBe(0); expect(await f.run("gate"), f.err.join("\n")).toBe(1); }
   expect(f.err.join("\n")).toContain("portable_tree_unreadable");
   await writeFile(receipt, JSON.stringify({ release }));
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
@@ -361,11 +366,20 @@ it('nonreusable credentials portable fresh clone',async()=>{
  await exec('git',['clone','--no-local',f.dir,foreign]);await exec('git',['update-ref','refs/remotes/origin/main',await f.git('rev-parse','origin/main')],{cwd:foreign});
  const verified=await runCli(['verify'],{...f.runtime,cwd:foreign});expect(verified).toBe(0);
 },60000);
-it.each(['check', 'dependencies'])('rejects an absolute authoring executable in %s before setup', async kind => {
+// Zero mechanical preparation defers runtime identities to the gate (V26-2347),
+// so the refusal lands in prepare only when the check is mechanical.
+it.each([['check', true], ['dependencies', true], ['check', false], ['dependencies', false]] as const)('rejects an absolute authoring executable in %s before setup (mechanical: %s)', async (kind, mechanical) => {
  const f=await fixture(); const script=path.join(f.dir,'check.cjs'); await writeFile(script,`#!${process.execPath}\nprocess.exit(7);\n`);
  const a=f.config.providers[0]!;
- f.setConfig(kind==='check' ? {...f.config,providers:[{...a,check:{...a.check!,command:[script]}},f.config.providers[1]!]} : {...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,dependencies:{command:[script],timeoutMs:5000}}]}});
- expect(await f.run('prepare')).toBe(1);expect(f.err.join('\n')).toContain('check_runtime_author_path');
+ const scopedExecution={...f.config.scopedExecution!,mechanicalProviders:mechanical?['check.a']:[]};
+ f.setConfig(kind==='check' ? {...f.config,scopedExecution,providers:[{...a,check:{...a.check!,command:[script]}},f.config.providers[1]!]} : {...f.config,scopedExecution:{...scopedExecution,profiles:[{...scopedExecution.profiles[0]!,dependencies:{command:[script],timeoutMs:5000}}]}});
+ const snapshots=await import('./check-snapshot.ts'),created=vi.spyOn(snapshots,'createCheckSnapshot');
+ try {
+  if (mechanical) expect(await f.run('prepare')).toBe(1);
+  else { expect(await f.run('prepare'),f.err.join('\n')).toBe(0); expect(await f.run('gate')).toBe(1); }
+  expect(f.err.join('\n')).toContain('check_runtime_author_path');
+  expect(created).not.toHaveBeenCalled();
+ } finally { created.mockRestore(); }
 },60000);
 it('missing dependency input is a named preflight blocker',async()=>{
  const f=await fixture();f.setConfig({...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,dependencyInputs:['missing.lock']}]}});
@@ -394,12 +408,13 @@ it("captures explicit repairs before validators and scoped mechanics", async () 
   expect(f.out.join("\n")).toContain("checking check.a");
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
 });
+// Runs at about the 5 s default on its own; bun runners have timed it out.
 it("cannot accept output precreated by dependency setup", async () => {
   const f = await fixture(); const a = f.config.providers[0]!;
   f.setConfig({ ...f.config, obligations: f.config.obligations.slice(0, 1), providers: [{ ...a, check: { ...a.check!, command: [process.execPath, "-e", ""] } }], scopedExecution: { ...f.config.scopedExecution!, profiles: [{ ...f.config.scopedExecution!.profiles[0]!, dependencies: { command: [process.execPath, "-e", "require('fs').writeFileSync('result-a.json','{}')"], timeoutMs: 5000 } }] } });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   expect(await f.run("gate")).toBe(1); expect(f.err.join("\n")).toContain("check_output_missing");
-});
+}, 30000);
 it.each(["src", "src/"])("refuses output ancestor %s", async output => {
   const f = await fixture(); await mkdir(path.join(f.dir, "src")); await writeFile(path.join(f.dir, "src/file"), "source");
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: [{ ...f.config.scopedExecution!.profiles[0]!, mutableOutputs: [output, "result-a.json", "result-b.json"] }] } });

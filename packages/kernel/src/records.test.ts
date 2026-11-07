@@ -840,7 +840,7 @@ describe("installed data record grammar", () => {
       const missing = { ...resourceBinding } as Record<string, unknown>; delete missing[key];
       return [missing, { ...resourceBinding, [key]: "bad" }];
     })]) {
-      await expect(publishRecord(tempDir("bad-resource-record"), { ...input, resolution: { ...input.resolution, resourceBinding: binding } } as PublishRecordInput, { storageRoot: tempDir("bad-resource-store") })).rejects.toThrow();
+      await expect(publishRecord(tempDir("bad-resource-record"), { ...input, resolution: { ...input.resolution, resourceBinding: binding } } as unknown as PublishRecordInput, { storageRoot: tempDir("bad-resource-store") })).rejects.toThrow();
     }
   });
 });
