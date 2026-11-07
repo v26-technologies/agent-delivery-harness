@@ -408,13 +408,14 @@ it('mutable output cannot hide a tracked source directory',async()=>{
  const a=f.config.providers[0]!;f.setConfig({...f.config,scopedExecution:{...f.config.scopedExecution!,profiles:[{...f.config.scopedExecution!.profiles[0]!,mutableOutputs:['src','result-a.json','result-b.json']}]},providers:[{...a,check:{...a.check!,command:[process.execPath,'-e',"require('fs').writeFileSync('src/app.txt','drift');require('fs').writeFileSync('result-a.json','{}')"],scope:{...a.check!.scope!,files:['src/app.txt']}}},f.config.providers[1]!]});
  const prepared=await f.run('prepare');const gate=prepared===0?await f.run('gate'):prepared;expect(gate).toBe(1);
 },60000);
+// Takes 3.6 to 4.6 s alone or under local suite load, and 5.0 to 5.2 s on loaded CI runners, past the 5 s default.
 it("captures explicit repairs before validators and scoped mechanics", async () => {
   const f = await fixture(); f.env["FAIL"] = "0";
   f.setConfig({ ...f.config, obligations: f.config.obligations.slice(0, 1), providers: f.config.providers.slice(0, 1), scopedExecution: { ...f.config.scopedExecution!, mechanicalProviders: ["check.a"], repairCommands: [{ id: "repair-source", command: [process.execPath, "-e", "require('fs').writeFileSync('source.txt','repaired')"], timeoutMs: 5000 }] }, preparationCommands: [{ id: "validate-source", command: [process.execPath, "-e", "if(require('fs').readFileSync('source.txt','utf8')!=='repaired')process.exit(1)"], timeoutMs: 5000 }] });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   expect(f.out.join("\n")).toContain("checking check.a");
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
-});
+}, 30000);
 // Runs at about the 5 s default on its own; bun runners have timed it out.
 it("cannot accept output precreated by dependency setup", async () => {
   const f = await fixture(); const a = f.config.providers[0]!;
@@ -427,13 +428,14 @@ it.each(["src", "src/"])("refuses output ancestor %s", async output => {
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: [{ ...f.config.scopedExecution!.profiles[0]!, mutableOutputs: [output, "result-a.json", "result-b.json"] }] } });
   expect(await f.run("prepare")).toBe(1); expect(f.err.join("\n")).toContain("check_output_overlaps_source");
 });
+// Takes 3.6 to 4.6 s alone or under local suite load, and 5.0 to 5.2 s on loaded CI runners, past the 5 s default.
 it("injects declared flags and credentials while excluding an explicitly supplied undeclared variable", async () => {
   const f = await fixture(); f.env["FLAG"] = "yes"; f.env["TOKEN"] = "secret-sentinel"; f.env["UNDECLARED"] = "must-not-reach-command"; f.env["FAIL"] = "0";
   const a = f.config.providers[0]!;
   f.setConfig({ ...f.config, obligations: f.config.obligations.slice(0, 1), providers: [{ ...a, check: { ...a.check!, command: [process.execPath, "-e", "if(process.env.FLAG!=='yes'||process.env.TOKEN!=='secret-sentinel'||process.env.UNDECLARED!==undefined)process.exit(7);require('fs').writeFileSync('result-a.json','{}')"], scope: { ...a.check!.scope!, environment: [{ name: "FLAG", kind: "flag" }, { name: "TOKEN", kind: "credential" }] } } }] });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
-});
+}, 30000);
 it.each(["GIT_DIR", "DELIVERY_CHECK_ORIGIN_TREE", "PATH", "HOME", "TMPDIR", "TMP", "TEMP"])("refuses reserved environment input %s", async name => {
   const f = await fixture(), a = f.config.providers[0]!;
   expect(() => f.setConfig({ ...f.config, providers: [{ ...a, check: { ...a.check!, scope: { ...a.check!.scope!, environment: [{ name, kind: "flag" }] } } }, f.config.providers[1]!] })).toThrow();
