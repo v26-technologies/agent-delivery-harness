@@ -394,13 +394,15 @@ export class ScopedChecks {
     };
     const halted = () => firstFailure !== undefined;
     const expected = await this.expectedCosts(requests.map(r => r.provider.id));
-    await this.prewarm(requests.map(r => r.provider.id), expected);
     const resource = requests.find(r => this.acceptsApplicability(r.provider, r.obligationIds));
+    // V1 has one conditional consumer. Keep the first configured check ahead of
+    // it, and execute both on the capture worker before releasing the rest to
+    // the pool. Other workers never inherit that worker's installed tree.
+    const serialIds = resource ? [...new Set([requests[0]!.provider.id, resource.provider.id])] : [];
+    // Those two hold every other worker, so their bases set up first, in that order.
+    await this.prewarm([...serialIds, ...requests.map(r => r.provider.id).filter(id => !serialIds.includes(id))],
+      new Map([...expected, ...serialIds.map((id, index) => [id, Number.MAX_SAFE_INTEGER - index] as const)]));
     if (resource) {
-      // V1 has one conditional consumer. Keep the first configured check ahead of
-      // it, and execute both on the capture worker before releasing the rest to
-      // the pool. Other workers never inherit that worker's installed tree.
-      const serialIds = [...new Set([requests[0]!.provider.id, resource.provider.id])];
       for (const id of serialIds) await run(id, this.serial);
       await this.pool(requests.map(r => r.provider.id).filter(id => !serialIds.includes(id)), run, halted, expected);
     } else await this.pool(requests.map(r => r.provider.id), run, halted, expected);
@@ -459,9 +461,9 @@ export class ScopedChecks {
     for (const [key, { id }] of keys) {
       const profile = this.profileOf(id), physicalSource = this.context.config.providers.find(p => p.id === id)?.check?.physicalSource;
       const previous = this.prewarmTail;
+      // A build queued when the prewarm stops sees the aborted signal and settles as interrupted.
       const base = (async () => {
         await previous;
-        if (signal.aborted) throw new CheckSnapshotError("check_snapshot_interrupted", "The prewarm was stopped before its setup began.");
         return this.buildSnapshot(profile, physicalSource, (phase, durationMs) => this.context.write(`prewarm ${profile.id}: ${phase} ${Math.round(durationMs)}ms`), undefined, signal);
       })();
       this.prewarmTail = base.then(() => undefined, () => undefined);

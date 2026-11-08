@@ -1814,9 +1814,11 @@ it("a never-timed check is expected to take its declared timeout, so the longest
   expect(started["c3"]).toBeLessThan(Math.max(started["c1"]!, started["c2"]!));
 }, 90000);
 it("prepare sets up nothing for the other mechanical checks until the guard has passed", async () => {
-  const f = await poolFixture(["1", "2", "2"], 2, id => id === "c1" ? "process.exit(3)" : "", true);
+  // The guard runs two seconds before it fails: long enough for setup 2 to have run, had it started.
+  const f = await poolFixture(["1", "2", "2"], 2, id => id === "c1" ? "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2000);process.exit(3)" : "", true);
   expect(await f.run("prepare")).toBe(1);
   expect(f.out.join("\n")).toMatch(/failed check\.c1/);
+  expect(f.out.join("\n")).not.toMatch(/prewarm pc[23]:/);
   expect(await f.installs("2")).toBe(0);
 }, 90000);
 it("a failed mechanical check ends prepare without waiting for a prewarm no check will take", async () => {
@@ -1840,6 +1842,60 @@ it("a prepare whose mechanical checks are all reused prewarms nothing", async ()
     expect(f.out.join("\n")).toMatch(/reusing mechanical check\.c1/);
     expect(spy).not.toHaveBeenCalled();
   } finally { spy.mockRestore(); }
+}, 90000);
+it("a reused mechanical check that claimed a key with no base frees it for the next check of that key", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // c2 and c3 share setup 2; c3 also reads e.txt and runs longer, so prepare takes c2 first.
+  const f = await poolFixture(["1", "2", "2"], 2, id => id === "c3" ? "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,300)" : "", true);
+  const arm = JSON.stringify(path.join(f.shared, "arm")), once = JSON.stringify(path.join(f.shared, "failed-once"));
+  await writeFile(path.join(f.dir, "e.txt"), "one"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "e");
+  f.setConfig({ ...f.config, providers: f.config.providers.map(p => p.id === "check.c3" ? { ...p, check: { ...p.check!, scope: { ...p.check!.scope!, files: ["source.txt", "e.txt"] } } } : p),
+    scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => p.id === "pc1" ? p : { ...p,
+      dependencies: { command: [process.execPath, "-e", `const fs=require('fs');if(fs.existsSync(${arm})&&!fs.existsSync(${once})){fs.writeFileSync(${once},'');process.exit(3)}${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } }) } });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  // Only c3 changes; setup 2's prewarm for it fails once, so c2, reused, is taken with no base for its key.
+  await writeFile(path.join(f.shared, "arm"), "");
+  await writeFile(path.join(f.dir, "e.txt"), "two"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "e two");
+  expect(await f.run("prepare"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  const out = f.out.join("\n");
+  expect(out).toMatch(/reusing mechanical check\.c2/);
+  expect(out).toMatch(/prewarm pc[23]: setup failed/);
+  expect(out).toMatch(/passed check\.c3/);
+}, 90000);
+it("a check's last clone and its queue are not part of what it is expected to cost", async () => {
+  const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
+  if (!await snapshots.snapshotCloneMethod()) return;
+  // c1 runs 700 ms on setup 1; c2 and c3 are instant on setup 2, but their clones in the first gate were held 1.5 s.
+  const f = await poolFixture(["1", "2", "2"], 2, id => id === "c1" ? "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,700)" : "");
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
+    const snapshot = await create(input);
+    if (!input.outputs.includes("result-c2.json")) return snapshot;
+    return { ...snapshot, clone: async (m, onPhase) => { await new Promise(resolve => setTimeout(resolve, 1500)); return snapshot.clone(m, (phase, ms) => onPhase?.(phase, phase === "clone" ? ms + 1500 : ms)); } };
+  });
+  try { expect(await f.run("gate"), f.err.join("\n")).toBe(0); } finally { spy.mockRestore(); }
+  await writeFile(path.join(f.dir, "source.txt"), "changed"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "changed");
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  f.out.length = 0;
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  // Without their clones, setup 2's checks cost almost nothing, so c1's setup goes first.
+  const lines = f.out.flatMap(line => line.split("\n"));
+  const first = (pattern: RegExp) => lines.findIndex(line => pattern.test(line));
+  expect(first(/^prewarm pc1: materialization /), lines.join("\n")).toBeGreaterThanOrEqual(0);
+  expect(first(/^prewarm pc1: materialization /)).toBeLessThan(first(/^prewarm pc[23]: materialization /));
+}, 120000);
+it("a setup key's prewarm is ordered by the longest check that needs it, not its first", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // Setup 1's first check is short and its second the longest; setup 2's one check is in between.
+  const f = await poolFixture(["1", "2", "1"], 2, () => "");
+  const timeouts: Record<string, number> = { "check.c1": 10000, "check.c2": 30000, "check.c3": 60000 };
+  f.setConfig({ ...f.config, providers: f.config.providers.map(p => ({ ...p, check: { ...p.check!, timeoutMs: timeouts[p.id]! } })) });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  const lines = f.out.flatMap(line => line.split("\n"));
+  const first = (pattern: RegExp) => lines.findIndex(line => pattern.test(line));
+  expect(first(/^prewarm pc[13]: materialization /), lines.join("\n")).toBeGreaterThanOrEqual(0);
+  expect(first(/^prewarm pc[13]: materialization /)).toBeLessThan(first(/^prewarm pc2: materialization /));
 }, 90000);
 it("a prewarm whose setup failed leaves no base, and the check that next needs it sets up itself", async () => {
   const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();

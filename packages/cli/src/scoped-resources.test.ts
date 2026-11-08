@@ -8,6 +8,7 @@ import { createArtifactsPort, defineHarnessConfig, deliveryRecordPathFor, digest
 import base from "../../../harness.config.ts";
 import { runCli, wireRepo, type CliRuntime } from "./index.ts";
 import { ScopedChecks } from "./scoped-checks.ts";
+import { snapshotCloneMethod } from "./check-snapshot.ts";
 import * as snapshots from "./check-snapshot.ts";
 const exec = promisify(execFile), roots:string[]=[];
 afterEach(async()=>{vi.restoreAllMocks();await Promise.all(roots.splice(0).map(dir=>rm(dir,{recursive:true,force:true})));});
@@ -192,6 +193,22 @@ describe('native scoped installed resources',()=>{
     expect(await readFile(f.commandCount,'utf8')).toBe('command\n');
     expect(await readFile(f.setupCount,'utf8')).toBe('setup\nsetup\n');
     expect(f.messages.some(s=>s.includes('consumer command omitted'))).toBe(true);
+  },60000);
+  it('parallel gate prewarms the capture worker\'s setups ahead of a longer check\'s',async()=>{
+    if(!await snapshotCloneMethod())return;
+    const f=await fixture(true,true),font=f.config.providers[0]!,fontProfile=font.check!.scope!.profile;
+    // The other check declares the longest timeout, so only the capture worker's hold puts its setup second.
+    const other={id:'check.other',findingCodes:[],check:{command:[process.execPath,'-e',''] as [string,...string[]],timeoutMs:60000,scope:{...font.check!.scope!,profile:'other'}}};
+    const config=defineHarnessConfig({...f.config,providers:[font,other],obligations:[...f.config.obligations,{...f.config.obligations[0]!,id:'other.passed',providers:[other.id],acceptedPayloadSpecs:['checks.passed/1']}],
+      scopedExecution:{...f.config.scopedExecution!,concurrency:2,profiles:[...f.config.scopedExecution!.profiles,{id:'other',gitContext:'full',dependencyInputs:[],mutableOutputs:[],credentialIdentities:{},dependencies:{command:[process.execPath,'-e','0'],timeoutMs:5000}}]}});
+    const runtime={...f.runtime,loadConfig:async()=>config};
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    f.messages.length=0;
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
+    const lines=f.messages.flatMap(s=>s.split('\n'));
+    const first=(profile:string)=>lines.findIndex(line=>line.startsWith(`prewarm ${profile}: materialization `));
+    expect(first(fontProfile),lines.join('\n')).toBeGreaterThanOrEqual(0);
+    expect(first('other'),lines.join('\n')).toBeGreaterThan(first(fontProfile));
   },60000);
   it('serial different-setup gate captures at the consumer and retains one-setup seed plus unrelated omission',async()=>{
     const f=await fixture(true,true),font=f.config.providers[0]!;
