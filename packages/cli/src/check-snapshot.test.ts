@@ -439,3 +439,17 @@ it("falls back to the source's whole history when side branches forked below the
     expect(await reads(git)).toEqual(await reads(f.git));
   } finally { await snapshot.cleanup(); }
 }, 30000);
+
+it("keeps a shallow source's boundary when the whole-history fallback fetches from it", async () => {
+  const f = await shallowFixture();
+  // An unrelated merge-base cannot bound the fetch, so the whole available history is fetched
+  // from a shallow source, whose grafts the snapshot must take on rather than reject.
+  const unrelated = (await exec("git", ["commit-tree", "-m", "unrelated", await f.git("rev-parse", `${f.candidate.headSha}^{tree}`)], { cwd: f.root })).stdout.trim();
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: unrelated } };
+  const shallow = (await readFile(path.join(f.root, ".git/shallow"), "utf8")).trim().split("\n").sort();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    expect((await readFile(path.join(snapshot.rootDir, ".git/shallow"), "utf8")).trim().split("\n").sort()).toEqual(shallow);
+    await expect(exec("git", ["cat-file", "-e", f.missingAncestor], { cwd: snapshot.rootDir })).rejects.toMatchObject({ code: 1 });
+  } finally { await snapshot.cleanup(); }
+}, 30000);

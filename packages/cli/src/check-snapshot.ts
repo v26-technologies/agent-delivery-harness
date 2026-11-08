@@ -169,11 +169,12 @@ async function materializationDepth(input: SnapshotRequest, git: (...args: strin
   const { headSha, base } = input.candidate;
   try {
     // Reading the author's repository only; the fetch below still transfers object bytes.
+    // A tip above the merge-base stands on it alone exactly when it is the range's one boundary
+    // commit, which also makes it an ancestor of that tip and so fetched through it.
     for (const tip of [headSha, base.tipSha]) {
-      await git("-C", input.rootDir, "merge-base", "--is-ancestor", base.mergeBaseSha, tip);
       const boundary = (await git("-C", input.rootDir, "rev-list", "--boundary", `${base.mergeBaseSha}..${tip}`))
         .split("\n").filter(line => line.startsWith("-"));
-      if (boundary.some(line => line !== `-${base.mergeBaseSha}`)) return undefined;
+      if (tip !== base.mergeBaseSha && boundary.join("\n") !== `-${base.mergeBaseSha}`) return undefined;
     }
     const counts = await Promise.all([headSha, base.tipSha].map(tip => git("-C", input.rootDir, "rev-list", "--count", `${base.mergeBaseSha}..${tip}`)));
     const longest = Math.max(...counts.map(Number));
