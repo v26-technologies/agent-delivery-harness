@@ -417,20 +417,22 @@ it("falls back to the source's whole history when it cannot measure the merge-ba
   } finally { await snapshot.cleanup(); }
 }, 30000);
 
-it("falls back to the source's whole history when side branches forked below the merge-base", async () => {
+it.each(["head", "base", "both"] as const)("falls back to the source's whole history when a side branch forked below the merge-base is merged on the %s side", async (sides) => {
   const f = await deepFixture();
   const root = await f.git("rev-parse", `${f.older[0]}^`);
-  // Branches cut from `root` and merged on each side reach below the merge-base by themselves;
-  // fetched to the bounded depth they would arrive cut off from it and read as a second merge-base.
+  // A branch cut from `root` reaches below the merge-base by itself; fetched to the bounded
+  // depth it would arrive cut off from it, counted above it and read as a second merge-base.
   const commitTree = async (message: string, tree: string, ...parents: string[]) =>
     (await exec("git", ["commit-tree", ...parents.flatMap(p => ["-p", p]), "-m", message, tree], { cwd: f.root })).stdout.trim();
   const tree = async (commit: string) => f.git("rev-parse", `${commit}^{tree}`);
-  const headSha = await commitTree("merge side", await tree(f.candidate.headSha), f.candidate.headSha, await commitTree("side", await tree(root), root));
-  const tipSha = await commitTree("merge other", await tree(f.candidate.base.tipSha), f.candidate.base.tipSha, await commitTree("other", await tree(root), root));
+  const merge = async (tip: string, name: string) => commitTree(`merge ${name}`, await tree(tip), tip, await commitTree(name, await tree(root), root));
+  const headSha = sides === "base" ? f.candidate.headSha : await merge(f.candidate.headSha, "side");
+  const tipSha = sides === "head" ? f.candidate.base.tipSha : await merge(f.candidate.base.tipSha, "other");
   const candidate = { ...f.candidate, headSha, base: { ...f.candidate.base, tipSha } };
   const reads = async (git: (...args: string[]) => Promise<string>) => [
     await git("merge-base", "--all", headSha, tipSha),
     await git("rev-list", "--count", `${f.mergeBase}..${headSha}`),
+    await git("rev-list", "--count", `${f.mergeBase}..${tipSha}`),
   ];
   expect((await reads(f.git))[0]).toBe(f.mergeBase);
   const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
@@ -440,16 +442,37 @@ it("falls back to the source's whole history when side branches forked below the
   } finally { await snapshot.cleanup(); }
 }, 30000);
 
+it("bounds the fetch when the base tip is itself the merge-base", async () => {
+  const f = await deepFixture();
+  // The base tip's range is empty and stands on nothing; only the head side bounds the depth.
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, tipSha: f.mergeBase } };
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: snapshot.rootDir })).stdout.trim();
+    expect(await git("merge-base", "HEAD", "refs/delivery/base")).toBe(f.mergeBase);
+    // The base tip is fetched to the head side's depth too, so it reaches `b` but not `a`.
+    await expect(git("cat-file", "-e", `${f.older[0]}^{commit}`)).rejects.toMatchObject({ code: 128 });
+  } finally { await snapshot.cleanup(); }
+}, 30000);
+
+it("refuses a merge-base the source does not have", async () => {
+  const f = await deepFixture();
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: "0".repeat(40) } };
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} })).rejects.toThrow();
+}, 30000);
+
 it("keeps a shallow source's boundary when the whole-history fallback fetches from it", async () => {
   const f = await shallowFixture();
   // An unrelated merge-base cannot bound the fetch, so the whole available history is fetched
   // from a shallow source, whose grafts the snapshot must take on rather than reject.
   const unrelated = (await exec("git", ["commit-tree", "-m", "unrelated", await f.git("rev-parse", `${f.candidate.headSha}^{tree}`)], { cwd: f.root })).stdout.trim();
   const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: unrelated } };
-  const shallow = (await readFile(path.join(f.root, ".git/shallow"), "utf8")).trim().split("\n").sort();
+  // Git may record one graft twice when several wants reach it; the set of grafts is what counts.
+  const grafts = async (root: string) => [...new Set((await readFile(path.join(root, ".git/shallow"), "utf8")).trim().split("\n"))].sort();
+  const shallow = await grafts(f.root);
   const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
   try {
-    expect((await readFile(path.join(snapshot.rootDir, ".git/shallow"), "utf8")).trim().split("\n").sort()).toEqual(shallow);
+    expect(await grafts(snapshot.rootDir)).toEqual(shallow);
     await expect(exec("git", ["cat-file", "-e", f.missingAncestor], { cwd: snapshot.rootDir })).rejects.toMatchObject({ code: 1 });
   } finally { await snapshot.cleanup(); }
 }, 30000);
