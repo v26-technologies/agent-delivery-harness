@@ -393,8 +393,8 @@ export class ScopedChecks {
       } finally { running.delete(id); }
     };
     const halted = () => firstFailure !== undefined;
-    await this.prewarm(requests.map(r => r.provider.id));
     const expected = await this.expectedCosts(requests.map(r => r.provider.id));
+    await this.prewarm(requests.map(r => r.provider.id), expected);
     const resource = requests.find(r => this.acceptsApplicability(r.provider, r.obligationIds));
     if (resource) {
       // V1 has one conditional consumer. Keep the first configured check ahead of
@@ -437,26 +437,40 @@ export class ScopedChecks {
     this.settling.set(base, base.then(() => { this.settled.add(base); }, () => { this.settled.add(base); if (this.bases.get(key) === base) this.bases.delete(key); }));
   }
   /**
-   * Starts, all at once, the warm base of each setup key among `ids` that has none yet, so the checks that
-   * clone it neither build it nor wait for another check to. No attempt owns this setup: a check cloning the
-   * base records it as reused and carries no dependency result, and a failed one leaves no base, so the
-   * check that next needs its key sets up itself and owns that result. Only with cloning: without it each
-   * worker builds its own tree, as before.
+   * Sets up the warm base of each setup key among `ids` that has none yet, so the checks that clone it neither
+   * build it nor wait for another check to. Bases set up one at a time, in this session's order: concurrent
+   * dependency installs on one machine each take about twice as long, so the critical path's base is ready
+   * soonest on its own. With `expected`, the key whose checks are expected to run longest goes first;
+   * without it, the order of `ids`. Every key is registered at once, so no worker takes its checks before
+   * its base settles. No attempt owns this setup: a check cloning the base records it as reused and carries
+   * no dependency result, and a failed one leaves no base, so the check that next needs its key sets up
+   * itself and owns that result. Only with cloning: without it each worker builds its own tree, as before.
    */
-  private async prewarm(ids: readonly string[]): Promise<void> {
+  private async prewarm(ids: readonly string[], expected?: ReadonlyMap<string, number>): Promise<void> {
     if (this.concurrency === 1 || !await (this.cloning ??= snapshotCloneMethod())) return;
     this.sharing = true;
     const signal = this.context.signal ? AbortSignal.any([this.context.signal, this.prewarming.signal]) : this.prewarming.signal;
-    for (const id of ids) {
-      const key = this.keyOf(id);
-      if (this.bases.has(key)) continue;
+    const longest = new Map<string, { id: string; cost: number; order: number }>();
+    for (const [order, id] of ids.entries()) {
+      const key = this.keyOf(id), cost = expected?.get(id) ?? 0, seen = longest.get(key);
+      if (!this.bases.has(key) && (!seen || cost > seen.cost)) longest.set(key, { id, cost, order: seen?.order ?? order });
+    }
+    const keys = [...longest].sort(([, a], [, b]) => b.cost - a.cost || a.order - b.order);
+    for (const [key, { id }] of keys) {
       const profile = this.profileOf(id), physicalSource = this.context.config.providers.find(p => p.id === id)?.check?.physicalSource;
-      const base = this.buildSnapshot(profile, physicalSource, (phase, durationMs) => this.context.write(`prewarm ${profile.id}: ${phase} ${Math.round(durationMs)}ms`), undefined, signal);
+      const previous = this.prewarmTail;
+      const base = (async () => {
+        await previous;
+        if (signal.aborted) throw new CheckSnapshotError("check_snapshot_interrupted", "The prewarm was stopped before its setup began.");
+        return this.buildSnapshot(profile, physicalSource, (phase, durationMs) => this.context.write(`prewarm ${profile.id}: ${phase} ${Math.round(durationMs)}ms`), undefined, signal);
+      })();
+      this.prewarmTail = base.then(() => undefined, () => undefined);
       this.prewarmedBases.add(base);
       this.shareBase(key, base);
       base.catch(error => { if (!this.prewarming.signal.aborted) this.context.write(`prewarm ${profile.id}: setup failed (${error instanceof CheckSnapshotError ? error.code : "unclassified"}); its first check sets up itself`); });
     }
   }
+  private prewarmTail: Promise<void> = Promise.resolve();
   private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"], onSetup: (setup: AcquiredSetup) => void = () => {}): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[]; setup: AcquiredSetup }> {
     const key = setupKey(profile, physicalSource);
     const sharedOutputs = this.sharedOutputsFor(key);

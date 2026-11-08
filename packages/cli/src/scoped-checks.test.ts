@@ -1599,24 +1599,28 @@ it("concurrency 2 on one setup key installs once, ahead of both checks, and reco
   // No attempt ran the dependency setup, so none carries its result.
   expect((await latestSetups(f)).filter(d => d!.dependency !== undefined)).toHaveLength(0);
 }, 90000);
-it("a pool prewarms every setup key at once, and no check of a key starts while its base is setting up", async () => {
+it("a pool prewarms each setup key one at a time, the longest-expected first, and no check of a key starts while its base is setting up", async () => {
   const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
   if (!method) return;
-  // Each setup holds until both have started, so a serial prewarm never gets there; then it takes a second.
   const f = await poolFixture(["1", "2", "1", "2"], 2, () => "");
-  const both = `const fs=require('fs'),d=${JSON.stringify(path.join(f.shared, "setups"))};fs.mkdirSync(d,{recursive:true});fs.writeFileSync(d+'/'+process.pid,'');` +
-    `const end=Date.now()+20000;while(fs.readdirSync(d).length<2){if(Date.now()>end)process.exit(7);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000)`;
-  // Each check reads its own setup's install, so a base of the other key is never what it runs in.
-  f.setConfig({ ...f.config, providers: f.config.providers.map((p, i) => ({ ...p, check: { ...p.check!, command: [process.execPath, "-e", `if(require('fs').readFileSync('node_modules/key','utf8')!=='${i % 2 === 0 ? "1" : "2"}')process.exit(9);require('fs').writeFileSync('result-c${i + 1}.json','{}')`] as [string, ...string[]] } })),
+  // Each setup records when it ran and takes half a second, so overlapping setups would show.
+  const span = (key: string) => `const fs=require('fs');fs.writeFileSync(${JSON.stringify(path.join(f.shared, "begin-"))}+'${key}',String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500);fs.writeFileSync(${JSON.stringify(path.join(f.shared, "end-"))}+'${key}',String(Date.now()))`;
+  const keyOf = (profile: string) => profile === "pc1" || profile === "pc3" ? "1" : "2";
+  // Each check reads its own setup's install, so a base of the other key is never what it runs in. Setup 2's
+  // checks declare the longer timeout, so with no history its base goes first.
+  f.setConfig({ ...f.config, providers: f.config.providers.map((p, i) => ({ ...p, check: { ...p.check!, timeoutMs: i % 2 === 0 ? 30000 : 60000,
+      command: [process.execPath, "-e", `if(require('fs').readFileSync('node_modules/key','utf8')!=='${i % 2 === 0 ? "1" : "2"}')process.exit(9);require('fs').writeFileSync('result-c${i + 1}.json','{}')`] as [string, ...string[]] } })),
     scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p,
-      dependencies: { command: [process.execPath, "-e", `${both};${p.dependencies!.command[2]};fs.mkdirSync('node_modules',{recursive:true});fs.writeFileSync('node_modules/key','${p.id === "pc1" || p.id === "pc3" ? "1" : "2"}')`] as [string, ...string[]], timeoutMs: 60000 } })) } });
+      dependencies: { command: [process.execPath, "-e", `${span(keyOf(p.id))};${p.dependencies!.command[2]};fs.mkdirSync('node_modules',{recursive:true});fs.writeFileSync('node_modules/key','${keyOf(p.id)}')`] as [string, ...string[]], timeoutMs: 60000 } })) } });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
   expect([await f.installs("1"), await f.installs("2")]).toEqual([1, 1]);
+  const at = async (name: string) => Number(await readFile(path.join(f.shared, name), "utf8"));
+  expect(await at("end-2")).toBeLessThanOrEqual(await at("begin-1"));
   const setups = (await latestSetups(f)).map(d => d!.setup!);
   expect(setups.every(s => s.action === "reused" && !s.phases.some(p => p.phase === "dependencies"))).toBe(true);
-  // A second-long setup was never inside a check: each one's wait for its base is near zero.
-  for (const setup of setups) expect(setup.phases.filter(p => p.phase === "warm-base-wait").reduce((sum, p) => sum + p.durationMs, 0)).toBeLessThan(500);
+  // A half-second setup was never inside a check: each one's wait for its base is near zero.
+  for (const setup of setups) expect(setup.phases.filter(p => p.phase === "warm-base-wait").reduce((sum, p) => sum + p.durationMs, 0)).toBeLessThan(300);
 }, 90000);
 it("without copy-on-write each worker sets up its own tree and the record says cloning is unavailable", async () => {
   const snapshots = await import("./check-snapshot.ts");
@@ -1775,32 +1779,29 @@ it("workers clone a warm base one at a time, and a clone's queue counts as its c
 it("a longer check's clone goes ahead of a shorter one already queued", async () => {
   const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
   if (!await snapshots.snapshotCloneMethod()) return;
-  const f = await poolFixture(["1", "1", "2"], 3, (id, shared) => id === "c3" ? `if(require('fs').existsSync(${JSON.stringify(path.join(shared, "slow"))}))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1500)` : "");
-  // A first gate times c3 as the longest; a source change makes the second one run all three again.
+  // c1 is the longest and c3 the next; c2 is short and shares c1's setup.
+  const slept = { c1: 1500, c2: 0, c3: 700 } as Record<string, number>;
+  const f = await poolFixture(["1", "1", "2"], 3, (id, shared) => `if(require('fs').existsSync(${JSON.stringify(path.join(shared, "slow"))}))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${slept[id]})`);
+  // A first gate times them; a source change makes the second one run all three again.
   await writeFile(path.join(f.shared, "slow"), "");
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   expect(await f.run("gate"), f.err.join("\n")).toBe(0);
-  // Setup 2 settles 400 ms after setup 1, so c3 reaches the clone queue while c2 waits behind c1.
-  slowSetups(f, ["pc3"], 400);
   await writeFile(path.join(f.dir, "source.txt"), "changed"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "changed");
-  const starts = new Map<string, number>();
+  // Setup 1 goes first, for c1. c1 clones at once and c2 queues; setup 2 settles while c1's clone is held.
   const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
     const snapshot = await create(input);
-    return { ...snapshot, clone: async (m, onPhase) => { const at = performance.now(); await new Promise(resolve => setTimeout(resolve, 700)); const clone = await snapshot.clone(m, onPhase); starts.set(clone.rootDir, at); return clone; } };
+    return { ...snapshot, clone: async (m, onPhase) => { await new Promise(resolve => setTimeout(resolve, 1500)); return snapshot.clone(m, onPhase); } };
   });
   try {
     expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
     expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
   } finally { spy.mockRestore(); }
-  expect(starts.size).toBe(3);
-  // The clone phase counts the queue. One short check cloned at once; the other, queued before c3 arrived,
-  // waited behind both that clone and c3's, each held 700 ms; c3 waited behind the first only.
+  // The clone phase counts the queue: c3, queued after c2, still cloned before it.
   const clone = (d: Awaited<ReturnType<typeof latestSetups>>[number]) => d!.setup!.phases.find(p => p.phase === "clone")!.durationMs;
   const [c1, c2, c3] = (await latestSetups(f)).map(clone);
-  const [first, late] = [c1!, c2!].sort((a, b) => a - b);
-  expect(first!).toBeLessThan(c3!);
-  expect(c3!).toBeLessThan(late!);
-  expect(late!).toBeGreaterThanOrEqual(1300);
+  expect(c1!).toBeLessThan(c3!);
+  expect(c3!).toBeLessThan(c2!);
+  expect(c2!).toBeGreaterThanOrEqual(2800);
 }, 120000);
 it("a never-timed check is expected to take its declared timeout, so the longest declared one goes first", async () => {
   if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
