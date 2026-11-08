@@ -1897,6 +1897,23 @@ it("a setup key's prewarm is ordered by the longest check that needs it, not its
   expect(first(/^prewarm pc[13]: materialization /), lines.join("\n")).toBeGreaterThanOrEqual(0);
   expect(first(/^prewarm pc[13]: materialization /)).toBeLessThan(first(/^prewarm pc2: materialization /));
 }, 90000);
+it("the gate prewarms first the setup whose own critical path is longest: its last build plus its longest check", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // Setup 1 takes 1.5 s to build and its check is instant; setup 2 builds at once and its check takes 700 ms.
+  const f = await poolFixture(["1", "2"], 2, id => id === "c2" ? "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,700)" : "");
+  slowSetups(f, ["pc1"], 1500);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  await writeFile(path.join(f.dir, "source.txt"), "changed"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "changed");
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  f.out.length = 0;
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  // By its longest check alone setup 2 would go first; with its build, setup 1's path is the longer.
+  const lines = f.out.flatMap(line => line.split("\n"));
+  const first = (pattern: RegExp) => lines.findIndex(line => pattern.test(line));
+  expect(first(/^prewarm pc1: materialization /), lines.join("\n")).toBeGreaterThanOrEqual(0);
+  expect(first(/^prewarm pc1: materialization /)).toBeLessThan(first(/^prewarm pc2: materialization /));
+}, 120000);
 it("a prewarm whose setup failed leaves no base, and the check that next needs it sets up itself", async () => {
   const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
   const f = await poolFixture(["1", "1"], 2, () => "");

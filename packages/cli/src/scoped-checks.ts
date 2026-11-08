@@ -1,6 +1,6 @@
 /** Invocation-scoped execution coordinator; durable truth remains per-check evidence. */
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { deliveryRecordPathFor, recordOutputProvider, computeDeliverableIdentity, capturePhysicalSource, captureCheckBindings, captureCheckOutputSnapshots, candidateTreeEvidenceReader, candidateTreeSourceReader, createExecPort, digestCanonical, resolveRecordStorage, runGitCommand, scopedCheckIdentity, selectScopedCheckAttempt, sha256Hex, submitManifest,
   createResourceApplicabilityProjection, matchResourceApplicabilityProjection, createResourceApplicabilityBinding, reconstructResourceApplicability, discoverRecords, portableArtifactContents, isRecordFreshForCandidate, isRecordNeutralPath, type ResourceApplicabilityBinding, type InstalledDataAttemptOrigin, type InstalledDataResourceRequest, normalizeInstalledDataResourceRequests, type InstalledDataResourceContext, type InstalledDataResourceCapture,
@@ -400,8 +400,7 @@ export class ScopedChecks {
     // the pool. Other workers never inherit that worker's installed tree.
     const serialIds = resource ? [...new Set([requests[0]!.provider.id, resource.provider.id])] : [];
     // Those two hold every other worker, so their bases set up first, in that order.
-    await this.prewarm([...serialIds, ...requests.map(r => r.provider.id).filter(id => !serialIds.includes(id))],
-      new Map([...expected, ...serialIds.map((id, index) => [id, Number.MAX_SAFE_INTEGER - index] as const)]));
+    await this.prewarm(requests.map(r => r.provider.id), expected, serialIds);
     if (resource) {
       for (const id of serialIds) await run(id, this.serial);
       await this.pool(requests.map(r => r.provider.id).filter(id => !serialIds.includes(id)), run, halted, expected);
@@ -440,37 +439,66 @@ export class ScopedChecks {
   }
   /**
    * Sets up the warm base of each setup key among `ids` that has none yet, so the checks that clone it neither
-   * build it nor wait for another check to. Bases set up one at a time, in this session's order: concurrent
-   * dependency installs on one machine each take about twice as long, so the critical path's base is ready
-   * soonest on its own. With `expected`, the key whose checks are expected to run longest goes first;
-   * without it, the order of `ids`. Every key is registered at once, so no worker takes its checks before
-   * its base settles. No attempt owns this setup: a check cloning the base records it as reused and carries
-   * no dependency result, and a failed one leaves no base, so the check that next needs its key sets up
-   * itself and owns that result. Only with cloning: without it each worker builds its own tree, as before.
+   * build it nor wait for another check to. Bases set up one at a time: concurrent dependency installs on one
+   * machine each take about twice as long, so a key's base is ready soonest on its own. With `expected`, the
+   * keys of `leading` go first, in that order, and then the key whose own critical path is longest: its last
+   * recorded build plus the longest expected check that needs it. Without it, the order of `ids`. Every key
+   * is registered at once, so no worker takes its checks before its base settles. No attempt owns this setup:
+   * a check cloning the base records it as reused and carries no dependency result, and a failed one leaves
+   * no base, so the check that next needs its key sets up itself and owns that result. Only with cloning:
+   * without it each worker builds its own tree, as before.
    */
-  private async prewarm(ids: readonly string[], expected?: ReadonlyMap<string, number>): Promise<void> {
+  private async prewarm(ids: readonly string[], expected?: ReadonlyMap<string, number>, leading: readonly string[] = []): Promise<void> {
     if (this.concurrency === 1 || !await (this.cloning ??= snapshotCloneMethod())) return;
     this.sharing = true;
     const signal = this.context.signal ? AbortSignal.any([this.context.signal, this.prewarming.signal]) : this.prewarming.signal;
-    const longest = new Map<string, { id: string; cost: number; order: number }>();
+    const keyed = new Map<string, { id: string; check: number; order: number }>();
     for (const [order, id] of ids.entries()) {
-      const key = this.keyOf(id), cost = expected?.get(id) ?? 0, seen = longest.get(key);
-      if (!this.bases.has(key) && (!seen || cost > seen.cost)) longest.set(key, { id, cost, order: seen?.order ?? order });
+      const key = this.keyOf(id), check = expected?.get(id) ?? 0, seen = keyed.get(key);
+      if (this.bases.has(key)) continue;
+      if (!seen) keyed.set(key, { id, check, order });
+      else if (check > seen.check) keyed.set(key, { id, check, order: seen.order });
     }
-    const keys = [...longest].sort(([, a], [, b]) => b.cost - a.cost || a.order - b.order);
+    const rank = (key: string) => { const index = leading.findIndex(id => this.keyOf(id) === key); return index < 0 ? leading.length : index; };
+    const critical = new Map<string, number>();
+    for (const [key, { check }] of keyed) critical.set(key, expected ? await this.lastBuild(key) + check : 0);
+    const keys = [...keyed].sort(([a, x], [b, y]) => rank(a) - rank(b) || critical.get(b)! - critical.get(a)! || x.order - y.order);
     for (const [key, { id }] of keys) {
       const profile = this.profileOf(id), physicalSource = this.context.config.providers.find(p => p.id === id)?.check?.physicalSource;
       const previous = this.prewarmTail;
       // A build queued when the prewarm stops sees the aborted signal and settles as interrupted.
       const base = (async () => {
         await previous;
-        return this.buildSnapshot(profile, physicalSource, (phase, durationMs) => this.context.write(`prewarm ${profile.id}: ${phase} ${Math.round(durationMs)}ms`), undefined, signal);
+        const started = performance.now();
+        const snapshot = await this.buildSnapshot(profile, physicalSource, (phase, durationMs) => this.context.write(`prewarm ${profile.id}: ${phase} ${Math.round(durationMs)}ms`), undefined, signal);
+        await this.recordBuild(key, performance.now() - started);
+        return snapshot;
       })();
       this.prewarmTail = base.then(() => undefined, () => undefined);
       this.prewarmedBases.add(base);
       this.shareBase(key, base);
       base.catch(error => { if (!this.prewarming.signal.aborted) this.context.write(`prewarm ${profile.id}: setup failed (${error instanceof CheckSnapshotError ? error.code : "unclassified"}); its first check sets up itself`); });
     }
+  }
+  /** Where the last successful build of each setup key's base is timed. Ordering only: no admission, gate
+   * or record reads it, and a missing or unreadable timing counts as no build time. */
+  private async timingPath(key: string): Promise<string> {
+    const storage = await resolveRecordStorage(this.context.rootDir, { storageNamespace: this.context.config.storageNamespace, leaf: "scoped-setup-timings" });
+    return path.join(storage.storageDir, `${digestCanonical({ gate: this.context.config.gateId, setup: key })}.json`);
+  }
+  private async lastBuild(key: string): Promise<number> {
+    try {
+      const timing = JSON.parse(await readFile(await this.timingPath(key), "utf8")) as { version?: unknown; buildMs?: unknown };
+      return timing.version === "scoped-setup-timing/1" && typeof timing.buildMs === "number" && Number.isFinite(timing.buildMs) && timing.buildMs >= 0 ? timing.buildMs : 0;
+    } catch { return 0; }
+  }
+  private async recordBuild(key: string, buildMs: number): Promise<void> {
+    try {
+      const file = await this.timingPath(key), temporary = `${file}.${randomUUID()}`;
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeFile(temporary, `${JSON.stringify({ version: "scoped-setup-timing/1", buildMs: Math.round(buildMs) })}\n`);
+      await rename(temporary, file);
+    } catch { /* Timing orders prewarms; it cannot fail a setup. */ }
   }
   private prewarmTail: Promise<void> = Promise.resolve();
   private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"], onSetup: (setup: AcquiredSetup) => void = () => {}): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[]; setup: AcquiredSetup }> {
@@ -497,7 +525,8 @@ export class ScopedChecks {
       let base = this.bases.get(key);
       if (!base) {
         executed = true;
-        base = build(onDependencyResult);
+        const started = performance.now();
+        base = build(onDependencyResult).then(async snapshot => { await this.recordBuild(key, performance.now() - started); return snapshot; });
         this.shareBase(key, base);
       }
       this.release(key);

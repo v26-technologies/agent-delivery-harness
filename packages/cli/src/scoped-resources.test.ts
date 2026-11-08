@@ -210,6 +210,22 @@ describe('native scoped installed resources',()=>{
     expect(first(fontProfile),lines.join('\n')).toBeGreaterThanOrEqual(0);
     expect(first('other'),lines.join('\n')).toBeGreaterThan(first(fontProfile));
   },60000);
+  it('parallel gate prewarms the first check\'s setup, then the capture worker\'s, when they differ',async()=>{
+    if(!await snapshotCloneMethod())return;
+    const f=await fixture(true,true),font=f.config.providers[0]!,fontProfile=font.check!.scope!.profile;
+    // The first configured check is on its own setup and declares the shortest timeout; it still goes first.
+    const first={id:'check.first',findingCodes:[],check:{command:[process.execPath,'-e',''] as [string,...string[]],timeoutMs:1000,scope:{...font.check!.scope!,profile:'first'}}};
+    const config=defineHarnessConfig({...f.config,providers:[first,font],obligations:[{...f.config.obligations[0]!,id:'first.passed',providers:[first.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations],
+      scopedExecution:{...f.config.scopedExecution!,concurrency:2,profiles:[...f.config.scopedExecution!.profiles,{id:'first',gitContext:'full',dependencyInputs:[],mutableOutputs:[],credentialIdentities:{},dependencies:{command:[process.execPath,'-e','0'],timeoutMs:5000}}]}});
+    const runtime={...f.runtime,loadConfig:async()=>config};
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    f.messages.length=0;
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')).toBe(0);
+    const lines=f.messages.flatMap(s=>s.split('\n'));
+    const at=(profile:string)=>lines.findIndex(line=>line.startsWith(`prewarm ${profile}: materialization `));
+    expect(at('first'),lines.join('\n')).toBeGreaterThanOrEqual(0);
+    expect(at(fontProfile),lines.join('\n')).toBeGreaterThan(at('first'));
+  },60000);
   it('serial different-setup gate captures at the consumer and retains one-setup seed plus unrelated omission',async()=>{
     const f=await fixture(true,true),font=f.config.providers[0]!;
     const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',''] as [string,...string[]],timeoutMs:5000,scope:{...font.check!.scope!,profile:'other'}}};
