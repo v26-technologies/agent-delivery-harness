@@ -1772,12 +1772,80 @@ it("workers clone a warm base one at a time, and a clone's queue counts as its c
   const clones = (await latestSetups(f)).map(d => d!.setup!.phases.find(p => p.phase === "clone")!.durationMs).sort((a, b) => a - b);
   expect(clones[2]!).toBeGreaterThanOrEqual(600);
 }, 90000);
+it("a longer check's clone goes ahead of a shorter one already queued", async () => {
+  const snapshots = await import("./check-snapshot.ts"), create = snapshots.createCheckSnapshot;
+  if (!await snapshots.snapshotCloneMethod()) return;
+  const f = await poolFixture(["1", "1", "2"], 3, (id, shared) => id === "c3" ? `if(require('fs').existsSync(${JSON.stringify(path.join(shared, "slow"))}))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1500)` : "");
+  // A first gate times c3 as the longest; a source change makes the second one run all three again.
+  await writeFile(path.join(f.shared, "slow"), "");
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n")).toBe(0);
+  // Setup 2 settles 400 ms after setup 1, so c3 reaches the clone queue while c2 waits behind c1.
+  slowSetups(f, ["pc3"], 400);
+  await writeFile(path.join(f.dir, "source.txt"), "changed"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "changed");
+  const starts = new Map<string, number>();
+  const spy = vi.spyOn(snapshots, "createCheckSnapshot").mockImplementation(async input => {
+    const snapshot = await create(input);
+    return { ...snapshot, clone: async (m, onPhase) => { const at = performance.now(); await new Promise(resolve => setTimeout(resolve, 700)); const clone = await snapshot.clone(m, onPhase); starts.set(clone.rootDir, at); return clone; } };
+  });
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  } finally { spy.mockRestore(); }
+  expect(starts.size).toBe(3);
+  // The clone phase counts the queue. One short check cloned at once; the other, queued before c3 arrived,
+  // waited behind both that clone and c3's, each held 700 ms; c3 waited behind the first only.
+  const clone = (d: Awaited<ReturnType<typeof latestSetups>>[number]) => d!.setup!.phases.find(p => p.phase === "clone")!.durationMs;
+  const [c1, c2, c3] = (await latestSetups(f)).map(clone);
+  const [first, late] = [c1!, c2!].sort((a, b) => a - b);
+  expect(first!).toBeLessThan(c3!);
+  expect(c3!).toBeLessThan(late!);
+  expect(late!).toBeGreaterThanOrEqual(1300);
+}, 120000);
+it("a never-timed check is expected to take its declared timeout, so the longest declared one goes first", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1", "1", "1"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, "start-"))}+'${id}',String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500)`);
+  f.setConfig({ ...f.config, providers: f.config.providers.map(p => p.id === "check.c3" ? { ...p, check: { ...p.check!, timeoutMs: 120000 } } : p) });
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  const started = Object.fromEntries(await Promise.all(["c1", "c2", "c3"].map(async id => [id, Number(await readFile(path.join(f.shared, `start-${id}`), "utf8"))])));
+  // Declared order would start c1 and c2 first; c3 declares four times their timeout.
+  expect(started["c3"]).toBeLessThan(Math.max(started["c1"]!, started["c2"]!));
+}, 90000);
+it("prepare sets up nothing for the other mechanical checks until the guard has passed", async () => {
+  const f = await poolFixture(["1", "2", "2"], 2, id => id === "c1" ? "process.exit(3)" : "", true);
+  expect(await f.run("prepare")).toBe(1);
+  expect(f.out.join("\n")).toMatch(/failed check\.c1/);
+  expect(await f.installs("2")).toBe(0);
+}, 90000);
+it("a failed mechanical check ends prepare without waiting for a prewarm no check will take", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1", "1", "2"], 2, id => id === "c2" ? "process.exit(3)" : "", true);
+  // Setup 2 would take a minute; once c2 fails, the worker waiting for it must stop waiting.
+  slowSetups(f, ["pc3"], 60000);
+  const started = Date.now();
+  expect(await f.run("prepare")).toBe(1);
+  expect(Date.now() - started).toBeLessThan(30000);
+  expect(f.out.join("\n")).toMatch(/failed check\.c2/);
+  expect(f.out.join("\n")).not.toMatch(/checking check\.c3/);
+  expect(await f.installs("2")).toBe(0);
+}, 120000);
+it("a prepare whose mechanical checks are all reused prewarms nothing", async () => {
+  const f = await poolFixture(["1", "2"], 2, () => "", true);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const snapshots = await import("./check-snapshot.ts"), spy = vi.spyOn(snapshots, "createCheckSnapshot");
+  try {
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    expect(f.out.join("\n")).toMatch(/reusing mechanical check\.c1/);
+    expect(spy).not.toHaveBeenCalled();
+  } finally { spy.mockRestore(); }
+}, 90000);
 it("a prewarm whose setup failed leaves no base, and the check that next needs it sets up itself", async () => {
   const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
   const f = await poolFixture(["1", "1"], 2, () => "");
   const once = JSON.stringify(path.join(f.shared, "failed-once"));
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p,
-    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');if(!fs.existsSync(${once})){fs.writeFileSync(${once},'');process.exit(3)}${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
+    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');if(!fs.existsSync(${once})){fs.writeFileSync(${once},'');process.exit(3)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000);${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const gate = await f.run("gate");
   const out = f.out.join("\n");
@@ -1794,6 +1862,9 @@ it("a prewarm whose setup failed leaves no base, and the check that next needs i
   expect(out).toMatch(/prewarm pc1: setup failed \(check_dependency_failed\); its first check sets up itself/);
   expect(setups.map(d => d!.setup!.action).sort()).toEqual(["executed", "reused"]);
   expect(setups.filter(d => d!.dependency !== undefined)).toHaveLength(1);
+  // The other check waited for that second-long setup outside its attempt, not inside it.
+  const reused = setups.find(d => d!.setup!.action === "reused")!.setup!;
+  expect(reused.phases.find(p => p.phase === "warm-base-wait")!.durationMs).toBeLessThan(500);
 }, 90000);
 it("a setup that always fails is recorded on each check that needed it", async () => {
   const f = await poolFixture(["1", "1"], 2, () => "");

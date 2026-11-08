@@ -258,11 +258,11 @@ export class ScopedChecks {
    * duration less that attempt's own dependency setup; never-timed checks follow timed ones and ties keep
    * declaration order. Checks then run one dependency setup at a time, in the order each setup first
    * appears, so each setup installs once. */
-  /** A check's most recent passed or failed attempt's duration less that attempt's own dependency setup and
-   * any wait for another's warm base; undefined for a never-timed check. */
+  /** A check's most recent passed or failed attempt's duration less that attempt's own dependency setup, any
+   * wait for another's warm base, and its clone with that clone's queue; undefined for a never-timed check. */
   private async lastCost(id: string): Promise<number | undefined> {
     const last = (await this.stores.get(id)!.read()).filter(r => r.attempt.status === "passed" || r.attempt.status === "failed").at(-1)?.payload;
-    const waited = last?.diagnostic?.setup?.phases.filter(p => p.phase === "warm-base-wait").reduce((sum, p) => sum + p.durationMs, 0) ?? 0;
+    const waited = last?.diagnostic?.setup?.phases.filter(p => p.phase === "warm-base-wait" || p.phase === "clone").reduce((sum, p) => sum + p.durationMs, 0) ?? 0;
     return last?.durationMs === undefined ? undefined : last.durationMs - (last.diagnostic?.dependency?.durationMs ?? 0) - waited;
   }
   /** How long each check is expected to run: its last cost, or, never timed, its declared `timeoutMs`. */
@@ -303,8 +303,8 @@ export class ScopedChecks {
         if (failures.size > 0 || remaining.length === 0) return undefined;
         const index = halted() ? 0 : remaining.reduce((best, id, i) => !this.startable(id) ? best
           : best < 0 || (expected?.get(id) ?? 0) > (expected?.get(remaining[best]!) ?? 0) ? i : best, -1);
-        if (index >= 0) return remaining.splice(index, 1)[0];
-        await Promise.race([woken(), ...remaining.flatMap(id => { const base = this.bases.get(this.keyOf(id)); return base ? [this.settling.get(base)!] : []; })]);
+        if (index >= 0) { const id = remaining.splice(index, 1)[0]!; this.claim(id); return id; }
+        await Promise.race([woken(), ...remaining.flatMap(id => { const key = this.keyOf(id), base = this.bases.get(key); return base ? [this.settling.get(base)!] : this.claims.has(key) ? [this.claims.get(key)!.released] : []; })]);
       }
     };
     try {
@@ -313,7 +313,7 @@ export class ScopedChecks {
           const lines: string[] = [];
           try { await run(id, this.concurrency === 1 ? this.serial : { snapshots, write: text => { lines.push(text); }, priority: expected?.get(id) ?? 0 }); }
           catch (error) { failures.set(id, error); this.wakePools(); }
-          finally { for (const line of lines) this.context.write(line); }
+          finally { this.release(this.keyOf(id), id); for (const line of lines) this.context.write(line); }
         }
       }));
     } finally { this.poolWakers.delete(waker); }
@@ -325,10 +325,27 @@ export class ScopedChecks {
   private keyOf(id: string): string {
     return setupKey(this.profileOf(id), this.context.config.providers.find(p => p.id === id)?.check?.physicalSource);
   }
-  /** No base for this id's setup key, or one whose setup has settled. */
+  /** A base for this id's setup key whose setup has settled, or no base and no check about to set one up. */
   private startable(id: string): boolean {
-    const base = this.bases.get(this.keyOf(id));
-    return base === undefined || this.settled.has(base);
+    const key = this.keyOf(id), base = this.bases.get(key);
+    return base === undefined ? !this.claims.has(key) : this.settled.has(base);
+  }
+  /** While bases are shared, a check taken for a key with no base holds the key until its setup has started
+   * one (or it finished), so a second check of that key waits outside its attempt rather than on that build. */
+  private readonly claims = new Map<string, { readonly owner: string; readonly released: Promise<void>; readonly release: () => void }>();
+  private sharing = false;
+  private claim(id: string): void {
+    const key = this.keyOf(id);
+    if (!this.sharing || this.bases.has(key) || this.claims.has(key)) return;
+    let release = () => {};
+    const released = new Promise<void>(resolve => { release = resolve; });
+    this.claims.set(key, { owner: id, released, release });
+  }
+  /** Ends the key's claim: once a base exists, whoever holds it; when a check finishes, only its own. */
+  private release(key: string, owner?: string): void {
+    const claim = this.claims.get(key);
+    if (!claim || (owner !== undefined && claim.owner !== owner)) return;
+    this.claims.delete(key); claim.release();
   }
   /** Stops at the first failure: a failed mechanical check publishes no receipt. */
   async satisfyMechanical(): Promise<void> {
@@ -428,6 +445,7 @@ export class ScopedChecks {
    */
   private async prewarm(ids: readonly string[]): Promise<void> {
     if (this.concurrency === 1 || !await (this.cloning ??= snapshotCloneMethod())) return;
+    this.sharing = true;
     const signal = this.context.signal ? AbortSignal.any([this.context.signal, this.prewarming.signal]) : this.prewarming.signal;
     for (const id of ids) {
       const key = this.keyOf(id);
@@ -466,6 +484,7 @@ export class ScopedChecks {
         base = build(onDependencyResult);
         this.shareBase(key, base);
       }
+      this.release(key);
       onSetup({ action: executed ? "executed" : "reused", snapshot: "cloned", clone: method });
       const waiting = performance.now();
       let warm: CheckSnapshot | undefined;
@@ -481,11 +500,8 @@ export class ScopedChecks {
         clone = "path-bound";
         lane.write(`snapshot ${profile.id}: setup wrote its own path into the tree; each worker builds its own`);
         if (executed) return acquired(warm, { action: "executed", snapshot: "built", clone });
-        // A prewarmed base no check owns becomes this worker's own tree; the next check of this key sets up again.
-        if (this.prewarmedBases.delete(base)) {
-          if (this.bases.get(key) === base) this.bases.delete(key);
-          return acquired(warm, { action: "reused", snapshot: "built", clone });
-        }
+        // A prewarmed base no check owns becomes exactly one worker's own tree; every other worker builds its own.
+        if (this.prewarmedBases.delete(base)) return acquired(warm, { action: "reused", snapshot: "built", clone });
       } else if (warm) {
         // Clones run one at a time; the time this one queued counts as its clone.
         const queued = performance.now(), source = warm;
