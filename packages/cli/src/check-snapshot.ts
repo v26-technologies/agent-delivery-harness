@@ -159,6 +159,29 @@ function selfReferences(...created: (string | undefined)[]): string[] {
 export function executionPath(root: string, value: string): string {
   return value.split(path.delimiter).filter(p => p && path.isAbsolute(p) && !inside(root, p) && !p.split(path.sep).includes("node_modules")).join(path.delimiter) || "/usr/bin:/bin";
 }
+/** The commit depth a materialization fetch needs, or undefined for the source's whole history.
+ * A tip lies at most `merge-base..tip` commits plus one above the merge-base on any path, so
+ * that depth from both tips keeps every commit a merge-base, ancestry or three-dot read walks.
+ * That holds only while the merge-base is the sole commit those ranges stand on: a side branch
+ * forked below it would arrive cut off from it and read as a second merge-base. */
+async function materializationDepth(input: SnapshotRequest, git: (...args: string[]) => Promise<string>): Promise<number | undefined> {
+  if (input.gitContext === "none") return 1;
+  const { headSha, base } = input.candidate;
+  try {
+    // Reading the author's repository only; the fetch below still transfers object bytes.
+    // A tip above the merge-base stands on it alone exactly when it is the range's one boundary
+    // commit, which also makes it an ancestor of that tip and so fetched through it.
+    for (const tip of [headSha, base.tipSha]) {
+      const boundary = (await git("-C", input.rootDir, "rev-list", "--boundary", `${base.mergeBaseSha}..${tip}`))
+        .split("\n").filter(line => line.startsWith("-"));
+      if (tip !== base.mergeBaseSha && boundary.join("\n") !== `-${base.mergeBaseSha}`) return undefined;
+    }
+    const counts = await Promise.all([headSha, base.tipSha].map(tip => git("-C", input.rootDir, "rev-list", "--count", `${base.mergeBaseSha}..${tip}`)));
+    const longest = Math.max(...counts.map(Number));
+    return Number.isSafeInteger(longest) && longest >= 0 ? longest + 1 : undefined;
+  } catch { return undefined; }
+}
+
 export async function createCheckSnapshot(input: SnapshotRequest): Promise<CheckSnapshot> {
   if (input.physicalSource !== undefined) return createFiniteCheckSnapshot(input);
   const report = (phase: SnapshotPhase, started: number) => {
@@ -193,7 +216,16 @@ export async function createCheckSnapshot(input: SnapshotRequest): Promise<Check
     // cannot create writable links back to the author's Git metadata.
     // Accept the source's shallow boundary in this private repository. Without
     // it, fetch can reject objects or succeed while dropping required grafts.
-    await git("fetch", "--update-shallow", "--no-tags", "--no-write-fetch-head", input.rootDir, input.candidate.headSha, input.candidate.base.tipSha, input.candidate.treeSha);
+    // Fetch only the history a check can read (V26-3284): none past the pinned
+    // commits without Git, and with Git the commits from the merge-base to each
+    // tip, which merge-base, ancestry and three-dot diffs need. A distance the
+    // source cannot measure keeps today's whole-history fetch.
+    const depth = await materializationDepth(input, git);
+    // Within a bounded full history the merge-base is already fetched from both
+    // tips; asked for by itself it would deepen past itself by the same depth.
+    const mergeBase = input.gitContext !== "none" && depth !== undefined ? [] : [input.candidate.base.mergeBaseSha];
+    await git("fetch", "--update-shallow", ...(depth === undefined ? [] : ["--depth", String(depth)]), "--no-tags", "--no-write-fetch-head", input.rootDir,
+      input.candidate.headSha, input.candidate.base.tipSha, ...mergeBase, input.candidate.treeSha);
     await git("update-ref", "HEAD", input.candidate.headSha);
     await git("read-tree", input.candidate.treeSha);
     await git("checkout-index", "--all", "--force");

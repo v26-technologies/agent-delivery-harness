@@ -75,7 +75,7 @@ it.each([ ["none", "same"], ["full", "same"], ["none", "distinct"], ["full", "di
     const control = gitContext === "none" ? path.join(path.dirname(snapshot.commandRoot), "repository") : path.join(snapshot.rootDir, ".git");
     const git = async (...args: string[]) => (await exec("git", [`--git-dir=${control}`, `--work-tree=${snapshot.rootDir}`, ...args])).stdout.trim();
     expect(await git("rev-parse", "--is-shallow-repository")).toBe("true");
-    expect(new Set((await readFile(path.join(control, "shallow"), "utf8")).trim().split("\n"))).toEqual(new Set(shallow.toString().trim().split("\n")));
+    // The boundary is the candidate's own (V26-3284): no deeper than the source's.
     await expect(git("cat-file", "-e", f.missingAncestor)).rejects.toMatchObject({ code: 1 });
     expect(await git("write-tree")).toBe(f.candidate.treeSha);
     expect(await git("rev-parse", "HEAD^{tree}")).toBe(f.candidate.treeSha);
@@ -356,3 +356,124 @@ it("excludes nested dependency segments but preserves similarly named source pat
     dependencies: { command: [process.execPath, "-e", install + ";fs.writeFileSync('node_modules-extra/source','changed')"], timeoutMs: 5000 },
   })).rejects.toMatchObject({ code: "check_snapshot_drift" });
 });
+
+/** A source with history older than the candidate's merge-base: a - b - c - m (merge-base) - d (base tip), and m - e - f (head).
+ * The depth is the longest tip's distance (head: 2) plus one, so from d it reaches c; a and b lie past it. */
+async function deepFixture() {
+  const f = await fixture();
+  const commit = async (file: string, text: string, message: string) => {
+    await writeFile(path.join(f.root, file), text); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", message);
+    return f.git("rev-parse", "HEAD");
+  };
+  const a = await commit("source.txt", "a", "a"), b = await commit("source.txt", "b", "b");
+  await commit("source.txt", "c", "c");
+  const c = await commit("source.txt", "m", "m");
+  const d = await commit("base.txt", "d", "d");
+  await f.git("checkout", "-q", c);
+  await commit("branch.txt", "e", "e");
+  const head = await commit("branch.txt", "f", "f");
+  await writeFile(path.join(f.root, "branch.txt"), "staged"); await f.git("add", ".");
+  return { ...f, older: [a, b], mergeBase: c, candidate: { headSha: head, treeSha: await f.git("write-tree"), base: { ref: "origin/main", tipSha: d, mergeBaseSha: c } } };
+}
+
+it("fetches only the history from the merge-base to each tip for a full Git context (V26-3284)", async () => {
+  const f = await deepFixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: snapshot.rootDir })).stdout.trim();
+    expect(await git("rev-parse", "--is-shallow-repository")).toBe("true");
+    for (const old of f.older) await expect(git("cat-file", "-e", `${old}^{commit}`)).rejects.toMatchObject({ code: 128 });
+    // What checks read through the pinned refs answers exactly as in the full source.
+    expect(await git("merge-base", "refs/delivery/base", "refs/delivery/origin-head")).toBe(f.mergeBase);
+    expect(await git("diff", "--name-only", "refs/delivery/base...refs/delivery/origin-head")).toBe(await f.git("diff", "--name-only", `${f.candidate.base.tipSha}...${f.candidate.headSha}`));
+    await expect(git("merge-base", "--is-ancestor", "refs/delivery/merge-base", "refs/delivery/base")).resolves.toBe("");
+    expect(await git("rev-list", "--count", "refs/delivery/merge-base..refs/delivery/origin-head")).toBe("2");
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+  } finally { await snapshot.cleanup(); }
+}, 30000);
+
+it("fetches only the pinned commits themselves when the check sees no Git", async () => {
+  const f = await deepFixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, gitContext: "none", outputs: [], environment: {} });
+  try {
+    const control = path.join(path.dirname(snapshot.commandRoot), "repository");
+    const git = async (...args: string[]) => (await exec("git", [`--git-dir=${control}`, `--work-tree=${snapshot.rootDir}`, ...args])).stdout.trim();
+    expect(await git("rev-parse", "refs/delivery/origin-head", "refs/delivery/base", "refs/delivery/merge-base")).toBe([f.candidate.headSha, f.candidate.base.tipSha, f.mergeBase].join("\n"));
+    // Depth 1: the pinned commits, never their parents (the base tip's parent is the pinned merge-base).
+    for (const pinned of [f.candidate.headSha, f.mergeBase]) await expect(git("rev-parse", "--verify", "--quiet", `${pinned}^`)).rejects.toMatchObject({ code: 1 });
+    await expect(snapshot.verify()).resolves.toBeUndefined();
+  } finally { await snapshot.cleanup(); }
+}, 30000);
+
+it("falls back to the source's whole history when it cannot measure the merge-base distance", async () => {
+  const f = await deepFixture();
+  // Not an ancestor of the base tip: the distance cannot bound what checks read.
+  const unrelated = (await exec("git", ["commit-tree", "-m", "unrelated", await f.git("rev-parse", `${f.older[0]}^{tree}`)], { cwd: f.root })).stdout.trim();
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: unrelated } };
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: snapshot.rootDir })).stdout.trim();
+    for (const old of f.older) await expect(git("cat-file", "-e", `${old}^{commit}`)).resolves.toBe("");
+  } finally { await snapshot.cleanup(); }
+}, 30000);
+
+it.each(["head", "base", "both"] as const)("falls back to the source's whole history when a side branch forked below the merge-base is merged on the %s side", async (sides) => {
+  const f = await deepFixture();
+  const root = await f.git("rev-parse", `${f.older[0]}^`);
+  // A branch cut from `root` reaches below the merge-base by itself; fetched to the bounded
+  // depth it would arrive cut off from it, counted above it and read as a second merge-base.
+  const commitTree = async (message: string, tree: string, ...parents: string[]) =>
+    (await exec("git", ["commit-tree", ...parents.flatMap(p => ["-p", p]), "-m", message, tree], { cwd: f.root })).stdout.trim();
+  const tree = async (commit: string) => f.git("rev-parse", `${commit}^{tree}`);
+  const merge = async (tip: string, name: string) => commitTree(`merge ${name}`, await tree(tip), tip, await commitTree(name, await tree(root), root));
+  const headSha = sides === "base" ? f.candidate.headSha : await merge(f.candidate.headSha, "side");
+  const tipSha = sides === "head" ? f.candidate.base.tipSha : await merge(f.candidate.base.tipSha, "other");
+  const candidate = { ...f.candidate, headSha, base: { ...f.candidate.base, tipSha } };
+  const reads = async (git: (...args: string[]) => Promise<string>) => [
+    await git("merge-base", "--all", headSha, tipSha),
+    await git("rev-list", "--count", `${f.mergeBase}..${headSha}`),
+    await git("rev-list", "--count", `${f.mergeBase}..${tipSha}`),
+  ];
+  expect((await reads(f.git))[0]).toBe(f.mergeBase);
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: snapshot.rootDir })).stdout.trim();
+    expect(await reads(git)).toEqual(await reads(f.git));
+  } finally { await snapshot.cleanup(); }
+}, 30000);
+
+it("bounds the fetch when the base tip is itself the merge-base", async () => {
+  const f = await deepFixture();
+  // The base tip's range is empty and stands on nothing; only the head side bounds the depth.
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, tipSha: f.mergeBase } };
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: snapshot.rootDir })).stdout.trim();
+    expect(await git("merge-base", "HEAD", "refs/delivery/base")).toBe(f.mergeBase);
+    // The base tip is fetched to the head side's depth too, so it reaches `b` but not `a`.
+    await expect(git("cat-file", "-e", `${f.older[0]}^{commit}`)).rejects.toMatchObject({ code: 128 });
+  } finally { await snapshot.cleanup(); }
+}, 30000);
+
+it("refuses a merge-base the source does not have", async () => {
+  const f = await deepFixture();
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: "0".repeat(40) } };
+  await expect(createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} })).rejects.toThrow();
+}, 30000);
+
+it("keeps a shallow source's boundary when the whole-history fallback fetches from it", async () => {
+  const f = await shallowFixture();
+  // An unrelated merge-base cannot bound the fetch, so the whole available history is fetched
+  // from a shallow source, whose grafts the snapshot must take on rather than reject.
+  // The shallow clone carries no repository identity of its own.
+  const unrelated = (await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", "-m", "unrelated", await f.git("rev-parse", `${f.candidate.headSha}^{tree}`)], { cwd: f.root })).stdout.trim();
+  const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: unrelated } };
+  // Git may record one graft twice when several wants reach it; the set of grafts is what counts.
+  const grafts = async (root: string) => [...new Set((await readFile(path.join(root, ".git/shallow"), "utf8")).trim().split("\n"))].sort();
+  const shallow = await grafts(f.root);
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    expect(await grafts(snapshot.rootDir)).toEqual(shallow);
+    await expect(exec("git", ["cat-file", "-e", f.missingAncestor], { cwd: snapshot.rootDir })).rejects.toMatchObject({ code: 1 });
+  } finally { await snapshot.cleanup(); }
+}, 30000);
