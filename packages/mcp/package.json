@@ -1,6 +1,6 @@
 {
   "name": "@agent-delivery-harness/mcp",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "MCP server exposing the delivery harness submission surface",
   "license": "FSL-1.1-ALv2",
@@ -13,8 +13,8 @@
     "node": ">=22.6.0"
   },
   "dependencies": {
-    "@agent-delivery-harness/cli": "0.8.0",
-    "@agent-delivery-harness/kernel": "0.8.0"
+    "@agent-delivery-harness/cli": "0.8.1",
+    "@agent-delivery-harness/kernel": "0.8.1"
   },
   "exports": {
     ".": "./src/index.ts"
