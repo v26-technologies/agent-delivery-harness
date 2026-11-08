@@ -465,7 +465,8 @@ it("keeps a shallow source's boundary when the whole-history fallback fetches fr
   const f = await shallowFixture();
   // An unrelated merge-base cannot bound the fetch, so the whole available history is fetched
   // from a shallow source, whose grafts the snapshot must take on rather than reject.
-  const unrelated = (await exec("git", ["commit-tree", "-m", "unrelated", await f.git("rev-parse", `${f.candidate.headSha}^{tree}`)], { cwd: f.root })).stdout.trim();
+  // The shallow clone carries no repository identity of its own.
+  const unrelated = (await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", "-m", "unrelated", await f.git("rev-parse", `${f.candidate.headSha}^{tree}`)], { cwd: f.root })).stdout.trim();
   const candidate = { ...f.candidate, base: { ...f.candidate.base, mergeBaseSha: unrelated } };
   // Git may record one graft twice when several wants reach it; the set of grafts is what counts.
   const grafts = async (root: string) => [...new Set((await readFile(path.join(root, ".git/shallow"), "utf8")).trim().split("\n"))].sort();
