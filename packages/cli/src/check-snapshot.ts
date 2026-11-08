@@ -161,15 +161,20 @@ export function executionPath(root: string, value: string): string {
 }
 /** The commit depth a materialization fetch needs, or undefined for the source's whole history.
  * A tip lies at most `merge-base..tip` commits plus one above the merge-base on any path, so
- * that depth from both tips keeps every commit a merge-base, ancestry or three-dot read walks. */
+ * that depth from both tips keeps every commit a merge-base, ancestry or three-dot read walks.
+ * That holds only while the merge-base is the sole commit those ranges stand on: a side branch
+ * forked below it would arrive cut off from it and read as a second merge-base. */
 async function materializationDepth(input: SnapshotRequest, git: (...args: string[]) => Promise<string>): Promise<number | undefined> {
   if (input.gitContext === "none") return 1;
   const { headSha, base } = input.candidate;
   try {
     // Reading the author's repository only; the fetch below still transfers object bytes.
-    if ((await git("-C", input.rootDir, "rev-list", "--max-count=1", `${base.mergeBaseSha}..${base.mergeBaseSha}`)) !== "") return undefined;
-    for (const tip of [headSha, base.tipSha])
+    for (const tip of [headSha, base.tipSha]) {
       await git("-C", input.rootDir, "merge-base", "--is-ancestor", base.mergeBaseSha, tip);
+      const boundary = (await git("-C", input.rootDir, "rev-list", "--boundary", `${base.mergeBaseSha}..${tip}`))
+        .split("\n").filter(line => line.startsWith("-"));
+      if (boundary.some(line => line !== `-${base.mergeBaseSha}`)) return undefined;
+    }
     const counts = await Promise.all([headSha, base.tipSha].map(tip => git("-C", input.rootDir, "rev-list", "--count", `${base.mergeBaseSha}..${tip}`)));
     const longest = Math.max(...counts.map(Number));
     return Number.isSafeInteger(longest) && longest >= 0 ? longest + 1 : undefined;

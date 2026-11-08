@@ -416,3 +416,26 @@ it("falls back to the source's whole history when it cannot measure the merge-ba
     for (const old of f.older) await expect(git("cat-file", "-e", `${old}^{commit}`)).resolves.toBe("");
   } finally { await snapshot.cleanup(); }
 }, 30000);
+
+it("falls back to the source's whole history when side branches forked below the merge-base", async () => {
+  const f = await deepFixture();
+  const root = await f.git("rev-parse", `${f.older[0]}^`);
+  // Branches cut from `root` and merged on each side reach below the merge-base by themselves;
+  // fetched to the bounded depth they would arrive cut off from it and read as a second merge-base.
+  const commitTree = async (message: string, tree: string, ...parents: string[]) =>
+    (await exec("git", ["commit-tree", ...parents.flatMap(p => ["-p", p]), "-m", message, tree], { cwd: f.root })).stdout.trim();
+  const tree = async (commit: string) => f.git("rev-parse", `${commit}^{tree}`);
+  const headSha = await commitTree("merge side", await tree(f.candidate.headSha), f.candidate.headSha, await commitTree("side", await tree(root), root));
+  const tipSha = await commitTree("merge other", await tree(f.candidate.base.tipSha), f.candidate.base.tipSha, await commitTree("other", await tree(root), root));
+  const candidate = { ...f.candidate, headSha, base: { ...f.candidate.base, tipSha } };
+  const reads = async (git: (...args: string[]) => Promise<string>) => [
+    await git("merge-base", "--all", headSha, tipSha),
+    await git("rev-list", "--count", `${f.mergeBase}..${headSha}`),
+  ];
+  expect((await reads(f.git))[0]).toBe(f.mergeBase);
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate, gitContext: "full", outputs: [], environment: {} });
+  try {
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: snapshot.rootDir })).stdout.trim();
+    expect(await reads(git)).toEqual(await reads(f.git));
+  } finally { await snapshot.cleanup(); }
+}, 30000);
