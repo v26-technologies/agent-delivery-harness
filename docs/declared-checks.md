@@ -38,14 +38,18 @@ A check that declares a `scope` runs in a private snapshot of the prepared tree 
 
 ### Snapshot setup and reuse
 
-With more than one worker, a setup runs once per invocation, not once per worker. The first check that needs a setup builds a warm base for it: the dependency setup runs there, and no check command ever does. Every worker, including that first one, takes a copy-on-write clone of the base: `clonefile(2)` on macOS (APFS), a reflink copy (`cp --reflink=always`) on Linux. Each clone is private, so a write in one clone reaches neither the base nor any other clone. Each worker builds its own tree as before, and the record says why, in two cases:
+With more than one worker, a setup runs once per invocation, not once per worker, in a warm base: the dependency setup runs there, and no check command ever does. Every worker takes a copy-on-write clone of the base: `clonefile(2)` on macOS (APFS), a reflink copy (`cp --reflink=always`) on Linux. Each clone is private, so a write in one clone reaches neither the base nor any other clone. Clones run one at a time, because concurrent clones of one large tree each take several times as long as one alone; the time a clone waits its turn counts in its `clone` phase.
+
+The warm bases are prewarmed. When `prepare` or the gate hands checks to the workers, every setup key among the checks that will run starts its base at once, before any check takes a worker. `prepare` prewarms the first declared mechanical check's setup first, and the others only after that check has passed, so nothing sets up ahead of the guard. No attempt owns a prewarmed setup: its phases print as `prewarm <profile>: <phase> <n>ms` lines, and a check that clones the base records `reused`, with no `dependency` result. A worker never starts a check whose base is still setting up. While every remaining check's base is, it waits for one to settle, outside any attempt. A fail-fast gate stops that wait and records the rest as cancelled before they started, and the gate's cleanup stops any prewarm no check took. A prewarm that fails leaves no base, so the check that next needs that setup sets up itself, as below, and its attempt owns that result.
+
+Each worker builds its own tree as before, and the record says why, in two cases:
 
 - The temporary directory supports neither cloning method.
-- The setup wrote the tree's own absolute path into one of its files. A Python virtual environment's scripts are one example. A clone would still read and write the base through that path. The inventory that hashes the installed tree finds such files.
+- The setup wrote the tree's own absolute path into one of its files. A Python virtual environment's scripts are one example. A clone would still read and write the base through that path. The inventory that hashes the installed tree finds such files. A prewarmed base of that kind becomes the first worker's own tree, recorded `reused` and `built`, instead of being set up again.
 
 Each attempt's retained diagnostic carries `setup`:
 
-- `action`: `executed` when this attempt ran the setup, or `reused` when it did not.
+- `action`: `executed` when this attempt ran the setup, or `reused` when it did not: another check or the prewarm ran it.
 - `snapshot`: `built`, `cloned` or `retained` (the worker's tree from its previous check).
 - `clone`: `clonefile`, `reflink`, `unavailable`, `path-bound` or `not-used` (one worker).
 - `verification`: what was checked before the command.
