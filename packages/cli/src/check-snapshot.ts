@@ -63,16 +63,30 @@ function phaseMeter(onPhase?: (phase: SnapshotPhase, durationMs: number) => void
 }
 /** Where removed trees wait to be deleted: beside them in the temporary directory, so moving one is a rename on
  * the same volume. Nothing here is evidence, and nothing reads it. */
-const trash = () => path.join(tmpdir(), "delivery-harness-trash");
-/** Deletes `paths` in a process this one does not wait for or outlive the need of. Best effort: whatever a stopped
- * deletion leaves in the trash, the next session's sweep removes. */
-function deleteDetached(paths: readonly string[]): void {
-  if (!paths.length) return;
+const trash = () => path.join(tmpdir(), `delivery-harness-trash-${process.getuid?.() ?? "user"}`);
+/**
+ * The trash, only when it is this user's own private directory. A temporary directory may be shared, and the
+ * sweep deletes what it lists, so a link or another user's directory at that name is never followed: the
+ * caller removes in place instead.
+ */
+async function ownTrash(create: boolean): Promise<string | undefined> {
+  const dir = trash();
   try {
-    const child = spawn("/bin/rm", ["-rf", "--", ...paths], { detached: true, stdio: "ignore" });
-    child.on("error", () => { /* Left for the next sweep. */ });
-    child.unref();
-  } catch { /* Left for the next sweep. */ }
+    if (create) await mkdir(dir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+    const found = await lstat(dir);
+    return found.isDirectory() && found.uid === process.getuid?.() && (found.mode & 0o077) === 0 ? dir : undefined;
+  } catch { return undefined; }
+}
+/** Deletes `paths` in a process this one does not wait for or outlive the need of. Best effort: whatever a stopped
+ * deletion leaves in the trash, the next session's sweep removes. Batched so no argument list outgrows the host's. */
+function deleteDetached(paths: readonly string[]): void {
+  for (let at = 0; at < paths.length; at += 256) {
+    try {
+      const child = spawn("/bin/rm", ["-rf", "--", ...paths.slice(at, at + 256)], { detached: true, stdio: "ignore" });
+      child.on("error", () => { /* Left for the next sweep. */ });
+      child.unref();
+    } catch { /* Left for the next sweep. */ }
+  }
 }
 /** Whether the process that moved a tree aside may still be deleting it. A reused pid only delays a sweep. */
 function ownerAlive(pid: number): boolean {
@@ -80,14 +94,16 @@ function ownerAlive(pid: number): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 /** Removes, in the background, what sessions that have ended left in the trash. An entry is named for the process
- * that moved it there; one whose owner is this process or still alive is left to that owner's own deletion. */
+ * that moved it there; one whose owner is still alive, this process included, is left to that owner's deletion. */
 export async function sweepRemovedTrees(): Promise<void> {
   if (process.platform === "win32") return;
-  const entries = await readdir(trash()).catch(() => [] as string[]);
+  const dir = await ownTrash(false);
+  if (!dir) return;
+  const entries = await readdir(dir).catch(() => [] as string[]);
   deleteDetached(entries.filter(entry => {
     const pid = Number(/^(\d+)-/.exec(entry)?.[1]);
-    return !Number.isSafeInteger(pid) || pid <= 0 || (pid !== process.pid && !ownerAlive(pid));
-  }).map(entry => path.join(trash(), entry)));
+    return !Number.isSafeInteger(pid) || pid <= 0 || !ownerAlive(pid);
+  }).map(entry => path.join(dir, entry)));
 }
 /**
  * Takes each owned tree out of its path at once, by renaming it into the trash, and deletes it in a detached
@@ -97,20 +113,22 @@ export async function sweepRemovedTrees(): Promise<void> {
  */
 async function removeTrees(directories: readonly string[]): Promise<void> {
   const moved: string[] = [];
+  const into = process.platform === "win32" ? undefined : await ownTrash(true);
   const removed = await Promise.allSettled(directories.map(async dir => {
-    if (process.platform !== "win32") {
+    if (into) {
       try {
-        await mkdir(trash(), { recursive: true, mode: 0o700 });
-        // A rename never copies; on another volume the tree is removed in place instead.
-        const [from, into] = await Promise.all([stat(path.dirname(dir)), stat(trash())]);
-        if (from.dev === into.dev) {
-          const target = path.join(trash(), `${process.pid}-${randomUUID()}`);
+        // A rename never copies; on another volume the tree is removed in place instead. The device check only
+        // spares a doomed rename: one across volumes fails with EXDEV and falls through to the same removal.
+        const [from, to] = await Promise.all([stat(path.dirname(dir)), stat(into)]);
+        if (from.dev === to.dev) {
+          const target = path.join(into, `${process.pid}-${randomUUID()}`);
           await rename(dir, target);
           moved.push(target);
           return;
         }
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        // Done only when the tree itself is gone, not when the trash went missing under the move.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && await lstat(dir).then(() => false, gone => (gone as NodeJS.ErrnoException).code === "ENOENT")) return;
       }
     }
     await rm(dir, { recursive: true, force: true });

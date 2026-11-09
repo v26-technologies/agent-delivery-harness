@@ -1967,6 +1967,9 @@ it("hashes an unchanged host tool once a process, and a changed one again", asyn
   const dir = await mkdtemp(path.join(tmpdir(), "host-tool-")); dirs.push(dir);
   const tool = path.join(dir, "tool");
   await writeFile(tool, "one", { mode: 0o755 });
+  // A whole-millisecond mtime survives being set again exactly, so only ctime can tell the rewrite apart.
+  const pinned = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+  await utimes(tool, pinned, pinned);
   let reads = 0;
   const counting = async (file: string) => { reads++; return readFile(file); };
   const sha = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -1977,13 +1980,39 @@ it("hashes an unchanged host tool once a process, and a changed one again", asyn
   expect(first[0]!.mode).toBe(0o111);
   expect(reads).toBe(1);
   // Same size, same mtime: the change of ctime alone gives a new key, so the new bytes are hashed.
-  const { mtime } = await import("node:fs").then(fs => fs.statSync(tool));
-  await writeFile(tool, "two"); await utimes(tool, mtime, mtime);
+  await writeFile(tool, "two"); await utimes(tool, pinned, pinned);
+  expect((await import("node:fs")).statSync(tool).mtimeMs).toBe(pinned.getTime());
   expect((await hostToolDigest(tool, counting)).sha256).toBe(sha("two"));
   expect(reads).toBe(2);
+  // A read that fails is not remembered: the next check reads the tool again.
+  const flaky = path.join(dir, "flaky");
+  await writeFile(flaky, "three", { mode: 0o755 });
+  let failing = true;
+  const once = async (file: string) => { if (failing) { failing = false; throw new Error("fixture read refused"); } return readFile(file); };
+  await expect(hostToolDigest(flaky, once)).rejects.toThrow("fixture read refused");
+  expect((await hostToolDigest(flaky, once)).sha256).toBe(sha("three"));
 });
-it("a gate reports the same result and records whether or not its trees' deletion finishes", async () => {
-  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+it("each scoped session sweeps what ended sessions left in the trash", async () => {
+  const { spawn: start } = await import("node:child_process");
+  const { access, mkdir: makeDir } = await import("node:fs/promises");
+  const done = start("/bin/sh", ["-c", "exit 0"]); await new Promise(resolve => done.once("exit", resolve));
+  const trashed = path.join(tmpdir(), `delivery-harness-trash-${process.getuid!()}`);
+  const left = path.join(trashed, `${done.pid}-left${process.pid}${Date.now()}`);
+  await makeDir(trashed, { recursive: true, mode: 0o700 });
+  await makeDir(path.join(left, "node_modules"), { recursive: true });
+  try {
+    const f = await poolFixture(["1"], 1, () => "");
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    await f.run("gate");
+    let gone = false;
+    for (const end = Date.now() + 20_000; !gone && Date.now() < end; await new Promise(resolve => setTimeout(resolve, 50)))
+      gone = await access(left).then(() => false, () => true);
+    expect(gone).toBe(true);
+  } finally { await rm(left, { recursive: true, force: true }); }
+});
+it("a gate reports the same result and records whether or not its trees' deletion finishes", async ({ skip }) => {
+  // Without cloning a gate owns no snapshot trees to delete; the row is reported skipped, not passed.
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) skip();
   const runs: { gate: number; out: string[]; verify: number }[] = [];
   for (const kill of [false, true]) {
     const f = await poolFixture(["1", "2"], 2, () => "");

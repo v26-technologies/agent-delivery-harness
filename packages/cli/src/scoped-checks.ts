@@ -17,7 +17,6 @@ export function scopedCandidate(candidate: CandidateBinding): RecordCandidateBin
 /** A host tool's sha256 within this process, by the file's identity and last change: every scoped check binds
  * the same node, package manager and setup tool, and each is often 50–120 MB. A changed file has a new key. */
 const hostToolDigests = new Map<string, Promise<string>>();
-let sweeping: Promise<void> | undefined;
 export async function hostToolDigest(file: string, readBytes: (file: string) => Promise<Uint8Array> = readFile): Promise<{ sha256: string; mode: number }> {
   const before = await stat(file);
   const key = JSON.stringify([before.dev, before.ino, before.size, before.mtimeMs, before.ctimeMs]);
@@ -184,8 +183,8 @@ export class ScopedChecks {
   static async create(context: CommandContext, candidate: CapturedCandidate): Promise<ScopedChecks | undefined> {
     const providers = scopedProviders(context);
     if (!providers.length) return undefined;
-    // Trees an earlier session moved aside but did not finish deleting.
-    sweeping ??= sweepRemovedTrees().catch(() => undefined);
+    // Trees an earlier session moved aside but did not finish deleting: one listing, in the background.
+    void sweepRemovedTrees().catch(() => undefined);
     const session = new ScopedChecks(context, candidate);
     const storage = await resolveRecordStorage(context.rootDir, { storageNamespace: context.config.storageNamespace, leaf: "scoped-attempts" });
     const { inventory, read } = await preparedSource(context, candidate);
