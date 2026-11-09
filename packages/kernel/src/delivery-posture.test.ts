@@ -858,6 +858,24 @@ describe("which directory is read", () => {
     refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
   });
 
+  it.each([
+    ["a bare layout git refuses to open", "bare"],
+    ["a gitfile pointing nowhere", "broken"],
+  ])("does not read from a real nested repository whose only enclosing layout is its parent, %s", async (_name, kind) => {
+    // No work tree holds the parent, so nothing above it refuses: the parent's own place in the walk decides.
+    const { other } = await focusedElsewhere();
+    const outside = await mkdtemp(path.join(tmpdir(), "delivery-posture-holder-")); dirs.push(outside);
+    const holder = path.join(outside, kind);
+    if (kind === "bare") await exec("git", ["clone", "-q", "--bare", other.remote, holder]);
+    else { await mkdir(holder); await writeFile(path.join(holder, ".git"), `gitdir: ${path.join(outside, "nowhere")}\n`); }
+    const nested = path.join(holder, "nested");
+    await exec("git", ["clone", "-q", other.remote, nested]);
+    // The controls: git fails from the parent, and nothing above the parent is in a work tree.
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--is-inside-work-tree"], { cwd: holder })).rejects.toThrow();
+    expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: outside }).catch(() => ({ stdout: "no repository" }))).stdout.trim()).not.toBe("true");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
   it("does not read from a linked worktree of a real nested repository", async () => {
     // Its parent is the nested clone, which shares its git directory: only the root above encloses it with another.
     const f = await fixture();
@@ -990,6 +1008,23 @@ describe("which directory is read", () => {
     // The control: its parent is inside the main checkout's work tree.
     expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: path.dirname(lane) })).stdout.trim()).toBe("true");
     for (const rootDir of await namings(lane, f.root)) {
+      expect(await resolveDeliveryPosture({ rootDir, baseRef: "origin/main" }), rootDir).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    }
+  });
+
+  it("reads a linked worktree inside its own bare repository from its root, however the root is named", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const bare = path.join(f.root, "project.git");
+    await exec("git", ["clone", "-q", "--bare", f.remote, bare]);
+    await exec("git", ["--git-dir", bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    await exec("git", ["--git-dir", bare, "fetch", "-q", "origin"]);
+    await exec("git", ["--git-dir", bare, "remote", "set-head", "origin", "main"]);
+    const linked = path.join(bare, "main");
+    await exec("git", ["--git-dir", bare, "worktree", "add", "-q", "--detach", linked]);
+    // The control: from inside the bare repository, git told to honour only an explicit one refuses.
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--git-common-dir"], { cwd: bare })).rejects.toThrow();
+    for (const rootDir of await namings(linked, f.root)) {
       expect(await resolveDeliveryPosture({ rootDir, baseRef: "origin/main" }), rootDir).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
     }
   });

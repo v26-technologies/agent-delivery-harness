@@ -290,7 +290,9 @@ async function whyNotRoot(rootDir: string, git: GitRunner, gitIn: (cwd: string) 
   // shares its parent's git directory, and a layout git refuses to open hides what encloses it from the
   // parent's own answer. Each must read, and be the directory's own repository.
   for (let ancestor = parent; ; ancestor = path.dirname(ancestor)) {
-    if (await couldBeRepository(ancestor) && await commonDir(gitIn(ancestor), ancestor) !== own) return nested;
+    // The directory's own git directory encloses it where a worktree sits inside its bare repository,
+    // which git, told to honour only an explicit bare repository, would refuse to read from inside.
+    if (ancestor !== own && await couldBeRepository(ancestor) && await commonDir(gitIn(ancestor), ancestor) !== own) return nested;
     if (path.dirname(ancestor) === ancestor) return undefined;
   }
 }
