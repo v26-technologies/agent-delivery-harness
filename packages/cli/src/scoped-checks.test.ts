@@ -1861,7 +1861,7 @@ it("a reused mechanical check that claimed a key with no base frees it for the n
   await writeFile(path.join(f.dir, "e.txt"), "one"); await f.git("add", "."); await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "e");
   f.setConfig({ ...f.config, providers: f.config.providers.map(p => p.id === "check.c3" ? { ...p, check: { ...p.check!, scope: { ...p.check!.scope!, files: ["source.txt", "e.txt"] } } } : p),
     scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => p.id === "pc1" ? p : { ...p,
-      dependencies: { command: [process.execPath, "-e", `const fs=require('fs');if(fs.existsSync(${arm})){let first=true;try{fs.writeFileSync(${once},'',{flag:'wx'})}catch{first=false}if(first)process.exit(3)}${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } }) } });
+      dependencies: { command: [process.execPath, "-e", `const fs=require('fs');if(fs.existsSync(${arm})){let first=true;try{fs.writeFileSync(${once},'',{flag:'wx'})}catch(e){if(e.code!=='EEXIST')throw e;first=false}if(first)process.exit(3)}${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } }) } });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   // Only c3 changes; setup 2's prewarm for it fails once, so c2, reused, is taken with no base for its key.
   await writeFile(path.join(f.shared, "arm"), "");
@@ -1929,7 +1929,7 @@ it("a prewarm whose setup failed leaves no base, and the check that next needs i
   const f = await poolFixture(["1", "1"], 2, () => "");
   const once = JSON.stringify(path.join(f.shared, "failed-once"));
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p,
-    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');{let first=true;try{fs.writeFileSync(${once},'',{flag:'wx'})}catch{first=false}if(first)process.exit(3)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000);${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
+    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');{let first=true;try{fs.writeFileSync(${once},'',{flag:'wx'})}catch(e){if(e.code!=='EEXIST')throw e;first=false}if(first)process.exit(3)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000);${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const gate = await f.run("gate");
   const out = f.out.join("\n");
