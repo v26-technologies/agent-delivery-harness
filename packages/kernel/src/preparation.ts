@@ -84,7 +84,7 @@ export const PREPARATION_RECEIPT_LEAF = "preparation";
  * supposed to be invalidated by; the manifest-equality test is what makes the
  * omission a red run rather than a silent one.
  */
-export const HARNESS_VERSION = "0.8.5";
+export const HARNESS_VERSION = "0.8.6";
 
 /**
  * The five ways a receipt can fail to authorise the candidate in front of it,
