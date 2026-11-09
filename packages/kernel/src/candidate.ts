@@ -124,26 +124,15 @@ export function scrubbedEnvironment(): Record<string, string> {
   return { ...environment, ...GIT_ENVIRONMENT_OVERRIDES };
 }
 
-interface BinaryCommandResult {
-  readonly exitCode: number;
-  readonly stdout: Buffer;
-  readonly stderr: string;
-}
 type GitCommandOptions = Parameters<CandidateCommandRunner>[1];
 
-export const runGitCommand: CandidateCommandRunner = (command, options) => collectGitCommand(command, options, false);
+export const runGitCommand: CandidateCommandRunner = (command, options) => collectGitCommand(command, options);
 
-/** Internal native transport. The public runner retains its text/base64 contract. */
-export function runGitCommandBytes(command: readonly string[], options: Omit<GitCommandOptions, "captureBytes">): Promise<BinaryCommandResult> {
-  return collectGitCommand(command, { ...options, captureBytes: true }, true);
-}
-function collectGitCommand(command: readonly string[], options: GitCommandOptions, rawBytes: true): Promise<BinaryCommandResult>;
-function collectGitCommand(command: readonly string[], options: GitCommandOptions, rawBytes: false): Promise<CandidateCommandResult>;
-function collectGitCommand(command: readonly string[], options: GitCommandOptions, rawBytes: boolean): Promise<BinaryCommandResult | CandidateCommandResult> {
-  return new Promise<BinaryCommandResult | CandidateCommandResult>((resolve) => {
+function collectGitCommand(command: readonly string[], options: GitCommandOptions): Promise<CandidateCommandResult> {
+  return new Promise<CandidateCommandResult>((resolve) => {
     const [executable, ...args] = command;
     if (executable === undefined) {
-      resolve(rawBytes ? { exitCode: -1, stdout: Buffer.alloc(0), stderr: "no command was given" } : { exitCode: -1, stdout: "", stderr: "no command was given" });
+      resolve({ exitCode: -1, stdout: "", stderr: "no command was given" });
       return;
     }
     const child = spawn(executable, args, {
@@ -166,7 +155,7 @@ function collectGitCommand(command: readonly string[], options: GitCommandOption
       stderr += chunk;
     });
     child.once("error", (error: Error) => {
-      resolve(rawBytes ? { exitCode: -1, stdout: Buffer.alloc(0), stderr: error.message } : { exitCode: -1, stdout, stderr: error.message });
+      resolve({ exitCode: -1, stdout, stderr: error.message });
     });
     if (options.stdin !== undefined) {
       child.stdin!.once("error", (error: Error) => {
@@ -179,10 +168,6 @@ function collectGitCommand(command: readonly string[], options: GitCommandOption
     // output is complete when the exit code is read.
     child.once("close", (code) => {
       const bytes = options.captureBytes ? Buffer.concat(chunks) : undefined;
-      if (rawBytes) {
-        resolve({ exitCode: inputError === undefined ? code ?? -1 : -1, stdout: bytes!, stderr: inputError ?? stderr });
-        return;
-      }
       resolve({ exitCode: inputError === undefined ? code ?? -1 : -1, stdout: bytes?.toString("utf8") ?? stdout, stderr: inputError ?? stderr, ...(bytes === undefined ? {} : { stdoutBase64: bytes.toString("base64") }) });
     });
   });

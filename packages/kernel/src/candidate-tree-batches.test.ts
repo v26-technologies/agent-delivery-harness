@@ -5,7 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
 import { candidateTreeEvidenceReader, candidateTreeSourceReader } from "./portable-inputs.ts";
-import { runGitCommand, runGitCommandBytes, type CandidateCommandRunner } from "./candidate.ts";
+import { runGitCommand, type CandidateCommandRunner } from "./candidate.ts";
 import { MAX_PORTABLE_ARTIFACT_BYTES } from "./portable-limits.ts";
 import { captureScopedCheckInputs } from "./checks.ts";
 
@@ -212,17 +212,13 @@ it("uses batching through compiled public kernel exports with the exported nativ
   expect(f.calls().filter(call => call.args[0] === "cat-file").map(call => call.args[1])).toEqual(["--batch"]);
 });
 
-it("drains exact binary chunks internally while preserving public text and base64 results", async () => {
+it("drains binary chunks while preserving public text and base64 results", async () => {
   const command = [process.execPath, "-e", "process.stdout.write(Buffer.from([0,255,128]));setTimeout(()=>{process.stdout.write(Buffer.from([10,195,169]));process.stderr.write('complete')},20)"];
   const expected = Buffer.from([0, 255, 128, 10, 195, 169]);
-  const binary = await runGitCommandBytes(command, { cwd: tmpdir() });
-  expect(binary).toEqual({ exitCode: 0, stdout: expected, stderr: "complete" });
   const publicResult = await runGitCommand(command, { cwd: tmpdir(), captureBytes: true });
   expect(publicResult).toEqual({ exitCode: 0, stdout: expected.toString("utf8"), stdoutBase64: expected.toString("base64"), stderr: "complete" });
-  expect(await runGitCommandBytes([], { cwd: tmpdir() })).toEqual({ exitCode: -1, stdout: Buffer.alloc(0), stderr: "no command was given" });
-  expect(await runGitCommandBytes(["/definitely-missing-v2347-command"], { cwd: tmpdir() })).toMatchObject({ exitCode: -1, stdout: Buffer.alloc(0) });
-  const closed = await runGitCommandBytes([process.execPath, "-e", "process.stdin.destroy();process.exit(0)"], { cwd: tmpdir(), stdin: "x".repeat(2 * 1024 * 1024) });
-  expect(closed.exitCode).toBe(-1); expect(closed.stderr).not.toBe("");
+  expect(await runGitCommand([], { cwd: tmpdir() })).toEqual({ exitCode: -1, stdout: "", stderr: "no command was given" });
+  expect(await runGitCommand(["/definitely-missing-v2347-command"], { cwd: tmpdir() })).toMatchObject({ exitCode: -1, stdout: "" });
 });
 
 it("passes finite stdin bytes and reports unstartable commands and stdin pipe failure", async () => {

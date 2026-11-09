@@ -112,3 +112,27 @@ it.each(["error", "stdin-error"] as const)("fails the reads a child holds on its
   await next.reply(f.frame(next.lines));
   expect(await retry).toEqual(Buffer.from(f.paths[0]!));
 });
+
+it("lets a read issued from a resolved read's continuation join the same child", async () => {
+  const f = fixture(2), read = await candidateTreeSourceReader(f.root, f.tree);
+  const chained = read(f.paths[0]!).then(first => read(f.paths[1]!).then(second => [first, second]));
+  const child = await started(); await setImmediate();
+  await child.reply(f.frame([child.lines[0]!]));
+  await vi.waitFor(() => expect(child.lines).toHaveLength(2));
+  await child.reply(f.frame([child.lines[1]!]));
+  expect(await chained).toEqual(f.paths.map(file => Buffer.from(file)));
+  expect(fake.children).toHaveLength(1);
+});
+
+it.each([
+  ["bytes after the last frame", (frame: Buffer) => Buffer.concat([frame, Buffer.from("x")]), "resolved"],
+  ["a header line without its newline", () => Buffer.alloc(200, 0x61), "rejected"],
+] as const)("ends a child that sends %s rather than buffering it", async (_, output, outcome) => {
+  const f = fixture(1), read = await candidateTreeSourceReader(f.root, f.tree);
+  const pending = read(f.paths[0]!).then(() => "resolved", () => "rejected");
+  const child = await started(); await setImmediate();
+  await child.reply(output(f.frame(child.lines)));
+  // A frame verified before the fault stays published; nothing after it lingers in a live child.
+  await vi.waitFor(() => expect(child.killed).toBe(true));
+  expect(await pending).toBe(outcome);
+});
