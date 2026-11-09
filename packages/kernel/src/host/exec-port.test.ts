@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { expect, it, vi } from "vitest";
-import { createExecPort } from "./exec-port.ts";
+import { createExecPort, groupStopped } from "./exec-port.ts";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -39,11 +39,12 @@ it.skipIf(process.platform === "win32")("awaits asynchronous group cleanup even 
   }
 });
 
+let gaps: number[] = [];
 // V26-3313: under load, Bun 1.1.29 can fail to launch /bin/kill and throw
 // synchronously from execFile. The group is still there, so the launch is
 // retried within its bound; a kill that ran and failed is not.
 type KillOutcome = "throw" | "eagain" | "ran-and-failed" | "ok";
-async function cleanupWith(outcomes: KillOutcome[]) {
+async function cleanupWith(outcomes: KillOutcome[], groupKill?: () => Promise<((pid: number) => boolean) | null>) {
   const child = Object.assign(new EventEmitter(), {
     pid: 2147483646, stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
   });
@@ -54,7 +55,9 @@ async function cleanupWith(outcomes: KillOutcome[]) {
   const launch = vi.mocked(execFile);
   launch.mockClear();
   let call = 0;
+  const launchedAt: number[] = [];
   launch.mockImplementation(((_file: string, _args: string[], _options: unknown, callback: (error: unknown, stdout: string, stderr: string) => void) => {
+    launchedAt.push(performance.now());
     const outcome = outcomes[Math.min(call++, outcomes.length - 1)];
     if (outcome === "throw") throw new TypeError("undefined is not an object");
     queueMicrotask(() => {
@@ -65,10 +68,12 @@ async function cleanupWith(outcomes: KillOutcome[]) {
     return undefined;
   }) as unknown as typeof execFile);
   try {
-    const pending = createExecPort().run({ command: "fixture", args: [] });
+    const pending = createExecPort(groupKill ? { groupKill } : {}).run({ command: "fixture", args: [] });
     child.emit("exit", 0, null);
     child.emit("close", 0, null);
-    return { result: await pending, launches: launch.mock.calls.length, killedLeader: child.kill.mock.calls.length };
+    const result = await pending;
+    gaps = launchedAt.slice(1).map((at, index) => at - launchedAt[index]!);
+    return { result, launches: launch.mock.calls.length, killedLeader: child.kill.mock.calls.length };
   } finally {
     kill.mockRestore();
     launch.mockReset();
@@ -82,6 +87,24 @@ it.skipIf(process.platform === "win32")("retries a group kill whose launch fails
 
 it.skipIf(process.platform === "win32")("fails closed when every launch within the bound fails", async () => {
   expect(await cleanupWith(["throw"])).toEqual({ result: { code: 1, stdout: "", stderr: "", errorCode: "execution_cleanup_failed" }, launches: 5, killedLeader: 1 });
+  // The tries are spaced 50, 100, 250 and 500 ms apart, not issued at once.
+  expect(gaps.map((gap, index) => gap >= [50, 100, 250, 500][index]! - 5)).toEqual([true, true, true, true]);
+});
+
+it("reads a libc kill as stopped only when it signalled the group or found it gone", () => {
+  expect(groupStopped(0, 0)).toBe(true);
+  expect(groupStopped(0, 1)).toBe(true);
+  expect(groupStopped(-1, 3)).toBe(true);
+  expect(groupStopped(-1, 1)).toBe(false);
+  expect(groupStopped(-1, 0)).toBe(false);
+});
+
+it.skipIf(process.platform === "win32")("sends a group libc could not stop on to /bin/kill, and keeps the leader's result", async () => {
+  expect(await cleanupWith(["ok"], async () => () => false)).toEqual({ result: { code: 0, stdout: "", stderr: "" }, launches: 1, killedLeader: 0 });
+  // A group libc stopped launches nothing at all.
+  expect(await cleanupWith(["ok"], async () => () => true)).toEqual({ result: { code: 0, stdout: "", stderr: "" }, launches: 0, killedLeader: 0 });
+  // A throwing libc call falls through to the utility as well.
+  expect(await cleanupWith(["ok"], async () => () => { throw new Error("ffi"); })).toEqual({ result: { code: 0, stdout: "", stderr: "" }, launches: 1, killedLeader: 0 });
 });
 
 it.skipIf(process.platform === "win32")("does not retry a kill that ran and failed", async () => {

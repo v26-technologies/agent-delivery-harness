@@ -33,11 +33,12 @@ export interface ExecPort {
   run(invocation: ExecInvocation): Promise<ExecOutcome>;
 }
 
-/** Foreground supervision; process-group isolation never unrefs a launch. */
-export function createExecPort(): ExecPort {
+/** Foreground supervision; process-group isolation never unrefs a launch.
+ * `groupKill` replaces the libc resolver, for tests of the fallback path. */
+export function createExecPort(options: { readonly groupKill?: () => Promise<NativeGroupKill | null> } = {}): ExecPort {
   return {
     run(invocation) {
-      if (process.platform !== "win32") return runProcessGroup(invocation);
+      if (process.platform !== "win32") return runProcessGroup(invocation, options.groupKill ?? nativeGroupKill);
       return new Promise<ExecOutcome>((resolve) => {
         execFile(
           invocation.command,
@@ -73,7 +74,13 @@ const ESRCH = 3; // The same value on darwin and linux.
  * the group was signalled or is already gone (ESRCH). Any other result is
  * false, so the caller still kills the group by other means. Resolved once;
  * null where bun:ffi is absent or cannot load libc. */
-type NativeGroupKill = (pid: number) => boolean;
+export type NativeGroupKill = (pid: number) => boolean;
+
+/** A libc kill(2) result on a group: signalled (0), or already gone (ESRCH).
+ * Anything else, EPERM included, leaves the group for /bin/kill. */
+export function groupStopped(rc: number, errno: number): boolean {
+  return rc === 0 || errno === ESRCH;
+}
 let nativeGroupKillOnce: Promise<NativeGroupKill | null> | undefined;
 export function nativeGroupKill(): Promise<NativeGroupKill | null> {
   return nativeGroupKillOnce ??= (async () => {
@@ -88,7 +95,9 @@ export function nativeGroupKill(): Promise<NativeGroupKill | null> {
       });
       const kill = libc.symbols["kill"] as (pid: number, signal: number) => number;
       const errno = libc.symbols[errnoSymbol] as () => unknown;
-      return (pid: number) => kill(-pid, 9) === 0 || read.i32(errno(), 0) === ESRCH;
+      // errno is read by a second call; a value changed in between only sends
+      // a stopped group on to /bin/kill, which reports it gone.
+      return (pid: number) => kill(-pid, 9) === 0 || groupStopped(-1, read.i32(errno(), 0));
     } catch {
       return null;
     }
@@ -132,7 +141,7 @@ async function killGroupWithUtility(pid: number): Promise<void> {
 }
 
 /** A dedicated POSIX session gives this invocation exclusive signal ownership. */
-function runProcessGroup(invocation: ExecInvocation): Promise<ExecOutcome> {
+function runProcessGroup(invocation: ExecInvocation, groupKill: () => Promise<NativeGroupKill | null>): Promise<ExecOutcome> {
   if (invocation.signal?.aborted) return Promise.resolve({ code: 1, stdout: "", stderr: "", errorCode: "ABORT_ERR" });
   return new Promise(resolve => {
     const child = spawn(invocation.command, [...invocation.args], {
@@ -156,8 +165,10 @@ function runProcessGroup(invocation: ExecInvocation): Promise<ExecOutcome> {
           // Older Bun rejects negative PIDs even for a group it created. libc
           // signals the group without launching anything; otherwise the
           // bounded utility does.
-          const native = await nativeGroupKill();
-          if (native?.(child.pid) !== true) await killGroupWithUtility(child.pid);
+          const native = await groupKill();
+          let stopped = false;
+          try { stopped = native?.(child.pid) === true; } catch { /* falls through to the utility */ }
+          if (!stopped) await killGroupWithUtility(child.pid);
         }
       }
       catch (error) {
