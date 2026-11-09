@@ -13,7 +13,9 @@ import { BlockedError, createBlocker, type Blocker } from "./blockers.ts";
 import { canonicalize } from "./canonical.ts";
 import type { LiveProviderResult } from "./evaluator.ts";
 import type { SubmissionOutcome, SubmissionRecord } from "./recorder.ts";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { fstatSync } from "node:fs";
+import type { InheritedDescriptor } from "./config.ts";
 import { createInterface } from "node:readline";
 
 export const DELIVERY_PROVIDER_RAILS_VERSION = "delivery-provider-rails/1" as const;
@@ -283,6 +285,63 @@ export interface OpenProviderRailProcessInput {
   readonly command: readonly [string, ...string[]];
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
+  /** The provider's declared inherited descriptors (3 and 4 only); absent is plain stdio. */
+  readonly inheritDescriptors?: readonly InheritedDescriptor[];
+  /** Names the provider for an embedding seam given the same input; unused here. */
+  readonly providerId?: string;
+}
+
+/** The launcher that opened inherited descriptors names them here, each with
+ * the identity of the pipe or socket it opened: "3:<dev>:<ino>,4:<dev>:<ino>".
+ * Bun and Node hold descriptors 3 and 4 themselves when nothing was inherited,
+ * and a setting can outlive the descriptors it named, so a descriptor passes
+ * only when its own identity is the one vouched for. */
+export const INHERITED_DESCRIPTORS_ENV = "DELIVERY_HARNESS_INHERITED_DESCRIPTORS";
+
+/** A descriptor's identity when it is a pipe or socket; undefined otherwise. */
+export function channelIdentity(fd: number): string | undefined {
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    return stat.isFIFO() || stat.isSocket() ? descriptorIdentity(stat) : undefined;
+  } catch { return undefined; }
+}
+
+/** `dev:ino` as exact unsigned 64-bit decimals, or undefined when they are not
+ * exact. A number-typed fstat rounds the values sockets and anonymous pipes
+ * can carry, and Bun 1.1.29 returns numbers even when asked for bigints; a
+ * rounded value could name another pipe, so it never vouches. darwin reports
+ * a socket's device as -1. */
+export function descriptorIdentity(stat: { readonly dev: bigint | number; readonly ino: bigint | number }): string | undefined {
+  const exact = (value: bigint | number): bigint | undefined =>
+    typeof value === "bigint" ? BigInt.asUintN(64, value) : Number.isSafeInteger(value) ? BigInt.asUintN(64, BigInt(value)) : undefined;
+  const dev = exact(stat.dev);
+  const ino = exact(stat.ino);
+  return dev === undefined || ino === undefined ? undefined : `${dev}:${ino}`;
+}
+
+/** Stdio and environment for a rail provider: three pipes, then each
+ * descriptor the provider declares whose identity the launcher vouched for.
+ * Every other slot is "ignore". The provider's environment then states
+ * exactly what it received, and nothing when it received nothing (V26-3314). */
+export function providerRailLaunch(
+  declared: readonly InheritedDescriptor[] = [],
+  env: NodeJS.ProcessEnv = {},
+  identify: (fd: number) => string | undefined = channelIdentity,
+): { stdio: ("pipe" | "ignore" | number)[]; env: NodeJS.ProcessEnv } {
+  const vouched = new Map<number, string>();
+  for (const entry of (env[INHERITED_DESCRIPTORS_ENV] ?? "").split(",")) {
+    const match = /^\s*([34]):(\d+:\d+)\s*$/.exec(entry);
+    if (match && !vouched.has(Number(match[1]))) vouched.set(Number(match[1]), match[2]!);
+  }
+  const stdio: ("pipe" | "ignore" | number)[] = ["pipe", "pipe", "pipe"];
+  const passed: string[] = [];
+  for (let fd = 3; fd <= Math.max(2, ...declared); fd++) {
+    const identity = declared.includes(fd as InheritedDescriptor) && vouched.has(fd) ? identify(fd) : undefined;
+    if (identity !== undefined && identity === vouched.get(fd)) { stdio.push(fd); passed.push(`${fd}:${identity}`); }
+    else stdio.push("ignore");
+  }
+  const { [INHERITED_DESCRIPTORS_ENV]: _vouched, ...rest } = env;
+  return { stdio, env: passed.length ? { ...rest, [INHERITED_DESCRIPTORS_ENV]: passed.join(",") } : rest };
 }
 
 const DEFAULT_PROVIDER_RAIL_DEADLINE_MS = 10 * 60_000;
@@ -358,12 +417,13 @@ async function settlesWithin(operation: Promise<unknown>, milliseconds: number):
 /** Opens the contract over newline-delimited JSON on a provider subprocess's stdio. */
 export function openProviderRailProcess(input: OpenProviderRailProcessInput): Promise<ProviderRailSession> {
   const [executable, ...args] = input.command;
+  const launch = providerRailLaunch(input.inheritDescriptors, input.env);
   const child = spawn(executable, args, {
     cwd: input.cwd,
-    env: input.env,
-    stdio: ["pipe", "pipe", "pipe"],
+    env: launch.env,
+    stdio: launch.stdio,
     shell: false,
-  });
+  }) as ChildProcessWithoutNullStreams;
   // A deadline may destroy the child while a bounded stdin write is pending.
   // The write callback still reports that failure; this listener prevents the
   // stream's parallel `error` event from becoming an uncaught exception.

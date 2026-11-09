@@ -1181,3 +1181,28 @@ describe("scopedExecution.failFast, budgetMs and checkBudgetMs", () => {
     });
   });
 });
+
+describe("inherited provider descriptors (V26-3314)", () => {
+  const withDescriptors = (inheritDescriptors: unknown, command: unknown = ["bun", "provider.ts"]) =>
+    withInput((input) => { input.providers[0] = { ...input.providers[0], ...(command === null ? {} : { command }), inheritDescriptors }; });
+  it("accepts a rail provider declaring ascending descriptors from 3 and 4", () => {
+    expect(define(withDescriptors([3, 4])).providers[0]?.inheritDescriptors).toEqual([3, 4]);
+    expect(define(withDescriptors([4])).providers[0]?.inheritDescriptors).toEqual([4]);
+  });
+  it("keeps a provider without the declaration free of it", () => {
+    expect(define(withInput(() => {})).providers[0]).not.toHaveProperty("inheritDescriptors");
+  });
+  it.each([[[5]], [[2]], [[3, 3]], [[4, 3]], [[]], [[3, "4"]], ["3"], [{ 0: 3, length: 1 }]])("refuses inheritDescriptors %j", (value) => {
+    expectOnly(withDescriptors(value), "config_invalid_member");
+  });
+  it("refuses a sparse declaration, whose hole is no descriptor", () => {
+    // eslint-disable-next-line no-sparse-arrays
+    expectOnly(withDescriptors([3, , 4]), "config_invalid_member");
+    // A trailing hole: ascending order alone would accept it.
+    // eslint-disable-next-line no-sparse-arrays
+    expectOnly(withDescriptors([3, ,]), "config_invalid_member");
+  });
+  it("refuses the declaration on a provider with no rail command", () => {
+    expectOnly(withDescriptors([3, 4], null), "config_invalid_member");
+  });
+});

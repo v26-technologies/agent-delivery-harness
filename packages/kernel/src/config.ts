@@ -196,12 +196,20 @@ export interface PathClassification {
   readonly lockfile: readonly PathMatcher[];
 }
 
+/** The only descriptors a rail provider may inherit (V26-3314). */
+export const INHERITABLE_DESCRIPTORS = [3, 4] as const;
+export type InheritedDescriptor = (typeof INHERITABLE_DESCRIPTORS)[number];
+
 export interface ProviderRegistration {
   readonly id: string;
   /** Every finding code this provider can report. Half of the code universe. */
   readonly findingCodes: readonly string[];
   /** Optional stdio provider-rail executable, expressed as argv and never a shell string. */
   readonly command?: NonEmptyTuple<string>;
+  /** Descriptors beyond stdio that a rail provider inherits from the invocation,
+   * by number: only 3 and 4, ascending, each at most once. A provider that does
+   * not declare them gets plain stdio. Requires `command`. */
+  readonly inheritDescriptors?: readonly InheritedDescriptor[];
   /** Deterministic bounded check executed by the product, not a provider protocol. */
   readonly check?: { readonly command: NonEmptyTuple<string>; readonly timeoutMs: number; readonly outputs?: readonly string[]; readonly scope?: ScopedCheckDefinition; readonly installedData?: InstalledDataConsumerDefinition; readonly physicalSource?: PhysicalSourceDefinition };
 }
@@ -1082,7 +1090,7 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
           sound = false;
           return;
         }
-        checkClosed(findings, at, entry, ["id", "findingCodes", "command", "check"]);
+        checkClosed(findings, at, entry, ["id", "findingCodes", "command", "check", "inheritDescriptors"]);
         const id = readString(findings, `${at}.id`, entry["id"], { pattern: ID_PATTERN, describe: "a provider id" });
         const findingCodes = readStringArray(findings, `${at}.findingCodes`, entry["findingCodes"], {
           pattern: FINDING_CODE_PATTERN,
@@ -1128,8 +1136,18 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
             if (command !== undefined) { findings.add("config_invalid_member", at, "command and check are mutually exclusive"); sound = false; }
           }
         }
+        let inheritDescriptors: readonly InheritedDescriptor[] | undefined;
+        if (entry["inheritDescriptors"] !== undefined) {
+          const value = entry["inheritDescriptors"];
+          // Array.from turns holes into undefined, which no descriptor matches.
+          if (command === undefined || !Array.isArray(value) || value.length === 0 ||
+              !Array.from(value).every((fd, index) => (INHERITABLE_DESCRIPTORS as readonly unknown[]).includes(fd) && (index === 0 || (fd as number) > (value[index - 1] as number)))) {
+            findings.add("config_invalid_member", `${at}.inheritDescriptors`, "requires a provider command and ascending unique descriptors from 3 and 4");
+            sound = false;
+          } else inheritDescriptors = value as InheritedDescriptor[];
+        }
         if (id === undefined || findingCodes === undefined) sound = false;
-        else registrations.push({ id, findingCodes, ...(command === undefined ? {} : { command }), ...(check === undefined ? {} : { check }) });
+        else registrations.push({ id, findingCodes, ...(command === undefined ? {} : { command }), ...(check === undefined ? {} : { check }), ...(inheritDescriptors === undefined ? {} : { inheritDescriptors }) });
       });
       if (sound) providers = registrations;
     }

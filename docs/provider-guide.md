@@ -42,6 +42,30 @@ not supplied a live result or retained evidence, `gate` and `record` invoke the
 command at their existing command boundary. Repositories whose registrations
 omit `command` keep the manual flow described in the rest of this guide.
 
+A command provider gets plain stdio. It may also declare
+`inheritDescriptors: [3, 4]` (or just one of them, ascending) to inherit those
+descriptors from the invocation. An invocation uses this to hand a provider a
+capability it already holds, such as a pipe to its own analysis worker.
+
+A declared descriptor is passed only when the launcher that opened it vouches
+for that very pipe or socket in `DELIVERY_HARNESS_INHERITED_DESCRIPTORS`, as
+`<fd>:<dev>:<ino>` entries (for example `3:16777220:1234,4:16777220:1235`), and
+the descriptor's own identity matches. `dev` and `ino` are the open
+descriptor's `fstat` values as exact unsigned 64-bit decimals: a socket's
+device of -1 on darwin is `18446744073709551615`. A JavaScript launcher reads
+them with `fstatSync(fd, { bigint: true })`, since the number form rounds
+them. Where only rounded numbers are available (Bun 1.1.29 ignores
+`bigint: true`), a value beyond 2^53 has no identity and is never passed; the
+named FIFOs an invocation opens carry small exact values. Runtimes also
+disagree on a socket's device on darwin (Bun reports 0 where Node reports -1),
+so a socket passes only when launcher and harness read it the same way; a
+launcher that may differ from the harness's runtime hands on named FIFOs. This applies wherever
+the product opens a provider: `gate`, `record`, and `verify`'s live collection. An open descriptor alone is not enough:
+Bun and Node hold descriptors 3 and 4 themselves, and a setting can outlive the
+descriptors it named. The provider's environment then states exactly what it
+received, and nothing when it received nothing. Only the declaring provider
+receives them, and no other descriptor is ever passed.
+
 The command exchanges one JSON document per stdout/stdin line. The documents
 and state transitions are the exact vendored
 [`delivery-provider-rails/1` contract](contracts/delivery-provider-rails-v1.md);
