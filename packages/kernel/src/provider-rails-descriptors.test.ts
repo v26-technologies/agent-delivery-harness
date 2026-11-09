@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { closeSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { closeSync, constants, mkdtempSync, openSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { channelIdentity, INHERITED_DESCRIPTORS_ENV, providerRailLaunch } from "./provider-rails.ts";
+import { channelIdentity, descriptorIdentity, INHERITED_DESCRIPTORS_ENV, providerRailLaunch } from "./provider-rails.ts";
 
 // V26-3314: a rail provider inherits a descriptor only when it declares it and
 // the launcher vouched for that very pipe or socket; its environment then says
@@ -40,13 +41,26 @@ describe("provider rail launch", () => {
     const file = path.join(root, "plain");
     writeFileSync(file, "x");
     const fd = openSync(file, "r");
+    const fifo = path.join(root, "fifo");
+    execFileSync("mkfifo", [fifo]);
+    const named = openSync(fifo, constants.O_RDWR);
     try {
       expect(channelIdentity(fd)).toBeUndefined();
       expect(channelIdentity(987654)).toBeUndefined();
+      // A named FIFO, the shell's `3<fifo`, is a pipe and not a socket.
+      const stat = statSync(fifo, { bigint: true });
+      expect(channelIdentity(named)).toBe(`${stat.dev}:${stat.ino}`);
     } finally {
       closeSync(fd);
+      closeSync(named);
       rmSync(root, { recursive: true, force: true });
     }
+  });
+  it("writes an identity as exact unsigned 64-bit decimals", () => {
+    // darwin's socket device, and an anonymous pipe's inode beyond 2^53.
+    expect(descriptorIdentity({ dev: -1n, ino: 555203n })).toBe("18446744073709551615:555203");
+    expect(descriptorIdentity({ dev: 0n, ino: 11824129486413362295n })).toBe("0:11824129486413362295");
+    expect(descriptorIdentity({ dev: 0n, ino: 11824129486413362297n })).not.toBe(descriptorIdentity({ dev: 0n, ino: 11824129486413362295n }));
   });
   it("never passes a descriptor nobody vouched for", () => {
     for (const env of [{}, { [INHERITED_DESCRIPTORS_ENV]: "" }, { [INHERITED_DESCRIPTORS_ENV]: "3,4" }, { [INHERITED_DESCRIPTORS_ENV]: "5:1:50" }, { [INHERITED_DESCRIPTORS_ENV]: "3:x:y" }])

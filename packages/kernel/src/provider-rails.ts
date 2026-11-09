@@ -287,6 +287,8 @@ export interface OpenProviderRailProcessInput {
   readonly env: NodeJS.ProcessEnv;
   /** The provider's declared inherited descriptors (3 and 4 only); absent is plain stdio. */
   readonly inheritDescriptors?: readonly InheritedDescriptor[];
+  /** Names the provider for an embedding seam given the same input; unused here. */
+  readonly providerId?: string;
 }
 
 /** The launcher that opened inherited descriptors names them here, each with
@@ -299,9 +301,16 @@ export const INHERITED_DESCRIPTORS_ENV = "DELIVERY_HARNESS_INHERITED_DESCRIPTORS
 /** A descriptor's identity when it is a pipe or socket; undefined otherwise. */
 export function channelIdentity(fd: number): string | undefined {
   try {
-    const stat = fstatSync(fd);
-    return stat.isFIFO() || stat.isSocket() ? `${stat.dev}:${stat.ino}` : undefined;
+    const stat = fstatSync(fd, { bigint: true });
+    return stat.isFIFO() || stat.isSocket() ? descriptorIdentity(stat) : undefined;
   } catch { return undefined; }
+}
+
+/** `dev:ino` as exact unsigned 64-bit decimals. A number-typed fstat rounds
+ * the values sockets and anonymous pipes carry, and darwin reports a socket's
+ * device as -1. */
+export function descriptorIdentity(stat: { readonly dev: bigint; readonly ino: bigint }): string {
+  return `${BigInt.asUintN(64, stat.dev)}:${BigInt.asUintN(64, stat.ino)}`;
 }
 
 /** Stdio and environment for a rail provider: three pipes, then each

@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -63,4 +64,17 @@ it('does not run inactive live providers or fabricate an absent command result',
  const missing=defineHarnessConfig({...f.input.config,providers:[{id:'live.sensor',findingCodes:[]}]});
  const result=await collectLiveProviderResults({...f.input,config:missing,evidenceContext:{release:null,preparationFingerprint:await computePreparationFingerprint(f.dir,missing)}});
  expect(result.liveResults).toEqual([]);
+});
+it.skipIf(process.platform==='win32')('hands verify\'s live provider exactly its declared, vouched descriptor (V26-3314)',{timeout:60000},async()=>{
+ // A parent holding a marker pipe on fd 3, vouched by identity, collects live
+ // results through a provider that does not declare fd 3 and one that does.
+ const child=spawn(process.execPath,['--import',import.meta.resolve('tsx'),fileURLToPath(new URL('./fixtures/live-descriptors-parent.ts',import.meta.url))],{cwd:process.cwd(),stdio:['ignore','pipe','pipe','pipe']});
+ let out='',err='';child.stdout!.on('data',c=>{out+=c;});child.stderr!.on('data',c=>{err+=c;});
+ (child.stdio[3] as NodeJS.WritableStream).end('marker');
+ const code=await new Promise(resolve=>child.once('close',resolve));
+ expect({code,err}).toEqual({code:0,err:''});
+ const [undeclared,declared]=JSON.parse(out) as {status:string|null;held:string|null;stated:string|null}[];
+ expect(undeclared).toEqual({status:'green',held:null,stated:null});
+ expect(declared).toMatchObject({status:'green',held:'marker'});
+ expect(declared!.stated).toMatch(/^3:\d+:\d+$/);
 });

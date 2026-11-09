@@ -1192,12 +1192,15 @@ describe("inherited provider descriptors (V26-3314)", () => {
   it("keeps a provider without the declaration free of it", () => {
     expect(define(withInput(() => {})).providers[0]).not.toHaveProperty("inheritDescriptors");
   });
-  it.each([[[5]], [[2]], [[3, 3]], [[4, 3]], [[]], [[3, "4"]], ["3"]])("refuses inheritDescriptors %j", (value) => {
+  it.each([[[5]], [[2]], [[3, 3]], [[4, 3]], [[]], [[3, "4"]], ["3"], [{ 0: 3, length: 1 }]])("refuses inheritDescriptors %j", (value) => {
     expectOnly(withDescriptors(value), "config_invalid_member");
   });
   it("refuses a sparse declaration, whose hole is no descriptor", () => {
     // eslint-disable-next-line no-sparse-arrays
     expectOnly(withDescriptors([3, , 4]), "config_invalid_member");
+    // A trailing hole: ascending order alone would accept it.
+    // eslint-disable-next-line no-sparse-arrays
+    expectOnly(withDescriptors([3, ,]), "config_invalid_member");
   });
   it("refuses the declaration on a provider with no rail command", () => {
     expectOnly(withDescriptors([3, 4], null), "config_invalid_member");
