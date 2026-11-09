@@ -42,6 +42,30 @@ not supplied a live result or retained evidence, `gate` and `record` invoke the
 command at their existing command boundary. Repositories whose registrations
 omit `command` keep the manual flow described in the rest of this guide.
 
+A command provider that reads no scoped check's attempts, records or outputs may
+declare `independentOfScopedChecks: true`. The declaration is only `true`, and only
+on a provider with `command`. When the gate runs scoped checks on more than one
+worker, it then starts that provider's live attempt while those checks run, rather
+than after them. It does so once the pool is saturated, not when the checks
+begin. The pool is saturated when every worker holds a check, or when no check is
+left to hand out. The gate hands out the check expected to run longest first. So a
+long check that sizes itself to the machine as it starts, such as a memory-planned
+typecheck, usually measures before any provider runs. This is a heuristic, not a
+guarantee. The check whose hand-out saturates the pool, any check handed out in the
+same turn (for example when several checks share one base that is already ready),
+and any check handed out later all start while the providers run. The outcome is held until the gate reaches that provider in its
+usual order, one provider at a time with an admission after each. So the verdict,
+the output and every delivery record are the same either way. A provider shares an
+existential obligation with another provider when either of them may satisfy it. A
+declared provider in that position still waits, because the gate may never need it.
+
+Under `scopedExecution.failFast`, the first scoped failure cancels each provider
+still running beside the checks, through the rail's own `cancel`. A provider is
+reported `interrupted <id>: check_cancelled after <failed id> failed`, and its
+result never counts, even if it finished first. A provider that does not declare
+the field keeps waiting for the scoped checks, as before. The harness judges
+dependence only by the declaration, never by reading the provider's code.
+
 A command provider gets plain stdio. It may also declare
 `inheritDescriptors: [3, 4]` (or just one of them, ascending) to inherit those
 descriptors from the invocation. An invocation uses this to hand a provider a

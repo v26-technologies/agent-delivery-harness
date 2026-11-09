@@ -14,7 +14,7 @@ import { refuseOverBudget } from "../scoped-budget.ts";
  * only ever offers a waiver to a `human` context, all-or-nothing over waivable
  * findings; the CLI adds no waiver logic of its own.
  */
-import { computeDeliverableIdentity, runAdmission, type AdmissionResult, type Blocker, type LiveProviderResult } from "@agent-delivery-harness/kernel";
+import { computeDeliverableIdentity, digestCanonical, runAdmission, type AdmissionResult, type Blocker, type LiveProviderResult } from "@agent-delivery-harness/kernel";
 import { CliInterruption, type CommandContext, type CommandDescriptor, type CommandResult } from "../boundary.ts";
 import { focusedOutcome } from "../delivery-posture.ts";
 import { oneLine } from "../run-surface.ts";
@@ -58,6 +58,8 @@ async function providerAdmission(
   }
 
   const liveResults: LiveProviderResult[] = options.includeInjectedLiveResults ? [...(context.liveResults ?? [])] : [];
+  const invokeProvider = context.invokeProvider;
+  const besideOutcomes = new Map<string, ({ result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }) & { obligationIds: readonly string[] }>();
   const attempted = new Set<string>();
   const attemptBlockers: Blocker[] = [];
   let admission = await admit(input, admissionOptions);
@@ -90,9 +92,45 @@ async function providerAdmission(
     const scoped = session !== undefined && session.concurrency > 1 ? [...requested].filter(([id]) => context.config.providers.find(p => p.id === id)!.check?.scope) : [];
     if (session !== undefined && scoped.length > 0) {
       for (const [id] of scoped) attempted.add(id);
-      const failures = await session.executeAll(scoped.map(([id, request]) => ({ provider: context.config.providers.find(p => p.id === id)!, obligationIds: request.obligationIds })));
+      // Live rail providers that declare they read no scoped result start alongside the scoped checks. Each outcome
+      // waits for the serial loop below to reach that provider, which applies it exactly as if it had run then: same
+      // order, same admission between each. A provider an existential obligation shares with another is left to the
+      // loop, which may never need it.
+      const shared = (id: string) => context.config.obligations.some(o => (o.providerPolicy ?? "all") === "existential" && o.providers.includes(id) && o.providers.length > 1);
+      const beside = invokeProvider === undefined ? [] : [...requested].filter(([id, request]) => {
+        const registration = context.config.providers.find(p => p.id === id)!;
+        return registration.independentOfScopedChecks === true && registration.command !== undefined && request.needsLiveResult && !request.requiresEvidence && !shared(id) && !besideOutcomes.has(id);
+      });
+      const cancelBeside = new AbortController();
+      let cancelledAfter: string | undefined;
+      // They start once the pool is saturated (every worker holds a check, or none is left to hand out), not at
+      // once: the checks handed out first, the longest expected first, have then been handed out, usually with time
+      // to size themselves while the rest wait on their bases.
+      const besideRuns: Promise<{ result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }>[] = [];
+      const startBeside = () => {
+        if (besideRuns.length > 0 || cancelBeside.signal.aborted) return;
+        for (const [providerId, request] of beside) besideRuns.push(invokeProvider!({ providerId, requiresEvidence: false, signal: cancelBeside.signal,
+          payload: { gateId: context.config.gateId, providerId, obligationIds: [...new Set(request.obligationIds)].sort(), candidate: admission.candidate! } })
+          .then(result => ({ result }), (error: unknown) => ({ error })));
+      };
+      let failures: CheckSnapshotError[];
+      try {
+        // The first scoped failure under failFast ends them too: nothing else of this admission may finish.
+        failures = await session.executeAll(scoped.map(([id, request]) => ({ provider: context.config.providers.find(p => p.id === id)!, obligationIds: request.obligationIds })),
+          failed => { cancelledAfter = failed; cancelBeside.abort(); }, startBeside);
+      } catch (error) { cancelBeside.abort(); await Promise.all(besideRuns); throw error; }
+      // executeAll either throws or has reported saturation: at once when the pool has nothing left, otherwise when its
+      // workers fill or its last check is handed out. A failFast cancel leaves them unstarted, as serial would.
+      const settled = await Promise.all(besideRuns);
+      // An interrupted invocation is an interruption, not a scoped failure's cancellation.
+      if (context.signal?.aborted) throw new CliInterruption();
       attemptBlockers.push(...failures.map(scopedCheckBlocker));
       failedFast = failFast && failures.length > 0;
+      for (const [index, [providerId]] of beside.entries()) {
+        // Stopped, or finished too late to count: never reported as passed, and its obligation stays unmet.
+        if (cancelledAfter !== undefined) context.write(`interrupted ${providerId}: check_cancelled after ${cancelledAfter} failed`);
+        else besideOutcomes.set(providerId, { ...settled[index]!, obligationIds: [...new Set(beside[index]![1].obligationIds)].sort() });
+      }
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }
@@ -118,7 +156,12 @@ async function providerAdmission(
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }
-    const result = await context.invokeProvider?.({
+    // A provider that already ran beside the scoped checks takes its outcome here, where serial would have run it.
+    // Only for the very request it answered: one the loop now makes differently runs again, as serial would run it.
+    const stored = besideOutcomes.get(providerId);
+    const early = stored && digestCanonical(stored.obligationIds) === digestCanonical([...new Set(request.obligationIds)].sort()) ? stored : undefined;
+    if (early && "error" in early) throw early.error;
+    const result = early ? early.result : await context.invokeProvider?.({
       providerId,
       requiresEvidence: request.requiresEvidence,
       payload: {

@@ -2035,3 +2035,263 @@ it("a gate reports the same result and records whether or not its trees' deletio
   expect(runs[0]!.verify).toBe(0);
   expect(runs[1]).toEqual(runs[0]);
 }, 90000);
+
+/** A live rail provider that marks when it starts and ends, waits `ms` (or until `until` exists), and then succeeds.
+ * A `cancel` from the gate makes it mark that and exit, so a stopped provider never reports success. */
+function liveProvider(shared: string, name: string, ms: number, until?: string, outcome: "success" | "failed" | "cancelled" = "success", cancelDelayMs = 0): [string, ...string[]] {
+  const mark = (what: string) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-`))}+'${what}',String(Date.now()))`;
+  return [process.execPath, "-e", `${mark("start")};require('fs').appendFileSync(${JSON.stringify(path.join(shared, `${name}-starts`))},'x');require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-pid`))},String(process.pid));let id;require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+ if(m.kind==='negotiate')console.log(JSON.stringify({kind:'negotiation',outcome:'supported',selectedVersion:'delivery-provider-rails/1',supportedVersions:['delivery-provider-rails/1']}));
+ if(m.kind==='cancel'){${mark("cancelled")};setTimeout(()=>process.exit(0),${cancelDelayMs})}
+ if(m.kind==='request'){id=m.requestId;const end=Date.now()+${ms};const done=()=>{${mark("end")};console.log(JSON.stringify({kind:'terminal',version:m.version,requestId:m.requestId,sequence:1,summary:'observed',outcome:'${outcome}'}))};
+  const tick=()=>{if(${until ? `require('fs').existsSync(${JSON.stringify(until)})||` : ""}Date.now()>=end)return done();setTimeout(tick,20)};tick()}});`];
+}
+/** Adds live providers to a pool fixture: each its own always-active live obligation, declared independent or not. */
+function withLiveProviders(f: Awaited<ReturnType<typeof poolFixture>>, providers: readonly { id: string; command: [string, ...string[]]; independent: boolean }[]) {
+  const template = f.config.obligations[0]!;
+  f.setConfig({ ...f.config, providers: [...f.config.providers, ...providers.map(p => ({ id: p.id, findingCodes: [], command: p.command, ...(p.independent ? { independentOfScopedChecks: true as const } : {}) }))],
+    obligations: [...f.config.obligations, ...providers.map(p => ({ ...template, id: `${p.id}.current`, freshness: "live" as const, providers: [p.id], allowedResolutionKinds: ["satisfied_live_fact" as const, "not_applicable" as const] }))] } as unknown as HarnessConfigInput);
+}
+const at = async (shared: string, name: string) => { try { return Number(await readFile(path.join(shared, name), "utf8")); } catch { return undefined; } };
+it("a provider declared independent runs while the scoped checks run, and an undeclared one still waits for them", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // c1 finishes only once the declared provider has started: a serial gate would never get there.
+  const f = await poolFixture(["1", "2"], 2, (id, shared) => id === "c1" ? `const fs=require('fs'),end=Date.now()+20000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "beside-start"))})){if(Date.now()>end)process.exit(7);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}` : "");
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 300), independent: true }, { id: "live.after", command: liveProvider(f.shared, "after", 0), independent: false }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const checked = path.join(f.shared, "checks-done");
+  const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype, executeAll = proto.executeAll;
+  const wrapped = vi.spyOn(proto, "executeAll").mockImplementation(async function (this: unknown, ...args: Parameters<typeof executeAll>) { const out = await executeAll.apply(this as never, args); await writeFile(checked, String(Date.now())); return out; });
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { wrapped.mockRestore(); }
+  expect(f.out.join("\n")).toMatch(/admitted: .*live\.beside\.current=satisfied_live_fact/);
+  expect(f.out.join("\n")).toMatch(/live\.after\.current=satisfied_live_fact/);
+  // The undeclared provider started only after every scoped check had finished.
+  expect((await at(f.shared, "after-start"))!).toBeGreaterThanOrEqual((await at(f.shared, "checks-done"))!);
+  expect((await at(f.shared, "beside-start"))!).toBeLessThan((await at(f.shared, "checks-done"))!);
+}, 90000);
+it("under failFast a scoped failure cancels a provider running beside the checks, which is reported cancelled and never passed", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, (id, shared) => `const fs=require('fs'),end=Date.now()+20000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "beside-start"))})){if(Date.now()>end)process.exit(7);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}process.exit(3)`);
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true } });
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const started = Date.now();
+  expect(await f.run("gate")).toBe(1);
+  const out = f.out.join("\n") + f.err.join("\n");
+  expect(out).toMatch(/^interrupted live\.beside: check_cancelled after check\.c1 failed$/m);
+  expect(out).not.toMatch(/live\.beside\.current=satisfied/);
+  // The gate stopped the provider through its rail, so it never finished its twenty seconds.
+  expect(await at(f.shared, "beside-start")).toBeDefined();
+  expect(await at(f.shared, "beside-end")).toBeUndefined();
+  expect(Date.now() - started).toBeLessThan(15000);
+}, 90000);
+it("failFast's cancel reaches only the rail session the gate opened for that provider", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, (_, shared) => `const fs=require('fs'),end=Date.now()+20000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "opened"))})){if(Date.now()>end)process.exit(7);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}process.exit(3)`);
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true } });
+  withLiveProviders(f, [{ id: "live.beside", command: ["/bin/false"], independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  // No process at all: a scripted session records what the gate sends it and whether it closes it.
+  const sessions: { providerId: string; sent: unknown[]; closed: boolean }[] = [];
+  (f.runtime as { openProviderRail?: unknown }).openProviderRail = async (input: { providerId: string }) => {
+    const session = { providerId: input.providerId, sent: [] as unknown[], closed: false };
+    sessions.push(session); await writeFile(path.join(f.shared, "opened"), "");
+    let pending: ((value: unknown) => void) | undefined;
+    return { async send(message: { kind: string; requestId?: string; version?: string }) {
+        session.sent.push(message);
+        if (message.kind === "negotiate") pending?.({ kind: "negotiation", outcome: "supported", selectedVersion: "delivery-provider-rails/1", supportedVersions: ["delivery-provider-rails/1"] });
+      },
+      receive: () => new Promise(resolve => { pending = resolve; if (session.sent.length === 1) resolve({ kind: "negotiation", outcome: "supported", selectedVersion: "delivery-provider-rails/1", supportedVersions: ["delivery-provider-rails/1"] }); }),
+      async close() { session.closed = true; pending?.(null); } };
+  };
+  expect(await f.run("gate")).toBe(1);
+  expect(sessions.map(s => s.providerId)).toEqual(["live.beside"]);
+  expect(sessions[0]!.sent.map(m => (m as { kind: string }).kind)).toEqual(["negotiate", "request", "cancel"]);
+  expect(sessions[0]!.closed).toBe(true);
+}, 90000);
+it.each(["passing", "failing"] as const)("the verdict, the output in order and every record on a %s candidate are the same whether a provider runs beside the checks or after them", async outcome => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const runs: { code: number; lines: string[]; records: string[] }[] = [];
+  for (const independent of [false, true]) {
+    const f = await poolFixture(["1", "2"], 2, id => outcome === "failing" && id === "c2" ? "process.exit(3)" : "");
+    // An undeclared provider first, then a declared one: serial applies them in that order, and so must the gate.
+    withLiveProviders(f, [{ id: "live.first", command: liveProvider(f.shared, "first", 50), independent: false }, { id: "live.second", command: liveProvider(f.shared, "second", 100), independent },
+      // A blocked provider too: its blockers and its failed live result must land exactly where serial puts them.
+      { id: "live.third", command: liveProvider(f.shared, "third", 0, undefined, "failed"), independent }]);
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    const code = await f.run("gate");
+    // Timing and attempt identity aside, every line the gate printed, in its order.
+    const lines = [...f.out, ...f.err].flatMap(line => line.split("\n")).filter(line => !/^(snapshot|setup|prewarm|checking) /.test(line)).map(line => normalized(f, line));
+    const recordDir = path.join(f.dir, ".git/delivery-harness/records");
+    const records = (await (await import("node:fs/promises")).readdir(recordDir).catch(() => [] as string[])).map(name => name.replace(/--[0-9a-f]{64}\.json$/, "")).sort();
+    runs.push({ code, lines, records });
+  }
+  expect(runs[1]).toEqual(runs[0]);
+  expect(runs[0]!.code).toBe(1);
+  // Both shapes ran the checks and all three providers: the comparison is not between two empty runs.
+  expect(runs[0]!.records.filter(name => name.includes("check.c")).length).toBe(outcome === "passing" ? 2 : 1);
+  expect(runs[0]!.lines.join("\n")).toMatch(/live\.third/);
+}, 180000);
+it("a declared provider that an existential obligation shares with another stays serial, and is never started when the other satisfies it", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.one", command: liveProvider(f.shared, "one", 0), independent: false }, { id: "live.two", command: liveProvider(f.shared, "two", 0), independent: true }]);
+  // One obligation either provider may satisfy, in place of the two the helper made.
+  const template = f.config.obligations.find(o => o.id === "live.one.current")!;
+  f.setConfig({ ...f.config, obligations: [...f.config.obligations.filter(o => !o.id.startsWith("live.")), { ...template, id: "live.either", providers: ["live.one", "live.two"], providerPolicy: "existential" }] } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  expect(f.out.join("\n")).toMatch(/live\.either=satisfied_live_fact/);
+  expect(await at(f.shared, "one-start")).toBeDefined();
+  expect(await at(f.shared, "two-start")).toBeUndefined();
+}, 90000);
+
+it("a declared provider an evidence obligation also names stays serial", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.both", command: liveProvider(f.shared, "both", 0), independent: true }]);
+  // The same provider owes exact-candidate evidence too, which only the serial loop publishes.
+  const template = f.config.obligations[0]!;
+  f.setConfig({ ...f.config, obligations: [...f.config.obligations, { ...template, id: "live.both.evidence", providers: ["live.both"] }] } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype, executeAll = proto.executeAll, checked = path.join(f.shared, "checks-done");
+  const wrapped = vi.spyOn(proto, "executeAll").mockImplementation(async function (this: unknown, ...args: Parameters<typeof executeAll>) { const out = await executeAll.apply(this as never, args); await writeFile(checked, String(Date.now())); return out; });
+  try { await f.run("gate"); } finally { wrapped.mockRestore(); }
+  expect((await at(f.shared, "both-start"))!).toBeGreaterThanOrEqual((await at(f.shared, "checks-done"))!);
+}, 90000);
+it.each([false, true])("a provider reporting its own cancellation interrupts the gate, beside the checks or not (%s)", async independent => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.stop", command: liveProvider(f.shared, "stop", 0, undefined, "cancelled"), independent }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate")).toBe(130);
+}, 90000);
+it.each([false, true])("a provider whose invocation throws fails the gate the same way, beside the checks or not (%s)", async independent => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.root", command: liveProvider(f.shared, "root", 0), independent }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const artifacts = f.runtime.artifacts!, allocate = artifacts.allocateRunRoot.bind(artifacts);
+  (artifacts as { allocateRunRoot: typeof allocate }).allocateRunRoot = async input => input.providerId === "live.root" ? { ok: false, reason: "refused for the test" } as never : allocate(input);
+  expect(await f.run("gate")).toBe(1);
+  expect(f.err.join("\n") + f.out.join("\n")).toContain("provider_rail_run_root_refused");
+}, 90000);
+it("a provider running beside the checks is cancelled and awaited when the scoped run itself throws", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  // Slow to honour its cancel: the gate must still wait for it to end.
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000, undefined, "success", 1500), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype;
+  const thrown = vi.spyOn(proto, "executeAll").mockImplementation(async (_requests, _onFailFast, onAllStarted) => {
+    onAllStarted?.();
+    for (const end = Date.now() + 20000; !await at(f.shared, "beside-start") && Date.now() < end;) await new Promise(resolve => setTimeout(resolve, 20));
+    throw new Error("the scoped run broke");
+  });
+  const started = Date.now();
+  try { await expect(f.run("gate")).resolves.not.toBe(0); } finally { thrown.mockRestore(); }
+  // The gate did not leave the provider running: it was stopped before finishing, and waited for.
+  expect(await at(f.shared, "beside-end")).toBeUndefined();
+  const pid = (await at(f.shared, "beside-pid"))!;
+  expect(() => process.kill(pid, 0)).toThrow();
+  expect(Date.now() - started).toBeLessThan(15000);
+}, 90000);
+it.each([true, false])("an interruption while a provider runs beside the checks interrupts the gate and stops the provider, never reported as a failure's cancellation (failFast %s)", async failFast => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, (_, shared) => `const fs=require('fs'),end=Date.now()+20000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "beside-start"))})){if(Date.now()>end)process.exit(7);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20000)`);
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } });
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const controller = new AbortController();
+  (f.runtime as { signal?: AbortSignal }).signal = controller.signal;
+  void (async () => { for (const end = Date.now() + 20000; !await at(f.shared, "beside-start") && Date.now() < end;) await new Promise(resolve => setTimeout(resolve, 20)); controller.abort(); })();
+  expect(await f.run("gate")).toBe(130);
+  expect(f.out.join("\n") + f.err.join("\n")).not.toMatch(/check_cancelled after/);
+  // The invocation's own interruption reached the provider: it never ran its twenty seconds out.
+  expect(await at(f.shared, "beside-end")).toBeUndefined();
+}, 90000);
+/** Admits as the kernel does, except that the first admission leaves out the blocked resolutions of `hidden`: what a
+ * waiver lost later in the gate looks like to the loop, an obligation it requests only after its first pass. */
+async function hideFromFirstAdmission(hidden: readonly string[]) {
+  const kernel = await import("@agent-delivery-harness/kernel"), real = kernel.runAdmission;
+  let calls = 0;
+  return vi.spyOn(kernel, "runAdmission").mockImplementation(async (input, options) => {
+    const result = await real(input, options);
+    if (calls++ > 0 || !result.decision) return result;
+    return { ...result, decision: { ...result.decision, resolutions: result.decision.resolutions.filter(r => !(r.kind === "blocked" && hidden.includes(r.obligationId))) } };
+  });
+}
+const starts = async (shared: string, name: string) => (await readFile(path.join(shared, `${name}-starts`), "utf8").catch(() => "")).length;
+it("a provider the loop later requests for more obligations than it ran beside the checks for runs again, as serial runs it then", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.p", command: liveProvider(f.shared, "p", 0), independent: true }]);
+  // A second live obligation of the same provider, which the loop sees only after its first pass.
+  const template = f.config.obligations.find(o => o.id === "live.p.current")!;
+  f.setConfig({ ...f.config, obligations: [...f.config.obligations, { ...template, id: "live.p.late" }] } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const spy = await hideFromFirstAdmission(["live.p.late"]);
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { spy.mockRestore(); }
+  // Beside the checks for one obligation, then again for both: never the first answer replayed for the larger request.
+  expect(await starts(f.shared, "p")).toBe(2);
+  expect(f.out.join("\n")).toMatch(/live\.p\.late=satisfied_live_fact/);
+}, 90000);
+it("a second pass of the scoped pool does not start a provider that already ran beside the first", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1", "2"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.p", command: liveProvider(f.shared, "p", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  // c2 becomes requestable only after the first pass, so the pool runs twice.
+  const spy = await hideFromFirstAdmission(["check.c2.passed"]);
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { spy.mockRestore(); }
+  expect(f.out.join("\n").match(/passed check\.c\d/g)?.sort()).toEqual(["passed check.c1", "passed check.c2"]);
+  expect(await starts(f.shared, "p")).toBe(1);
+}, 90000);
+it("providers beside the checks start only once the pool is saturated: every worker holds a check", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // Three checks on two workers. c2's and c3's base takes 1.5 s longer to set up, so the second worker stays empty
+  // until then; the third check waits for c1 to free a worker. Saturation comes at the first, not the last.
+  const f = await poolFixture(["1", "2", "2"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `check-${id}`))},String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2500)`);
+  slowSetups(f, ["pc2"], 1500);
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype, executeAll = proto.executeAll, checked = path.join(f.shared, "checks-done");
+  const wrapped = vi.spyOn(proto, "executeAll").mockImplementation(async function (this: unknown, ...args: Parameters<typeof executeAll>) { const out = await executeAll.apply(this as never, args); await writeFile(checked, String(Date.now())); return out; });
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { wrapped.mockRestore(); }
+  const c1 = (await at(f.shared, "check-c1"))!, later = [(await at(f.shared, "check-c2"))!, (await at(f.shared, "check-c3"))!].sort((a, b) => a - b), beside = (await at(f.shared, "beside-start"))!;
+  // c1 ran alone first; the providers waited for the second worker to fill, but not for the last check to be handed out.
+  expect(later[0]! - c1).toBeGreaterThan(800);
+  expect(beside).toBeGreaterThan(c1 + 800);
+  expect(beside).toBeLessThan(later[1]! - 300);
+  expect(beside).toBeLessThan((await at(f.shared, "checks-done"))!);
+}, 90000);
+it("under failFast a check failing before the pool is saturated leaves the providers beside the checks unstarted", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // c1 fails at once while c2's base is still setting up, so the second worker is still empty: the halted pool then
+  // hands c2 out after the cancel, and the providers must not start then.
+  const f = await poolFixture(["1", "2"], 2, id => id === "c1" ? "process.exit(3)" : "");
+  slowSetups(f, ["pc2"], 2000);
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true } });
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const artifacts = f.runtime.artifacts!, allocate = artifacts.allocateRunRoot.bind(artifacts), allocated: string[] = [];
+  (artifacts as { allocateRunRoot: typeof allocate }).allocateRunRoot = async input => { allocated.push(input.providerId); return allocate(input); };
+  expect(await f.run("gate")).toBe(1);
+  expect(f.out.join("\n")).toMatch(/^interrupted live\.beside: check_cancelled after check\.c1 failed$/m);
+  // Never invoked at all: no run root, no process.
+  expect(allocated).not.toContain("live.beside");
+  expect(await at(f.shared, "beside-start")).toBeUndefined();
+}, 90000);
+it("a worker that has finished its check no longer counts toward saturation", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // c1 finishes at once on the first worker; c2's base is ready after 1.5 s, c3's after a further 1.5 s. Only when c3
+  // is handed out are both workers busy again.
+  const f = await poolFixture(["1", "2", "3"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `check-${id}`))},String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${id === "c2" ? 4000 : 0})`);
+  slowSetups(f, ["pc2", "pc3"], 1500);
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  const c2 = (await at(f.shared, "check-c2"))!, c3 = (await at(f.shared, "check-c3"))!, beside = (await at(f.shared, "beside-start"))!;
+  expect(c3 - c2).toBeGreaterThan(800);
+  expect(beside).toBeGreaterThan(c3 - 400);
+}, 90000);

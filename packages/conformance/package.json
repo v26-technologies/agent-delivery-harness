@@ -1,6 +1,6 @@
 {
   "name": "@agent-delivery-harness/conformance",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "type": "module",
   "description": "delivery-evidence/1 conformance kit (89 golden vectors) and its generator",
   "license": "FSL-1.1-ALv2",
@@ -13,7 +13,7 @@
     "node": ">=22.6.0"
   },
   "dependencies": {
-    "@agent-delivery-harness/kernel": "0.8.4"
+    "@agent-delivery-harness/kernel": "0.8.5"
   },
   "exports": {
     ".": "./src/index.ts"
