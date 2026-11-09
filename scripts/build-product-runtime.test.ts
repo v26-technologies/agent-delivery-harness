@@ -173,10 +173,11 @@ it("finds every load a scanner cannot bound from its specifier", () => {
     "__require(dep);",
     "import(pathToFileURL(configPath).href);",
     "createRequire(import.meta.url)(dep);",
+    "module.require(dep); globalThis.require(dep);",
     'eval("1"); Function("return 1"); new Function("return 1");',
   ].join("\n"))).toEqual([
     "ffiModule", "`bun:ffi`", '"./a.mjs", { with: { type: "json" } }', "`./${name}.mjs`", '"a" + b', "dep",
-    "pathToFileURL(configPath).href", "createRequire(import.meta.url)(dep)", 'eval("1")', 'Function("return 1")', 'new Function("return 1")',
+    "pathToFileURL(configPath).href", "createRequire(import.meta.url)(dep)", "dep", "dep", 'eval("1")', 'Function("return 1")', 'new Function("return 1")',
   ]);
 });
 
@@ -187,6 +188,7 @@ it.each([
   ["policy", "export const load = name => require(name);", "loads name through a computed specifier"],
   ["cli", "export const load = configPath => import(configPath);", "loads configPath through a computed specifier"],
   ["cli-api", "export const load = () => eval('x');", "loads eval('x') through a computed specifier"],
+  ["cli", "export const load = (x, configPath) => import(x ? pathToFileURL(configPath).href : x);", "loads x ? pathToFileURL(configPath).href : x through"],
   ["kernel", loader, "kernel.mjs has 1 config loaders, expected 0"],
   ["cli", literal, "cli.mjs has 0 config loaders, expected 1"],
   ["cli-api", `${loader}\n${loader.replace("load", "again")}`, "cli-api.mjs has 2 config loaders, expected 1"],

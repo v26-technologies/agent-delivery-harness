@@ -16,8 +16,9 @@ const BOUNDED_COMPUTED_IMPORTS: Record<string, number> = { "cli-api": 1, cli: 1,
 /**
  * Each load in `text` an import scanner cannot bound from the source alone, as written: an `import()`,
  * `require()` or `__require()` whose specifier is anything but one quoted string with nothing after it, a call
- * through `createRequire(...)`'s result, and code built at run time (`eval`, `Function`). Scanners such as
- * Athena's accept the same literal form, so a runtime this passes cannot read to them as opaque.
+ * through `createRequire(...)`'s result or a `.require` member, and code built at run time (`eval`, `Function`).
+ * Scanners such as Athena's accept the same literal form, so a runtime this passes cannot read to them as opaque.
+ * It does not follow an alias of `require` or the text of a script a bundle hands to a child process.
  */
 export function computedImports(text: string): string[] {
   const source = ts.createSourceFile("bundle.mjs", text, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
@@ -26,7 +27,8 @@ export function computedImports(text: string): string[] {
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
-      if (callee.kind === ts.SyntaxKind.ImportKeyword || named(callee, /^(?:__)?require$/)) {
+      if (callee.kind === ts.SyntaxKind.ImportKeyword || named(callee, /^(?:__)?require$/) ||
+          ts.isPropertyAccessExpression(callee) && callee.name.text === "require") {
         const [specifier, ...rest] = node.arguments;
         if (!specifier || !ts.isStringLiteral(specifier) || rest.length) found.push(node.arguments.map(arg => arg.getText(source)).join(", "));
       } else if (ts.isCallExpression(callee) && named(callee.expression, /^createRequire\d*$/)) found.push(node.getText(source));
