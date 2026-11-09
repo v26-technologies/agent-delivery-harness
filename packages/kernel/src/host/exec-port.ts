@@ -81,6 +81,13 @@ export type NativeGroupKill = (pid: number) => boolean;
 export function groupStopped(rc: number, errno: number): boolean {
   return rc === 0 || errno === ESRCH;
 }
+
+/** The group kill over libc's kill(2) and errno: SIGKILL to the whole group.
+ * errno is read by a second call; a value changed in between only sends a
+ * stopped group on to /bin/kill, which reports it gone. */
+export function libcGroupKill(kill: (pid: number, signal: number) => number, readErrno: () => number): NativeGroupKill {
+  return (pid: number) => kill(-pid, 9) === 0 || groupStopped(-1, readErrno());
+}
 let nativeGroupKillOnce: Promise<NativeGroupKill | null> | undefined;
 export function nativeGroupKill(): Promise<NativeGroupKill | null> {
   return nativeGroupKillOnce ??= (async () => {
@@ -95,9 +102,7 @@ export function nativeGroupKill(): Promise<NativeGroupKill | null> {
       });
       const kill = libc.symbols["kill"] as (pid: number, signal: number) => number;
       const errno = libc.symbols[errnoSymbol] as () => unknown;
-      // errno is read by a second call; a value changed in between only sends
-      // a stopped group on to /bin/kill, which reports it gone.
-      return (pid: number) => kill(-pid, 9) === 0 || groupStopped(-1, read.i32(errno(), 0));
+      return libcGroupKill(kill, () => read.i32(errno(), 0));
     } catch {
       return null;
     }

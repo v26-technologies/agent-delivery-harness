@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { expect, it, vi } from "vitest";
-import { createExecPort, groupStopped } from "./exec-port.ts";
+import { createExecPort, groupStopped, libcGroupKill } from "./exec-port.ts";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -43,7 +43,7 @@ let gaps: number[] = [];
 // V26-3313: under load, Bun 1.1.29 can fail to launch /bin/kill and throw
 // synchronously from execFile. The group is still there, so the launch is
 // retried within its bound; a kill that ran and failed is not.
-type KillOutcome = "throw" | "eagain" | "ran-and-failed" | "ok";
+type KillOutcome = "throw" | "eagain" | "emfile" | "enfile" | "enomem" | "ran-and-failed" | "ok";
 async function cleanupWith(outcomes: KillOutcome[], groupKill?: () => Promise<((pid: number) => boolean) | null>) {
   const child = Object.assign(new EventEmitter(), {
     pid: 2147483646, stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
@@ -61,7 +61,8 @@ async function cleanupWith(outcomes: KillOutcome[], groupKill?: () => Promise<((
     const outcome = outcomes[Math.min(call++, outcomes.length - 1)];
     if (outcome === "throw") throw new TypeError("undefined is not an object");
     queueMicrotask(() => {
-      if (outcome === "eagain") callback(Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" }), "", "");
+      if (outcome === "eagain" || outcome === "emfile" || outcome === "enfile" || outcome === "enomem")
+        callback(Object.assign(new Error(`spawn ${outcome.toUpperCase()}`), { code: outcome.toUpperCase() }), "", "");
       else if (outcome === "ran-and-failed") callback(Object.assign(new Error("kill failed"), { code: 1 }), "", "kill: Operation not permitted");
       else callback(null, "", "");
     });
@@ -83,6 +84,23 @@ async function cleanupWith(outcomes: KillOutcome[], groupKill?: () => Promise<((
 
 it.skipIf(process.platform === "win32")("retries a group kill whose launch fails, then keeps the leader's result", async () => {
   expect(await cleanupWith(["throw", "eagain", "throw", "ok"])).toEqual({ result: { code: 0, stdout: "", stderr: "" }, launches: 4, killedLeader: 0 });
+});
+
+it.skipIf(process.platform === "win32").each(["eagain", "emfile", "enfile", "enomem"] as const)("retries a group kill whose launch fails with %s", async (code) => {
+  expect(await cleanupWith([code, "ok"])).toEqual({ result: { code: 0, stdout: "", stderr: "" }, launches: 2, killedLeader: 0 });
+});
+
+it("kills the whole group with SIGKILL through libc, and reads errno only when that fails", () => {
+  const calls: number[][] = [];
+  let errnoReads = 0;
+  const groupKill = (rc: number, errno: number) => libcGroupKill((pid, signal) => { calls.push([pid, signal]); return rc; }, () => { errnoReads++; return errno; });
+  expect(groupKill(0, 1)(4242)).toBe(true);
+  expect([calls, errnoReads]).toEqual([[[-4242, 9]], 0]);
+  expect(groupKill(-1, 3)(4242)).toBe(true);
+  // EPERM, or any errno but ESRCH, is not stopped: the group goes on to /bin/kill.
+  expect(groupKill(-1, 1)(4242)).toBe(false);
+  expect(groupKill(-1, 0)(4242)).toBe(false);
+  expect(errnoReads).toBe(3);
 });
 
 it.skipIf(process.platform === "win32")("fails closed when every launch within the bound fails", async () => {
