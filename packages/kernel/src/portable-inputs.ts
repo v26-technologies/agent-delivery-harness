@@ -6,7 +6,8 @@ import type { ResourceApplicabilityBinding, ScopedCheckPlan, ScopedCheckAttempt 
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { BlockedError } from "./blockers.ts";
-import { runGitCommand, runGitCommandBytes, evaluateCandidateActivation, type CandidateCommandRunner } from "./candidate.ts";
+import { spawn, type ChildProcess } from "node:child_process";
+import { runGitCommand, scrubbedEnvironment, evaluateCandidateActivation, type CandidateCommandRunner } from "./candidate.ts";
 import type { CapturedCandidate } from "./candidate.types.ts";
 import type { HarnessConfig } from "./config.ts";
 import { computePreparationFingerprint } from "./preparation.ts";
@@ -51,49 +52,84 @@ async function candidateTreeReader(rootDir: string, treeSha: string, run: Candid
     return verifyObject(sha, type, bytes);
   };
   type ObjectRequest = { sha: string; type: "blob" | "tree"; resolve: (bytes: Buffer) => void; reject: (error: unknown) => void };
-  const queued: ObjectRequest[] = [];
-  let active = 0, scheduled = false;
-  const schedule = () => {
-    if (scheduled || active >= 4 || !queued.length) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      // Feed the bounded source-input readers without building one large
-      // response. Every finite child retains its own validation barrier.
-      while (active < 4 && queued.length) {
-        const batch = queued.splice(0, 8);
-        active++;
-        void flush(batch);
-      }
-    });
+  type BatchChild = { git: ChildProcess; written: ObjectRequest[]; chunks: Buffer[]; buffered: number; awaiting?: number; closed: boolean };
+  let current: BatchChild | undefined;
+  // One long-lived `git cat-file --batch` answers a burst of reads in request order. Each frame is published
+  // only once it names the requested object and its bytes hash to it; any other fault ends that child.
+  const fail = (child: BatchChild, error: unknown) => {
+    if (child.closed) return;
+    child.closed = true;
+    if (current === child) current = undefined;
+    child.git.kill("SIGKILL");
+    for (const request of child.written.splice(0)) request.reject(error);
   };
-  const flush = async (batch: ObjectRequest[]) => {
-    try {
-      const result = await runGitCommandBytes(["git", "cat-file", "--batch"], {
-        cwd: rootDir, stdin: batch.map(request => `${request.sha}\n`).join(""),
-      });
-      if (result.exitCode !== 0) refusal("A target-tree evidence input cannot be read.");
-      const output = result.stdout, values: Buffer[] = [];
-      let offset = 0;
-      for (const request of batch) {
-        const end = output.indexOf(0x0a, offset);
-        if (end < offset || end - offset > 128) refusal("A target-tree object batch has an invalid header.");
-        const header = /^([a-f0-9]{40}(?:[a-f0-9]{24})?) (blob|tree) (0|[1-9][0-9]*)$/.exec(output.subarray(offset, end).toString("utf8"));
-        if (!header || header[1] !== request.sha || header[2] !== request.type) refusal("A target-tree object batch has an invalid identity or type.");
-        const size = Number(header![3]), start = end + 1, finish = start + size;
-        if (!Number.isSafeInteger(size) || !Number.isSafeInteger(finish) || finish >= output.length || output[finish] !== 0x0a) refusal("A target-tree object batch has invalid or truncated bytes.");
-        values.push(verifyObject(request.sha, request.type, Buffer.from(output.subarray(start, finish))));
-        offset = finish + 1;
+  const failure = (message: string) => { try { return refusal(message); } catch (error) { return error; } };
+  // The child's stdin ends as soon as no read waits on it, so it exits after every burst, a fault, or a caller
+  // that stopped awaiting; a read after that starts a new child.
+  const settle = (child: BatchChild) => {
+    if (child.written.length || child.closed) return;
+    if (current === child) current = undefined;
+    child.git.stdin!.end();
+  };
+  const take = (child: BatchChild, length: number): Buffer => {
+    const joined = child.chunks.length === 1 ? child.chunks[0]! : Buffer.concat(child.chunks, child.buffered);
+    child.chunks = joined.length > length ? [joined.subarray(length)] : [];
+    child.buffered = joined.length - length;
+    return joined.subarray(0, length);
+  };
+  const parse = (child: BatchChild) => {
+    while (!child.closed && child.written.length) {
+      // A large body arrives in many chunks; join them once it is whole, not on every chunk.
+      if (child.awaiting !== undefined && child.buffered < child.awaiting) return;
+      const request = child.written[0]!;
+      const head = child.chunks.length === 1 ? child.chunks[0]! : Buffer.concat(child.chunks, child.buffered);
+      child.chunks = head.length ? [head] : [];
+      const end = head.indexOf(0x0a);
+      if (end < 0 ? head.length > 128 : end > 128) return fail(child, failure("A target-tree object batch has an invalid header."));
+      if (end < 0) return;
+      const line = head.subarray(0, end).toString("utf8");
+      if (line === `${request.sha} missing` || line === `${request.sha} ambiguous`) {
+        take(child, end + 1);
+        child.written.shift();
+        request.reject(failure("A target-tree input is missing or oversized."));
+        continue;
       }
-      if (offset !== output.length) refusal("A target-tree object batch has unexpected trailing bytes.");
-      // Publish nothing until every frame and the finite process have passed.
-      batch.forEach((request, index) => request.resolve(values[index]!));
-    } catch (error) { batch.forEach(request => request.reject(error)); }
-    finally { active--; schedule(); }
+      const header = /^([a-f0-9]{40}(?:[a-f0-9]{24})?) (blob|tree) (0|[1-9][0-9]*)$/.exec(line);
+      if (!header || header[1] !== request.sha || header[2] !== request.type) return fail(child, failure("A target-tree object batch has an invalid identity or type."));
+      const size = Number(header[3]);
+      if (!Number.isSafeInteger(size) || !Number.isSafeInteger(end + size + 2)) return fail(child, failure("A target-tree object batch has invalid or truncated bytes."));
+      if (child.buffered < end + size + 2) { child.awaiting = end + size + 2; return; }
+      child.awaiting = undefined;
+      const frame = take(child, end + size + 2);
+      if (frame[end + size + 1] !== 0x0a) return fail(child, failure("A target-tree object batch has invalid or truncated bytes."));
+      let bytes: Buffer;
+      try { bytes = verifyObject(request.sha, request.type, Buffer.from(frame.subarray(end + 1, end + 1 + size))); }
+      catch (error) { return fail(child, error); }
+      child.written.shift();
+      request.resolve(bytes);
+    }
+    if (!child.closed && child.buffered) return fail(child, failure("A target-tree object batch has unexpected trailing bytes."));
+    // A read issued from a resolved read's continuation joins this child rather than starting another.
+    setImmediate(() => settle(child));
+  };
+  const start = (): BatchChild => {
+    const git = spawn("git", ["cat-file", "--batch"], { cwd: rootDir, env: scrubbedEnvironment(), stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+    const child: BatchChild = { git, written: [], chunks: [], buffered: 0, closed: false };
+    git.stdout!.on("data", (chunk: Buffer) => { if (child.closed) return; child.chunks.push(chunk); child.buffered += chunk.length; parse(child); });
+    git.once("error", () => fail(child, failure("A target-tree evidence input cannot be read.")));
+    git.stdin!.once("error", () => fail(child, failure("A target-tree evidence input cannot be read.")));
+    // A child that exits with reads still waiting has failed them; one that exits idle is only retired.
+    git.once("close", () => {
+      if (child.written.length) return fail(child, failure("A target-tree evidence input cannot be read."));
+      child.closed = true;
+      if (current === child) current = undefined;
+    });
+    return child;
   };
   const loadNativeObject = (sha: string, type: "blob" | "tree"): Promise<Buffer> => new Promise((resolve, reject) => {
-    queued.push({ sha, type, resolve, reject });
-    schedule();
+    const child = current ??= start();
+    child.written.push({ sha, type, resolve, reject });
+    child.git.stdin!.write(`${sha}\n`);
   });
   // One reader owns one pinned tree and one size policy. Only verified bytes
   // resolve successfully; sharing in-flight reads also avoids duplicate Git I/O.

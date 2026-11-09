@@ -33,35 +33,65 @@ function fixture(format = "sha1") {
   const tree = git("write-tree").toString().trim();
   const transport = path.join(root, "transport"); mkdirSync(transport);
   const control = path.join(transport, "control"), trace = path.join(transport, "trace"); writeFileSync(control, "good"); writeFileSync(trace, "");
+  // A streaming stand-in for git: it relays a long-lived `cat-file --batch` frame by frame and corrupts the first
+  // frame each child answers in the selected mode. Every other command runs to completion as before.
   const wrapper = `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process');
-const args=process.argv.slice(2),mode=fs.readFileSync(${JSON.stringify(control)},'utf8');
-const input=fs.readFileSync(0);fs.appendFileSync(${JSON.stringify(trace)},JSON.stringify({args,input:input.toString()})+'\\n');
-if(mode==='hold'&&args[0]==='cat-file'&&args[1]==='--batch'){
- const deadline=Date.now()+10000;while(!fs.existsSync(${JSON.stringify(control + ".release")})){
-  if(Date.now()>deadline)throw Error('Unreleased native fixture child');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
- }
-}
-const r=cp.spawnSync(${JSON.stringify(realGit)},args,{input,maxBuffer:32*1024*1024});let output=r.stdout;
-if(args[0]==='cat-file'&&args[1]==='--batch'){
- const end=output.indexOf(10),header=output.subarray(0,end).toString(),fields=header.split(' ');
- if(mode==='oid')output=Buffer.concat([Buffer.from('f'.repeat(fields[0].length)+' '+fields.slice(1).join(' ')+'\\n'),output.subarray(end+1)]);
- if(mode==='type')output=Buffer.concat([Buffer.from(fields[0]+' tree '+fields[2]+'\\n'),output.subarray(end+1)]);
- if(mode==='non-ascii')output[0]|=128;
- if(mode==='negative'||mode==='unsafe'||mode==='size-text')output=Buffer.concat([Buffer.from(fields[0]+' '+fields[1]+' '+({negative:'-1',unsafe:'9007199254740992','size-text':'oops'}[mode])+'\\n'),output.subarray(end+1)]);
- if(mode==='header')output=Buffer.from(header);
- if(mode==='body')output=output.subarray(0,end+2);
- if(mode==='hash')output[end+1]^=1;
- if(mode==='delimiter')output[output.length-1]=0;
- if(mode==='trailing')output=Buffer.concat([output,Buffer.from('unexpected')]);
- if(mode==='missing')output=Buffer.from(fields[0]+' missing\\n');
- if(mode==='exit')process.exitCode=7;
-}
-process.stdout.write(output);process.stderr.write(r.stderr);process.exitCode=process.exitCode||r.status||0;\n`;
+const args=process.argv.slice(2),mode=fs.readFileSync(${JSON.stringify(control)},'utf8'),trace=${JSON.stringify(trace)};
+if(!(args[0]==='cat-file'&&args[1]==='--batch')){
+ const input=fs.readFileSync(0);fs.appendFileSync(trace,JSON.stringify({args,input:input.toString()})+'\\n');
+ const r=cp.spawnSync(${JSON.stringify(realGit)},args,{input,maxBuffer:32*1024*1024});process.stdout.write(r.stdout);process.stderr.write(r.stderr);process.exitCode=r.status||0;
+}else{
+ const inputs=trace+'.'+process.pid;fs.writeFileSync(inputs,'');fs.appendFileSync(trace,JSON.stringify({args,inputs})+'\\n');
+ const git=cp.spawn(${JSON.stringify(realGit)},args,{stdio:['pipe','pipe','inherit']});
+ process.stdin.on('data',d=>{fs.appendFileSync(inputs,d);git.stdin.write(d);});process.stdin.on('end',()=>git.stdin.end());
+ const released=()=>mode!=='hold'||fs.existsSync(${JSON.stringify(control + ".release")});
+ let buffered=Buffer.alloc(0),frames=[],index=0,sent=0,stopped=false;
+ const emit=frame=>{
+  const end=frame.indexOf(10),header=frame.subarray(0,end).toString(),fields=header.split(' ');let out=frame;
+  if(index++===0){
+   if(mode==='oid')out=Buffer.concat([Buffer.from('f'.repeat(fields[0].length)+' '+fields.slice(1).join(' ')+'\\n'),frame.subarray(end+1)]);
+   if(mode==='type')out=Buffer.concat([Buffer.from(fields[0]+' tree '+fields[2]+'\\n'),frame.subarray(end+1)]);
+   if(mode==='non-ascii'){out=Buffer.from(frame);out[0]|=128;}
+   if(mode==='negative'||mode==='unsafe'||mode==='size-text')out=Buffer.concat([Buffer.from(fields[0]+' '+fields[1]+' '+({negative:'-1',unsafe:'9007199254740992','size-text':'oops'}[mode])+'\\n'),frame.subarray(end+1)]);
+   if(mode==='header')out=Buffer.from(header);
+   if(mode==='body')out=frame.subarray(0,end+2);
+   if(mode==='hash'){out=Buffer.from(frame);out[end+1]^=1;}
+   if(mode==='delimiter'){out=Buffer.from(frame);out[out.length-1]=0;}
+   if(mode==='trailing')out=Buffer.concat([frame,Buffer.from('unexpected')]);
+   if(mode==='missing')out=Buffer.from(fields[0]+' missing\\n');
+   if(mode==='swap'){frames.push(frame);return;}
+  }
+  if(mode==='swap'&&index===2)out=Buffer.concat([frame,frames.shift()]);
+  if(stopped)return;
+  if(mode==='exit'&&++sent===1){stopped=true;return process.stdout.write(out,()=>process.exit(7));}
+  process.stdout.write(out);
+ };
+ const flush=()=>{
+  if(!released())return setTimeout(flush,10);
+  for(;;){
+   const end=buffered.indexOf(10);if(end<0)return;
+   const header=buffered.subarray(0,end).toString(),size=/ missing$/.test(header)?-1:Number(header.split(' ')[2]);
+   const length=size<0?end+1:end+size+2;if(buffered.length<length)return;
+   emit(buffered.subarray(0,length));buffered=buffered.subarray(length);
+  }
+ };
+ git.stdout.on('data',d=>{buffered=Buffer.concat([buffered,d]);flush();});
+ git.on('close',code=>{flush();process.exitCode=code||0;});
+}\n`;
   writeFileSync(path.join(transport, "git"), wrapper, { mode: 0o755 });
   vi.stubEnv("PATH", transport + path.delimiter + process.env["PATH"]);
-  const calls = () => readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { args: string[]; input: string });
+  const calls = () => readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map(line => {
+    const call = JSON.parse(line) as { args: string[]; input?: string; inputs?: string };
+    return { args: call.args, input: call.inputs === undefined ? call.input! : readFileSync(call.inputs, "utf8") };
+  });
   return { root, git, tree, bytes, calls, mode: (mode: string) => writeFileSync(control, mode), release: () => writeFileSync(control + ".release", "") };
 }
+
+/** The `cat-file --batch` children this file's readers started, and those still running. */
+const batchChildren = () => vi.mocked(spawn).mock.calls.map((call, index) => ({ call, child: vi.mocked(spawn).mock.results[index]!.value as ReturnType<typeof spawn> }))
+  .filter(({ call }) => call[0] === "git" && Array.isArray(call[1]) && call[1][0] === "cat-file" && call[1][1] === "--batch").map(({ child }) => child);
+const running = () => batchChildren().filter(child => child.exitCode === null && child.signalCode === null);
+async function allClosed() { await vi.waitFor(() => expect(running()).toHaveLength(0), { timeout: 5000, interval: 10 }); }
 
 it.each(["sha1", "sha256"])("batches native %s binary, aliases and metadata while legacy runners keep their protocol", async format => {
   const f = fixture(format), read = await candidateTreeSourceReader(f.root, f.tree);
@@ -110,42 +140,55 @@ it("keeps native binary batches out of UTF8 and base64 text transport", async ()
   expect(bodyEncodings).toEqual([]);
 });
 
-it("bounds native waves to eight and flushes a single request without waiting for peers", async () => {
+it("answers a burst through one long-lived child and closes it once no read waits", async () => {
   const f = fixture(); for (let i = 0; i < 67; i++) writeFileSync(path.join(f.root, `extra-${i}`), `unique ${i}`);
   // Keep the transport wrapper out of the pinned tree.
   f.git("add", ...Array.from({ length: 67 }, (_, i) => `extra-${i}`)); const tree = f.git("write-tree").toString().trim();
   const read = await candidateTreeSourceReader(f.root, tree);
   expect(await Promise.all(Array.from({ length: 67 }, (_, i) => read(`extra-${i}`)))).toEqual(Array.from({ length: 67 }, (_, i) => Buffer.from(`unique ${i}`)));
+  await allClosed();
+  // A read after the burst starts a new child rather than waiting on a closed one.
   expect(await read("empty")).toEqual(Buffer.alloc(0));
-  const waves = f.calls().filter(call => call.args[1] === "--batch").map(call => call.input.trim().split("\n").length);
-  expect(waves).toEqual([...Array.from({ length: 8 }, () => 8), 3, 1]);
+  await allClosed();
+  const children = f.calls().filter(call => call.args[1] === "--batch").map(call => call.input.trim().split("\n").length);
+  expect(children).toEqual([67, 1]);
 });
 
-it("allows a distinct native child to overlap an earlier held batch", async () => {
+it("pipelines a read issued while the child is held into the same child", async () => {
   const f = fixture(); f.mode("hold");
   const read = await candidateTreeSourceReader(f.root, f.tree), first = read("input");
-  const launches = () => vi.mocked(spawn).mock.calls.map((call, index) => ({ call, result: vi.mocked(spawn).mock.results[index]! }))
-    .filter(({ call }) => call[0] === "git" && Array.isArray(call[1]) && call[1][0] === "cat-file" && call[1][1] === "--batch");
   let second: ReturnType<typeof read> | undefined;
   try {
     await vi.waitFor(() => expect(f.calls().filter(call => call.args[1] === "--batch")).toHaveLength(1), { timeout: 5000, interval: 10 });
     second = read("exec");
-    // Drain scheduler microtasks while the first real child waits for release.
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(launches()).toHaveLength(2);
-    expect(launches().every(({ result }) => result.value.exitCode === null)).toBe(true);
+    expect(batchChildren()).toHaveLength(1);
+    expect(running()).toHaveLength(1);
   } finally {
     f.release(); await Promise.allSettled([first, ...(second ? [second] : [])]);
   }
   expect(await first).toEqual(f.bytes); expect(await second).toEqual(Buffer.from("executable"));
-  expect(launches()).toHaveLength(2);
+  expect(batchChildren()).toHaveLength(1);
+  await allClosed();
 }, 15000);
 
-it.each(["oid", "type", "non-ascii", "negative", "unsafe", "size-text", "header", "body", "hash", "delimiter", "trailing", "missing", "exit"])("rejects native batch %s faults, settles siblings and retries without cached failure", async mode => {
+// A fault in the first frame ends the child and fails every read it holds; a missing object fails only its own
+// read; a fault after a verified frame leaves that frame published.
+const faults: Record<string, ["fulfilled" | "rejected", "fulfilled" | "rejected"]> = {
+  oid: ["rejected", "rejected"], type: ["rejected", "rejected"], "non-ascii": ["rejected", "rejected"], negative: ["rejected", "rejected"],
+  unsafe: ["rejected", "rejected"], "size-text": ["rejected", "rejected"], header: ["rejected", "rejected"], body: ["rejected", "rejected"],
+  hash: ["rejected", "rejected"], delimiter: ["rejected", "rejected"], swap: ["rejected", "rejected"],
+  missing: ["rejected", "fulfilled"], trailing: ["fulfilled", "rejected"], exit: ["fulfilled", "rejected"],
+};
+it.each(Object.keys(faults))("answers native batch %s faults frame by frame, closes the child and retries without cached failure", async mode => {
   const f = fixture(), read = await candidateTreeSourceReader(f.root, f.tree); f.mode(mode);
   const results = await Promise.allSettled([read("input"), read("exec")]);
-  expect(results.map(result => result.status)).toEqual(["rejected", "rejected"]);
+  expect(results.map(result => result.status)).toEqual(faults[mode]);
   for (const result of results) if (result.status === "rejected") expect(result.reason).toMatchObject({ blockers: [{ code: "portable_tree_unreadable" }] });
+  if (results[0]!.status === "fulfilled") expect(results[0]!.value).toEqual(f.bytes);
+  if (results[1]!.status === "fulfilled") expect(results[1]!.value).toEqual(Buffer.from("executable"));
+  if (mode === "missing") expect(results[0]).toMatchObject({ reason: { blockers: [{ summary: expect.stringContaining("missing") }] } });
+  await allClosed();
   f.mode("good"); expect(await read("input")).toEqual(f.bytes); expect(await read("exec")).toEqual(Buffer.from("executable"));
   expect(await (await candidateTreeSourceReader(f.root, f.tree))("input")).toEqual(f.bytes);
   expect(f.calls().filter(call => call.args[0] === "cat-file").every(call => call.args[1] === "--batch")).toBe(true);
