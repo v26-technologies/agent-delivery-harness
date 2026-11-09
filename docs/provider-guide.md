@@ -42,6 +42,14 @@ not supplied a live result or retained evidence, `gate` and `record` invoke the
 command at their existing command boundary. Repositories whose registrations
 omit `command` keep the manual flow described in the rest of this guide.
 
+A command provider gets plain stdio. It may also declare
+`inheritDescriptors: [3, 4]` (or just one of them, ascending) to inherit those
+descriptors from the invocation. An invocation uses this to hand a provider a
+capability it already holds, such as a pipe to its own analysis worker. Only
+the declaring provider receives them, and only if the invocation actually holds
+them open; otherwise the provider sees them closed. No other descriptor is ever
+passed.
+
 The command exchanges one JSON document per stdout/stdin line. The documents
 and state transitions are the exact vendored
 [`delivery-provider-rails/1` contract](contracts/delivery-provider-rails-v1.md);

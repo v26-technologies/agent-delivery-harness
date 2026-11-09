@@ -906,6 +906,60 @@ describe("the full delivery loop", () => {
     expect(opened).toEqual(["failing.provider", "passing.provider"]);
   });
 
+  it("opens a provider with exactly its own declared descriptors, and the others with plain stdio (V26-3314)", { timeout: 60000 }, async () => {
+    const dir = await initRepo();
+    const providerIds = ["failing.provider", "passing.provider"] as const;
+    const config = makeConfig({
+      providers: providerIds.map((id) => ({ id, findingCodes: [], command: [`fake-${id}`],
+        ...(id === "passing.provider" ? { inheritDescriptors: [3, 4] as (3 | 4)[] } : {}) })),
+      obligations: [
+        {
+          id: "review.green",
+          activation: { kind: "relevant_change" },
+          freshness: "live",
+          providers: providerIds,
+          providerPolicy: "existential",
+          acceptedPayloadSpecs: ["review.green/1"],
+          allowedResolutionKinds: ["satisfied_live_fact", "not_applicable"],
+          humanWaiverAllowed: false,
+          minimumAttestationLevel: "self",
+          ciDelegationPolicyIds: [],
+          remediation: { default: [{ id: "run-provider", kind: "retry", summary: "Run an uncovered provider." }] },
+          waivableCodes: [],
+          nonWaivableCodes: [...STRUCTURAL_WAIVABLE, ...STRUCTURAL_NONWAIVABLE],
+        },
+      ],
+    });
+    const artifacts = await makeArtifacts();
+    const { runtime } = makeRuntime(dir, config, artifacts);
+    const opened: Record<string, unknown> = {};
+    const railRuntime: CliRuntime = {
+      ...runtime,
+      openProviderRail: async (input): Promise<ProviderRailSession> => {
+        opened[input.providerId] = "inheritDescriptors" in input ? input.inheritDescriptors : "absent";
+        let receiveCount = 0;
+        let requestId: string | undefined;
+        return {
+          async send(message) {
+            if (message.kind === "request") requestId = message.requestId;
+          },
+          async receive() {
+            receiveCount += 1;
+            if (receiveCount === 1)
+              return { kind: "negotiation", outcome: "supported", selectedVersion: "delivery-provider-rails/1", supportedVersions: ["delivery-provider-rails/1"] };
+            if (requestId === undefined) return null;
+            return { kind: "terminal", outcome: input.providerId === "failing.provider" ? "failed" : "success", requestId, sequence: 1,
+              summary: `${input.providerId} complete`, version: "delivery-provider-rails/1" };
+          },
+          async close() {},
+        };
+      },
+    };
+    expect(await runCli(["prepare"], railRuntime)).toBe(EXIT_OK);
+    expect(await runCli(["record"], railRuntime)).toBe(EXIT_OK);
+    expect(opened).toEqual({ "failing.provider": "absent", "passing.provider": [3, 4] });
+  });
+
   it("invokes only the uncovered provider for an all-provider exact-evidence obligation", { timeout: 60000 }, async () => {
     const dir = await initRepo();
     const providerIds = ["first.provider", "second.provider"] as const;

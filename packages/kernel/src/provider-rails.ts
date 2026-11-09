@@ -13,7 +13,9 @@ import { BlockedError, createBlocker, type Blocker } from "./blockers.ts";
 import { canonicalize } from "./canonical.ts";
 import type { LiveProviderResult } from "./evaluator.ts";
 import type { SubmissionOutcome, SubmissionRecord } from "./recorder.ts";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { fstatSync } from "node:fs";
+import type { InheritedDescriptor } from "./config.ts";
 import { createInterface } from "node:readline";
 
 export const DELIVERY_PROVIDER_RAILS_VERSION = "delivery-provider-rails/1" as const;
@@ -283,6 +285,21 @@ export interface OpenProviderRailProcessInput {
   readonly command: readonly [string, ...string[]];
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
+  /** The provider's declared inherited descriptors (3 and 4 only); absent is plain stdio. */
+  readonly inheritDescriptors?: readonly InheritedDescriptor[];
+}
+
+/** Stdio for a rail provider: three pipes, then exactly the declared
+ * descriptors the invocation actually holds open. An undeclared or closed
+ * descriptor is never passed: the provider sees it closed (V26-3314). */
+export function providerRailStdio(declared: readonly InheritedDescriptor[] = [], isOpen: (fd: number) => boolean = descriptorOpen): ("pipe" | "ignore" | number)[] {
+  const stdio: ("pipe" | "ignore" | number)[] = ["pipe", "pipe", "pipe"];
+  const last = Math.max(2, ...declared);
+  for (let fd = 3; fd <= last; fd++) stdio.push(declared.includes(fd as InheritedDescriptor) && isOpen(fd) ? fd : "ignore");
+  return stdio;
+}
+function descriptorOpen(fd: number): boolean {
+  try { fstatSync(fd); return true; } catch { return false; }
 }
 
 const DEFAULT_PROVIDER_RAIL_DEADLINE_MS = 10 * 60_000;
@@ -361,9 +378,9 @@ export function openProviderRailProcess(input: OpenProviderRailProcessInput): Pr
   const child = spawn(executable, args, {
     cwd: input.cwd,
     env: input.env,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: providerRailStdio(input.inheritDescriptors),
     shell: false,
-  });
+  }) as ChildProcessWithoutNullStreams;
   // A deadline may destroy the child while a bounded stdin write is pending.
   // The write callback still reports that failure; this listener prevents the
   // stream's parallel `error` event from becoming an uncaught exception.

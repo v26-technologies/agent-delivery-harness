@@ -244,6 +244,7 @@ export interface CliRuntime {
     readonly command: readonly [string, ...string[]];
     readonly cwd: string;
     readonly env: EnvSnapshot;
+    readonly inheritDescriptors?: readonly (3 | 4)[];
   }) => Promise<ProviderRailSession>;
 }
 
@@ -533,6 +534,8 @@ async function runConfiguredCommand(
         const provider = config.providers.find((registration) => registration.id === providerId);
         if (provider?.command === undefined) return undefined;
         const command = provider.command;
+        // Only this provider's own declaration reaches its process.
+        const inherited = provider.inheritDescriptors;
         const requestId = randomUUID();
         const allocation = await artifacts.allocateRunRoot({ providerId, runId: requestId });
         if (!allocation.ok) {
@@ -568,8 +571,8 @@ async function runConfiguredCommand(
             {
               open: () =>
                 runtime.openProviderRail === undefined
-                  ? openProviderRailProcess({ command, cwd: runtime.cwd, env: { ...runtime.env } })
-                  : runtime.openProviderRail({ providerId, command, cwd: runtime.cwd, env: runtime.env }),
+                  ? openProviderRailProcess({ command, cwd: runtime.cwd, env: { ...runtime.env }, ...(inherited ? { inheritDescriptors: inherited } : {}) })
+                  : runtime.openProviderRail({ providerId, command, cwd: runtime.cwd, env: runtime.env, ...(inherited ? { inheritDescriptors: inherited } : {}) }),
               publishManifest: (manifestPath) =>
                 submitManifest(
                   { rootDir: runtime.cwd, config, manifestPath },
