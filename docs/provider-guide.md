@@ -56,7 +56,10 @@ device of -1 on darwin is `18446744073709551615`. A JavaScript launcher reads
 them with `fstatSync(fd, { bigint: true })`, since the number form rounds
 them. Where only rounded numbers are available (Bun 1.1.29 ignores
 `bigint: true`), a value beyond 2^53 has no identity and is never passed; the
-named FIFOs an invocation opens carry small exact values. This applies wherever
+named FIFOs an invocation opens carry small exact values. Runtimes also
+disagree on a socket's device on darwin (Bun reports 0 where Node reports -1),
+so a socket passes only when launcher and harness read it the same way; a
+launcher that may differ from the harness's runtime hands on named FIFOs. This applies wherever
 the product opens a provider: `gate`, `record`, and `verify`'s live collection. An open descriptor alone is not enough:
 Bun and Node hold descriptors 3 and 4 themselves, and a setting can outlive the
 descriptors it named. The provider's environment then states exactly what it
