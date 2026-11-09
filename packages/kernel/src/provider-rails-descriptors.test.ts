@@ -1,42 +1,47 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { INHERITED_DESCRIPTORS_ENV, providerRailStdio } from "./provider-rails.ts";
+import { INHERITED_DESCRIPTORS_ENV, providerRailLaunch } from "./provider-rails.ts";
 
-// V26-3314: a rail provider inherits a descriptor only when it declares it, the
-// launcher vouches for it in the environment, and it is a pipe or socket.
-describe("provider rail stdio", () => {
-  const channel = () => true;
-  const vouched = { [INHERITED_DESCRIPTORS_ENV]: "3,4" };
-  it("gives a provider without a declaration plain stdio", () => {
-    expect(providerRailStdio()).toEqual(["pipe", "pipe", "pipe"]);
-    expect(providerRailStdio([], vouched, channel)).toEqual(["pipe", "pipe", "pipe"]);
+// V26-3314: a rail provider inherits a descriptor only when it declares it and
+// the launcher vouched for that very pipe or socket; its environment then says
+// exactly what it received.
+describe("provider rail launch", () => {
+  const identify = (fd: number) => ({ 3: "1:30", 4: "1:40" } as Record<number, string>)[fd];
+  const vouched = { [INHERITED_DESCRIPTORS_ENV]: "3:1:30,4:1:40" };
+  const slots = (declared: (3 | 4)[], env: NodeJS.ProcessEnv, id = identify) => providerRailLaunch(declared, env, id).stdio.slice(3);
+  it("gives a provider without a declaration plain stdio and no inherited statement", () => {
+    expect(providerRailLaunch(undefined, vouched, identify)).toEqual({ stdio: ["pipe", "pipe", "pipe"], env: {} });
+    expect(providerRailLaunch([], { PATH: "/bin" }, identify)).toEqual({ stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/bin" } });
   });
-  it("passes exactly the declared and vouched descriptors", () => {
-    expect(providerRailStdio([3, 4], vouched, channel)).toEqual(["pipe", "pipe", "pipe", 3, 4]);
-    expect(providerRailStdio([4], vouched, channel)).toEqual(["pipe", "pipe", "pipe", "ignore", 4]);
-    expect(providerRailStdio([3], vouched, channel)).toEqual(["pipe", "pipe", "pipe", 3]);
-    expect(providerRailStdio([3, 4], { [INHERITED_DESCRIPTORS_ENV]: " 4 " }, channel)).toEqual(["pipe", "pipe", "pipe", "ignore", 4]);
+  it("passes exactly the declared descriptors whose identity was vouched for", () => {
+    expect(providerRailLaunch([3, 4], { ...vouched, PATH: "/bin" }, identify)).toEqual({
+      stdio: ["pipe", "pipe", "pipe", 3, 4], env: { PATH: "/bin", [INHERITED_DESCRIPTORS_ENV]: "3:1:30,4:1:40" } });
+    expect(slots([4], vouched)).toEqual(["ignore", 4]);
+    expect(slots([3], vouched)).toEqual([3]);
+    expect(providerRailLaunch([4], vouched, identify).env[INHERITED_DESCRIPTORS_ENV]).toBe("4:1:40");
   });
-  it("never passes a descriptor the launcher did not vouch for, however open", () => {
-    for (const env of [{}, { [INHERITED_DESCRIPTORS_ENV]: "" }, { [INHERITED_DESCRIPTORS_ENV]: "5,6" }, { [INHERITED_DESCRIPTORS_ENV]: "34" }])
-      expect(providerRailStdio([3, 4], env, channel)).toEqual(["pipe", "pipe", "pipe", "ignore", "ignore"]);
+  it("never passes a descriptor whose identity differs from the one vouched for", () => {
+    expect(slots([3, 4], { [INHERITED_DESCRIPTORS_ENV]: "3:1:31,4:1:40" })).toEqual(["ignore", 4]);
+    expect(slots([3, 4], vouched, () => undefined)).toEqual(["ignore", "ignore"]);
+    expect(providerRailLaunch([3, 4], vouched, () => "9:9").env).toEqual({});
   });
-  it("never passes a vouched descriptor that is not a pipe or socket", () => {
-    expect(providerRailStdio([3, 4], vouched, (fd) => fd === 4)).toEqual(["pipe", "pipe", "pipe", "ignore", 4]);
-    expect(providerRailStdio([3, 4], vouched, () => false)).toEqual(["pipe", "pipe", "pipe", "ignore", "ignore"]);
+  it("never passes a descriptor nobody vouched for", () => {
+    for (const env of [{}, { [INHERITED_DESCRIPTORS_ENV]: "" }, { [INHERITED_DESCRIPTORS_ENV]: "3,4" }, { [INHERITED_DESCRIPTORS_ENV]: "5:1:50" }, { [INHERITED_DESCRIPTORS_ENV]: "3:x:y" }])
+      expect(slots([3, 4], env)).toEqual(["ignore", "ignore"]);
   });
-  it.skipIf(process.platform === "win32")("hands a real child the vouched pipe only when declared", async () => {
+  it.skipIf(process.platform === "win32")("hands a real child the vouched pipe only when declared and only for its own identity", async () => {
     // The parent holds a pipe on fd 3 carrying a marker. A shell child reads fd
     // 3 only if it was passed; sh opens no descriptor 3 of its own.
     const rails = pathToFileURL(fileURLToPath(new URL("./provider-rails.ts", import.meta.url))).href;
     const parent = `import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { providerRailStdio, INHERITED_DESCRIPTORS_ENV } from ${JSON.stringify(rails)};
+import { providerRailLaunch, channelIdentity, INHERITED_DESCRIPTORS_ENV } from ${JSON.stringify(rails)};
 const read = "cat <&3 2>/dev/null || printf closed";
-const vouched = { [INHERITED_DESCRIPTORS_ENV]: "3" };
-for (const [declared, env] of [[[], vouched], [[3], {}], [[3], vouched]]) {
-  const result = spawnSync("/bin/sh", ["-c", read], { stdio: providerRailStdio(declared, env), encoding: "utf8" });
+const own = { [INHERITED_DESCRIPTORS_ENV]: "3:" + channelIdentity(3) };
+const stale = { [INHERITED_DESCRIPTORS_ENV]: "3:0:1" };
+for (const [declared, env] of [[[], own], [[3], stale], [[3], own]]) {
+  const launch = providerRailLaunch(declared, env);
+  const result = spawnSync("/bin/sh", ["-c", read], { stdio: launch.stdio, env: launch.env, encoding: "utf8" });
   console.log(JSON.stringify(result.stdout));
 }`;
     const child = spawn(process.execPath, ["--input-type=module", "-e", parent], { stdio: ["ignore", "pipe", "pipe", "pipe"] });
@@ -46,9 +51,9 @@ for (const [declared, env] of [[[], vouched], [[3], {}], [[3], vouched]]) {
     (child.stdio[3] as NodeJS.WritableStream).end("marker");
     await new Promise((resolve) => child.once("close", resolve));
     expect(err).toBe("");
-    const [plain, unvouched, passed] = out.trim().split("\n").map((line) => JSON.parse(line) as string);
+    const [plain, stale, passed] = out.trim().split("\n").map((line) => JSON.parse(line) as string);
     expect(plain).not.toBe("marker");
-    expect(unvouched).not.toBe("marker");
+    expect(stale).not.toBe("marker");
     expect(passed).toBe("marker");
   });
 });

@@ -48,11 +48,13 @@ descriptors from the invocation. An invocation uses this to hand a provider a
 capability it already holds, such as a pipe to its own analysis worker.
 
 A declared descriptor is passed only when the launcher that opened it vouches
-for it, by listing its number in `DELIVERY_HARNESS_INHERITED_DESCRIPTORS`
-(for example `3,4`), and only when it is a pipe or socket. An open descriptor
-alone is not enough, because Bun and Node hold descriptors 3 and 4 themselves.
-Only the declaring provider receives them. No undeclared, unvouched or
-runtime-internal descriptor is ever passed.
+for that very pipe or socket in `DELIVERY_HARNESS_INHERITED_DESCRIPTORS`, as
+`<fd>:<dev>:<ino>` entries (for example `3:16777220:1234,4:16777220:1235`), and
+the descriptor's own identity matches. An open descriptor alone is not enough:
+Bun and Node hold descriptors 3 and 4 themselves, and a setting can outlive the
+descriptors it named. The provider's environment then states exactly what it
+received, and nothing when it received nothing. Only the declaring provider
+receives them, and no other descriptor is ever passed.
 
 The command exchanges one JSON document per stdout/stdin line. The documents
 and state transitions are the exact vendored

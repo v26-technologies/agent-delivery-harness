@@ -289,29 +289,44 @@ export interface OpenProviderRailProcessInput {
   readonly inheritDescriptors?: readonly InheritedDescriptor[];
 }
 
-/** The launcher that opened inherited descriptors names them here, as
- * comma-separated numbers ("3,4"). Bun and Node hold descriptors 3 and 4
- * themselves when nothing was inherited, so an open descriptor alone is no
- * evidence that it is the capability a provider declared. */
+/** The launcher that opened inherited descriptors names them here, each with
+ * the identity of the pipe or socket it opened: "3:<dev>:<ino>,4:<dev>:<ino>".
+ * Bun and Node hold descriptors 3 and 4 themselves when nothing was inherited,
+ * and a setting can outlive the descriptors it named, so a descriptor passes
+ * only when its own identity is the one vouched for. */
 export const INHERITED_DESCRIPTORS_ENV = "DELIVERY_HARNESS_INHERITED_DESCRIPTORS";
 
-/** Stdio for a rail provider: three pipes, then each descriptor that the
- * provider declares, the launcher vouches for in the invocation environment,
- * and that is a pipe or socket. Every other slot is "ignore", so no undeclared,
- * unvouched or runtime-internal descriptor is ever passed (V26-3314). */
-export function providerRailStdio(
+/** A descriptor's identity when it is a pipe or socket; undefined otherwise. */
+export function channelIdentity(fd: number): string | undefined {
+  try {
+    const stat = fstatSync(fd);
+    return stat.isFIFO() || stat.isSocket() ? `${stat.dev}:${stat.ino}` : undefined;
+  } catch { return undefined; }
+}
+
+/** Stdio and environment for a rail provider: three pipes, then each
+ * descriptor the provider declares whose identity the launcher vouched for.
+ * Every other slot is "ignore". The provider's environment then states
+ * exactly what it received, and nothing when it received nothing (V26-3314). */
+export function providerRailLaunch(
   declared: readonly InheritedDescriptor[] = [],
   env: NodeJS.ProcessEnv = {},
-  isChannel: (fd: number) => boolean = descriptorIsChannel,
-): ("pipe" | "ignore" | number)[] {
-  const vouched = new Set((env[INHERITED_DESCRIPTORS_ENV] ?? "").split(",").map((part) => part.trim()).filter((part) => /^[34]$/.test(part)).map(Number));
+  identify: (fd: number) => string | undefined = channelIdentity,
+): { stdio: ("pipe" | "ignore" | number)[]; env: NodeJS.ProcessEnv } {
+  const vouched = new Map<number, string>();
+  for (const entry of (env[INHERITED_DESCRIPTORS_ENV] ?? "").split(",")) {
+    const match = /^\s*([34]):(\d+:\d+)\s*$/.exec(entry);
+    if (match && !vouched.has(Number(match[1]))) vouched.set(Number(match[1]), match[2]!);
+  }
   const stdio: ("pipe" | "ignore" | number)[] = ["pipe", "pipe", "pipe"];
-  const last = Math.max(2, ...declared);
-  for (let fd = 3; fd <= last; fd++) stdio.push(declared.includes(fd as InheritedDescriptor) && vouched.has(fd) && isChannel(fd) ? fd : "ignore");
-  return stdio;
-}
-function descriptorIsChannel(fd: number): boolean {
-  try { const stat = fstatSync(fd); return stat.isFIFO() || stat.isSocket(); } catch { return false; }
+  const passed: string[] = [];
+  for (let fd = 3; fd <= Math.max(2, ...declared); fd++) {
+    const identity = declared.includes(fd as InheritedDescriptor) && vouched.has(fd) ? identify(fd) : undefined;
+    if (identity !== undefined && identity === vouched.get(fd)) { stdio.push(fd); passed.push(`${fd}:${identity}`); }
+    else stdio.push("ignore");
+  }
+  const { [INHERITED_DESCRIPTORS_ENV]: _vouched, ...rest } = env;
+  return { stdio, env: passed.length ? { ...rest, [INHERITED_DESCRIPTORS_ENV]: passed.join(",") } : rest };
 }
 
 const DEFAULT_PROVIDER_RAIL_DEADLINE_MS = 10 * 60_000;
@@ -387,10 +402,11 @@ async function settlesWithin(operation: Promise<unknown>, milliseconds: number):
 /** Opens the contract over newline-delimited JSON on a provider subprocess's stdio. */
 export function openProviderRailProcess(input: OpenProviderRailProcessInput): Promise<ProviderRailSession> {
   const [executable, ...args] = input.command;
+  const launch = providerRailLaunch(input.inheritDescriptors, input.env);
   const child = spawn(executable, args, {
     cwd: input.cwd,
-    env: input.env,
-    stdio: providerRailStdio(input.inheritDescriptors, input.env),
+    env: launch.env,
+    stdio: launch.stdio,
     shell: false,
   }) as ChildProcessWithoutNullStreams;
   // A deadline may destroy the child while a bounded stdin write is pending.
