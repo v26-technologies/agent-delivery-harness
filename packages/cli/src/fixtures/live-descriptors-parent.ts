@@ -17,26 +17,34 @@ require('readline').createInterface({input:process.stdin}).on('line',line=>{cons
  if(m.kind==='negotiate')console.log(JSON.stringify({kind:'negotiation',outcome:'supported',selectedVersion:'delivery-provider-rails/1',supportedVersions:['delivery-provider-rails/1']}));
  if(m.kind==='request')console.log(JSON.stringify({kind:'terminal',version:m.version,requestId:m.requestId,sequence:1,summary:'observed',outcome:'success'}));});`;
 
-const reports: unknown[] = [];
-for (const declared of [false, true]) {
-  const dir = await mkdtemp(path.join(tmpdir(), "live-descriptors-"));
-  try {
-    const git = (...args: string[]) => exec("git", args, { cwd: dir });
-    await git("init", "-q"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
-    await writeFile(path.join(dir, "source.ts"), "export const a=1;"); await writeFile(path.join(dir, "harness.config.ts"), "export default {};");
-    await git("add", "."); await git("-c", "commit.gpgsign=false", "commit", "-qm", "base"); await git("branch", "origin/main");
-    const config = defineHarnessConfig({ ...adopter, preparationCommands: [], preparationWiringPaths: ["harness.config.ts"],
-      providers: [{ id: "live.sensor", findingCodes: [], command: [process.execPath, "-e", provider], ...(declared ? { inheritDescriptors: [3] as const } : {}) }],
-      obligations: [{ ...adopter.obligations[0]!, id: "live.current", freshness: "live", providers: ["live.sensor"], activation: { kind: "always" }, humanWaiverAllowed: false, allowedResolutionKinds: ["satisfied_live_fact", "not_applicable"] }] });
-    const capture = await captureGitCandidate({ rootDir: dir, config, workspaceId: "test-workspace", computeIdentity: withDeliverableIdentity() });
-    if (!capture.ok) throw new Error(JSON.stringify(capture));
-    const result = await collectLiveProviderResults({ rootDir: dir, config, candidate: capture.candidate,
-      projection: await evaluateCandidateActivation({ rootDir: dir, config, candidate: capture.candidate }),
-      evidenceContext: { preparationFingerprint: await computePreparationFingerprint(dir, config), release: null },
-      env: { ...process.env, [INHERITED_DESCRIPTORS_ENV]: `3:${channelIdentity(3)}` } });
-    reports.push({ status: result.liveResults[0]?.status ?? null, ...JSON.parse(await readFile(path.join(dir, ".git/inherited"), "utf8")) });
-  } finally {
-    await rm(dir, { recursive: true, force: true });
+async function collect(env: NodeJS.ProcessEnv): Promise<unknown[]> {
+  const reports: unknown[] = [];
+  for (const declared of [false, true]) {
+    const dir = await mkdtemp(path.join(tmpdir(), "live-descriptors-"));
+    try {
+      const git = (...args: string[]) => exec("git", args, { cwd: dir });
+      await git("init", "-q"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
+      await writeFile(path.join(dir, "source.ts"), "export const a=1;"); await writeFile(path.join(dir, "harness.config.ts"), "export default {};");
+      await git("add", "."); await git("-c", "commit.gpgsign=false", "commit", "-qm", "base"); await git("branch", "origin/main");
+      const config = defineHarnessConfig({ ...adopter, preparationCommands: [], preparationWiringPaths: ["harness.config.ts"],
+        providers: [{ id: "live.sensor", findingCodes: [], command: [process.execPath, "-e", provider], ...(declared ? { inheritDescriptors: [3] as const } : {}) }],
+        obligations: [{ ...adopter.obligations[0]!, id: "live.current", freshness: "live", providers: ["live.sensor"], activation: { kind: "always" }, humanWaiverAllowed: false, allowedResolutionKinds: ["satisfied_live_fact", "not_applicable"] }] });
+      const capture = await captureGitCandidate({ rootDir: dir, config, workspaceId: "test-workspace", computeIdentity: withDeliverableIdentity() });
+      if (!capture.ok) throw new Error(JSON.stringify(capture));
+      const result = await collectLiveProviderResults({ rootDir: dir, config, candidate: capture.candidate,
+        projection: await evaluateCandidateActivation({ rootDir: dir, config, candidate: capture.candidate }),
+        evidenceContext: { preparationFingerprint: await computePreparationFingerprint(dir, config), release: null },
+        env: { ...env, [INHERITED_DESCRIPTORS_ENV]: `3:${channelIdentity(3)}` } });
+      reports.push({ status: result.liveResults[0]?.status ?? null, ...JSON.parse(await readFile(path.join(dir, ".git/inherited"), "utf8")) });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
+  return reports;
 }
-console.log(JSON.stringify(reports));
+
+async function main(): Promise<void> {
+  console.log(JSON.stringify(await collect(process.env)));
+}
+
+await main();
