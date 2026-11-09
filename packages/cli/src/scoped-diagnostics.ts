@@ -21,8 +21,9 @@ export interface ScopedDependencyDiagnostic {
 const setupPhases = ["materialization", "baseline-inventory", "dependencies", "post-dependency-inventory", "warm-base-wait", "clone", "pre-command-verification"] as const;
 /** How this attempt got the tree its command ran in, and what that cost up to the command.
  * `executed`: this attempt ran the setup (a tree it built, or the warm base it then cloned);
- * `reused`: the setup had already run (a clone of a warm base another check built, or the
- * worker's tree retained from its previous check). `clone` names the copy-on-write method, or says
+ * `reused`: the setup had already run (a clone of a warm base another check or the session's prewarm
+ * built, a prewarmed path-bound base taken as this worker's own tree, or the worker's tree retained
+ * from its previous check). `clone` names the copy-on-write method, or says
  * why each worker built its own tree: cloning is unavailable here, or the setup wrote its own path
  * into the tree (`path-bound`), or there is one worker (`not-used`). */
 export interface ScopedSetupDiagnostic {
