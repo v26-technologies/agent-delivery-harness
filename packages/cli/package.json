@@ -1,6 +1,6 @@
 {
   "name": "@agent-delivery-harness/cli",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "type": "module",
   "description": "Delivery harness CLI: admit, prepare, review-context, submit-evidence, gate, record, verify, check",
   "license": "FSL-1.1-ALv2",
@@ -13,7 +13,7 @@
     "node": ">=22.6.0"
   },
   "dependencies": {
-    "@agent-delivery-harness/kernel": "0.8.3"
+    "@agent-delivery-harness/kernel": "0.8.4"
   },
   "exports": {
     ".": "./src/index.ts"
