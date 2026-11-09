@@ -471,7 +471,8 @@ export class ScopedChecks {
         await previous;
         const started = performance.now();
         const snapshot = await this.buildSnapshot(profile, physicalSource, (phase, durationMs) => this.context.write(`prewarm ${profile.id}: ${phase} ${Math.round(durationMs)}ms`), undefined, signal);
-        await this.recordBuild(key, performance.now() - started);
+        // Recorded in the background: a base never waits on its timing.
+        this.timingWrites.push(this.recordBuild(key, performance.now() - started));
         return snapshot;
       })();
       this.prewarmTail = base.then(() => undefined, () => undefined);
@@ -480,11 +481,14 @@ export class ScopedChecks {
       base.catch(error => { if (!this.prewarming.signal.aborted) this.context.write(`prewarm ${profile.id}: setup failed (${error instanceof CheckSnapshotError ? error.code : "unclassified"}); its first check sets up itself`); });
     }
   }
-  /** Where the last successful build of each setup key's base is timed. Ordering only: no admission, gate
-   * or record reads it, and a missing or unreadable timing counts as no build time. */
+  /** Where the last successful prewarm of each setup key's base is timed, resolved once a session. Ordering
+   * only: no admission, gate or record reads it, and a missing or unreadable timing counts as no build time.
+   * A check-owned build is not timed: it follows a failed prewarm and may share the machine with the chain. */
+  private timings?: Promise<string>;
+  private readonly timingWrites: Promise<void>[] = [];
   private async timingPath(key: string): Promise<string> {
-    const storage = await resolveRecordStorage(this.context.rootDir, { storageNamespace: this.context.config.storageNamespace, leaf: "scoped-setup-timings" });
-    return path.join(storage.storageDir, `${digestCanonical({ gate: this.context.config.gateId, setup: key })}.json`);
+    const dir = await (this.timings ??= resolveRecordStorage(this.context.rootDir, { storageNamespace: this.context.config.storageNamespace, leaf: "scoped-setup-timings" }).then(storage => storage.storageDir));
+    return path.join(dir, `${digestCanonical({ gate: this.context.config.gateId, setup: key })}.json`);
   }
   private async lastBuild(key: string): Promise<number> {
     try {
@@ -493,12 +497,17 @@ export class ScopedChecks {
     } catch { return 0; }
   }
   private async recordBuild(key: string, buildMs: number): Promise<void> {
+    let temporary: string | undefined;
     try {
-      const file = await this.timingPath(key), temporary = `${file}.${randomUUID()}`;
+      const file = await this.timingPath(key);
+      temporary = `${file}.${randomUUID()}`;
       await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
       await writeFile(temporary, `${JSON.stringify({ version: "scoped-setup-timing/1", buildMs: Math.round(buildMs) })}\n`);
       await rename(temporary, file);
-    } catch { /* Timing orders prewarms; it cannot fail a setup. */ }
+    } catch {
+      // Timing orders prewarms; it cannot fail a setup, and leaves no partial file behind.
+      if (temporary) await rm(temporary, { force: true }).catch(() => undefined);
+    }
   }
   private prewarmTail: Promise<void> = Promise.resolve();
   private async acquireSnapshot(profile: ScopedExecutionProfile, lane: Lane, onDependencyResult?: SnapshotRequest["onDependencyResult"], physicalSource?: SnapshotRequest["physicalSource"], onSetup: (setup: AcquiredSetup) => void = () => {}): Promise<{ snapshot: CheckSnapshot; sharedOutputs: string[]; setup: AcquiredSetup }> {
@@ -525,8 +534,7 @@ export class ScopedChecks {
       let base = this.bases.get(key);
       if (!base) {
         executed = true;
-        const started = performance.now();
-        base = build(onDependencyResult).then(async snapshot => { await this.recordBuild(key, performance.now() - started); return snapshot; });
+        base = build(onDependencyResult);
         this.shareBase(key, base);
       }
       this.release(key);
@@ -861,6 +869,7 @@ export class ScopedChecks {
     await Promise.all(this.executionTails.values());
     // No check needs a base still setting up now; stop rather than wait for it.
     this.prewarming.abort();
+    await Promise.all(this.timingWrites);
     for (const snapshots of this.workers) { for (const snapshot of snapshots.values()) await snapshot.cleanup(); snapshots.clear(); }
     const bases = [...this.bases.values()]; this.bases.clear();
     for (const base of bases) await (await base.catch(() => undefined))?.cleanup();
