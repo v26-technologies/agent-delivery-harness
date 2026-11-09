@@ -2263,3 +2263,18 @@ it("providers beside the checks start only once every scoped check has taken a w
   expect(beside).toBeGreaterThan(Math.min(...started) + 600);
   expect(beside).toBeLessThan((await at(f.shared, "checks-done"))!);
 }, 90000);
+it("under failFast a check failing before every check has a worker leaves the providers beside the checks unstarted", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // Three checks on two workers: c1 fails at once while c2 runs, so the halted pool hands out c3 after the cancel.
+  const f = await poolFixture(["1", "1", "1"], 2, id => id === "c1" ? "process.exit(3)" : "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1500)");
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true } });
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const artifacts = f.runtime.artifacts!, allocate = artifacts.allocateRunRoot.bind(artifacts), allocated: string[] = [];
+  (artifacts as { allocateRunRoot: typeof allocate }).allocateRunRoot = async input => { allocated.push(input.providerId); return allocate(input); };
+  expect(await f.run("gate")).toBe(1);
+  expect(f.out.join("\n")).toMatch(/^interrupted live\.beside: check_cancelled after check\.c1 failed$/m);
+  // Never invoked at all: no run root, no process.
+  expect(allocated).not.toContain("live.beside");
+  expect(await at(f.shared, "beside-start")).toBeUndefined();
+}, 90000);
