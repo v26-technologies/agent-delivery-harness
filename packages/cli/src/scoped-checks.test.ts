@@ -2109,23 +2109,37 @@ it("failFast's cancel reaches only the rail session the gate opened for that pro
   expect(sessions[0]!.sent.map(m => (m as { kind: string }).kind)).toEqual(["negotiate", "request", "cancel"]);
   expect(sessions[0]!.closed).toBe(true);
 }, 90000);
-it.each(["passing", "failing"] as const)("the verdict and every record on a %s candidate are the same whether the provider runs beside the checks or after them", async outcome => {
+it.each(["passing", "failing"] as const)("the verdict, the output in order and every record on a %s candidate are the same whether a provider runs beside the checks or after them", async outcome => {
   if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
-  const verdicts: { code: number; resolutions: string[]; blockers: string[]; records: string[] }[] = [];
+  const runs: { code: number; lines: string[]; records: string[] }[] = [];
   for (const independent of [false, true]) {
     const f = await poolFixture(["1", "2"], 2, id => outcome === "failing" && id === "c2" ? "process.exit(3)" : "");
-    withLiveProviders(f, [{ id: "live.sensor", command: liveProvider(f.shared, "sensor", 100), independent }]);
+    // An undeclared provider first, then a declared one: serial applies them in that order, and so must the gate.
+    withLiveProviders(f, [{ id: "live.first", command: liveProvider(f.shared, "first", 50), independent: false }, { id: "live.second", command: liveProvider(f.shared, "second", 100), independent }]);
     expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
     const code = await f.run("gate");
-    const text = f.out.join("\n") + "\n" + f.err.join("\n");
+    // Timing and attempt identity aside, every line the gate printed, in its order.
+    const lines = [...f.out, ...f.err].flatMap(line => line.split("\n")).filter(line => !/^(snapshot|setup|prewarm|checking) /.test(line)).map(line => normalized(f, line));
     const recordDir = path.join(f.dir, ".git/delivery-harness/records");
     const records = (await (await import("node:fs/promises")).readdir(recordDir).catch(() => [] as string[])).map(name => name.replace(/--[0-9a-f]{64}\.json$/, "")).sort();
-    verdicts.push({ code, resolutions: (/admitted: (.*)$/m.exec(text)?.[1] ?? "").split(", ").sort(), blockers: [...text.matchAll(/\[([a-z_]+)\]/g)].map(m => m[1]!).sort(), records });
+    runs.push({ code, lines, records });
   }
-  expect(verdicts[1]).toEqual(verdicts[0]);
-  expect(verdicts[0]!.code).toBe(outcome === "passing" ? 0 : 1);
-  // Both shapes ran the checks and the provider: the comparison is not between two empty runs.
-  expect(verdicts[0]!.records.filter(name => name.includes("check.c")).length).toBe(outcome === "passing" ? 2 : 1);
-  if (outcome === "passing") expect(verdicts[0]!.resolutions).toContain("live.sensor.current=satisfied_live_fact");
-  else expect(verdicts[0]!.blockers.length).toBeGreaterThan(0);
+  expect(runs[1]).toEqual(runs[0]);
+  expect(runs[0]!.code).toBe(outcome === "passing" ? 0 : 1);
+  // Both shapes ran the checks and both providers: the comparison is not between two empty runs.
+  expect(runs[0]!.records.filter(name => name.includes("check.c")).length).toBe(outcome === "passing" ? 2 : 1);
+  if (outcome === "passing") expect(runs[0]!.lines.join("\n")).toMatch(/live\.first\.current=satisfied_live_fact.*live\.second\.current=satisfied_live_fact|live\.second\.current=satisfied_live_fact.*live\.first\.current=satisfied_live_fact/);
 }, 180000);
+it("a declared provider that an existential obligation shares with another stays serial, and is never started when the other satisfies it", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.one", command: liveProvider(f.shared, "one", 0), independent: false }, { id: "live.two", command: liveProvider(f.shared, "two", 0), independent: true }]);
+  // One obligation either provider may satisfy, in place of the two the helper made.
+  const template = f.config.obligations.find(o => o.id === "live.one.current")!;
+  f.setConfig({ ...f.config, obligations: [...f.config.obligations.filter(o => !o.id.startsWith("live.")), { ...template, id: "live.either", providers: ["live.one", "live.two"], providerPolicy: "existential" }] } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  expect(f.out.join("\n")).toMatch(/live\.either=satisfied_live_fact/);
+  expect(await at(f.shared, "one-start")).toBeDefined();
+  expect(await at(f.shared, "two-start")).toBeUndefined();
+}, 90000);

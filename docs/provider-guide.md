@@ -46,9 +46,11 @@ A command provider that reads no scoped check's attempts, records or outputs may
 declare `independentOfScopedChecks: true`. The declaration is only `true`, and only
 on a provider with `command`. When the gate runs scoped checks on more than one
 worker, it then starts that provider's live attempt while those checks run, rather
-than after them, and admits once for the checks and every provider that ran beside
-them. Results apply in request order, exactly as the serial loop applies them, so
-the verdict and every record are the same either way.
+than after them. The outcome is held until the gate reaches that provider in its
+usual order, one provider at a time with an admission after each. So the verdict,
+the output and every record are the same either way. A provider shares an
+existential obligation with another provider when either of them may satisfy it. A
+declared provider in that position still waits, because the gate may never need it.
 
 Under `scopedExecution.failFast`, the first scoped failure cancels each provider
 still running beside the checks, through the rail's own `cancel`. A provider is

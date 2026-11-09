@@ -59,6 +59,7 @@ async function providerAdmission(
 
   const liveResults: LiveProviderResult[] = options.includeInjectedLiveResults ? [...(context.liveResults ?? [])] : [];
   const invokeProvider = context.invokeProvider;
+  const besideOutcomes = new Map<string, { result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }>();
   const attempted = new Set<string>();
   const attemptBlockers: Blocker[] = [];
   let admission = await admit(input, admissionOptions);
@@ -91,12 +92,15 @@ async function providerAdmission(
     const scoped = session !== undefined && session.concurrency > 1 ? [...requested].filter(([id]) => context.config.providers.find(p => p.id === id)!.check?.scope) : [];
     if (session !== undefined && scoped.length > 0) {
       for (const [id] of scoped) attempted.add(id);
-      // Live rail providers that declare they read no scoped result run alongside the scoped checks, not after.
+      // Live rail providers that declare they read no scoped result start alongside the scoped checks. Each outcome
+      // waits for the serial loop below to reach that provider, which applies it exactly as if it had run then: same
+      // order, same admission between each. A provider an existential obligation shares with another is left to the
+      // loop, which may never need it.
+      const shared = (id: string) => context.config.obligations.some(o => (o.providerPolicy ?? "all") === "existential" && o.providers.includes(id) && o.providers.length > 1);
       const beside = invokeProvider === undefined ? [] : [...requested].filter(([id, request]) => {
         const registration = context.config.providers.find(p => p.id === id)!;
-        return registration.independentOfScopedChecks === true && registration.command !== undefined && request.needsLiveResult && !request.requiresEvidence;
+        return registration.independentOfScopedChecks === true && registration.command !== undefined && request.needsLiveResult && !request.requiresEvidence && !shared(id);
       });
-      for (const [id] of beside) attempted.add(id);
       const cancelBeside = new AbortController();
       let cancelledAfter: string | undefined;
       const besideRuns = beside.map(([providerId, request]) => invokeProvider!({ providerId, requiresEvidence: false, signal: cancelBeside.signal,
@@ -109,26 +113,15 @@ async function providerAdmission(
           failed => { cancelledAfter = failed; cancelBeside.abort(); });
       } catch (error) { cancelBeside.abort(); await Promise.all(besideRuns); throw error; }
       const settled = await Promise.all(besideRuns);
+      // An interrupted invocation is an interruption, not a scoped failure's cancellation.
+      if (context.signal?.aborted) throw new CliInterruption();
       attemptBlockers.push(...failures.map(scopedCheckBlocker));
       failedFast = failFast && failures.length > 0;
-      // In request order, whatever order they finished in, exactly as the serial loop would apply them.
-      for (const [index, [providerId, request]] of beside.entries()) {
-        const outcome = settled[index]!;
-        if (cancelledAfter !== undefined) {
-          // Stopped, or finished too late to count: never reported as passed, and its obligation stays unmet.
-          context.write(`interrupted ${providerId}: check_cancelled after ${cancelledAfter} failed`);
-          continue;
-        }
-        if ("error" in outcome) throw outcome.error;
-        const result = outcome.result;
-        if (result === undefined) continue;
-        if (result.kind === "interrupted") throw new CliInterruption("Provider invocation interrupted before a trustworthy terminal outcome.");
-        if (result.kind === "blocked") {
-          attemptBlockers.push(...result.blockers);
-          if (request.needsLiveResult) liveResults.push({ providerId, runId: result.runId, status: "failed", findings: [] });
-        } else if (request.needsLiveResult) liveResults.push(result.liveResult);
+      for (const [index, [providerId]] of beside.entries()) {
+        // Stopped, or finished too late to count: never reported as passed, and its obligation stays unmet.
+        if (cancelledAfter !== undefined) context.write(`interrupted ${providerId}: check_cancelled after ${cancelledAfter} failed`);
+        else besideOutcomes.set(providerId, settled[index]!);
       }
-      // One admission for the scoped checks and every provider that ran beside them.
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }
@@ -154,7 +147,10 @@ async function providerAdmission(
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
     }
-    const result = await context.invokeProvider?.({
+    // A provider that already ran beside the scoped checks takes its outcome here, where serial would have run it.
+    const early = besideOutcomes.get(providerId);
+    if (early && "error" in early) throw early.error;
+    const result = early ? early.result : await context.invokeProvider?.({
       providerId,
       requiresEvidence: request.requiresEvidence,
       payload: {
