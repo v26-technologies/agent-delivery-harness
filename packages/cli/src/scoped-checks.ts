@@ -387,7 +387,7 @@ export class ScopedChecks {
    * yet started never starts and one running has its process group signalled, and both are recorded
    * `interrupted` with `check_cancelled` and left out of the returned failures.
    */
-  async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[]): Promise<CheckSnapshotError[]> {
+  async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[], onFailFast?: (failed: string) => void): Promise<CheckSnapshotError[]> {
     const failures = new Map<string, CheckSnapshotError>();
     const failFast = this.context.config.scopedExecution?.failFast === true;
     const running = new Map<string, AbortController>(), unstarted: string[] = [];
@@ -404,6 +404,7 @@ export class ScopedChecks {
         failures.set(id, error);
         if (failFast && firstFailure === undefined) {
           firstFailure = id;
+          onFailFast?.(id);
           for (const [other, controller] of running) if (other !== id) controller.abort();
           // A worker waiting for a base takes the rest now, which never start.
           this.wakePools();

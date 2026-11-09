@@ -42,6 +42,21 @@ not supplied a live result or retained evidence, `gate` and `record` invoke the
 command at their existing command boundary. Repositories whose registrations
 omit `command` keep the manual flow described in the rest of this guide.
 
+A command provider that reads no scoped check's attempts, records or outputs may
+declare `independentOfScopedChecks: true`. The declaration is only `true`, and only
+on a provider with `command`. When the gate runs scoped checks on more than one
+worker, it then starts that provider's live attempt while those checks run, rather
+than after them, and admits once for the checks and every provider that ran beside
+them. Results apply in request order, exactly as the serial loop applies them, so
+the verdict and every record are the same either way.
+
+Under `scopedExecution.failFast`, the first scoped failure cancels each provider
+still running beside the checks, through the rail's own `cancel`. A provider is
+reported `interrupted <id>: check_cancelled after <failed id> failed`, and its
+result never counts, even if it finished first. A provider that does not declare
+the field keeps waiting for the scoped checks, as before. The harness judges
+dependence only by the declaration, never by reading the provider's code.
+
 A command provider gets plain stdio. It may also declare
 `inheritDescriptors: [3, 4]` (or just one of them, ascending) to inherit those
 descriptors from the invocation. An invocation uses this to hand a provider a

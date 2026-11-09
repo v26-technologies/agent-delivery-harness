@@ -210,6 +210,9 @@ export interface ProviderRegistration {
    * by number: only 3 and 4, ascending, each at most once. A provider that does
    * not declare them gets plain stdio. Requires `command`. */
   readonly inheritDescriptors?: readonly InheritedDescriptor[];
+  /** Declares that this rail provider reads no scoped check's attempts, records or outputs, so the gate may
+   * run it while its scoped checks run instead of after them. Only `true`, and only with `command`. */
+  readonly independentOfScopedChecks?: true;
   /** Deterministic bounded check executed by the product, not a provider protocol. */
   readonly check?: { readonly command: NonEmptyTuple<string>; readonly timeoutMs: number; readonly outputs?: readonly string[]; readonly scope?: ScopedCheckDefinition; readonly installedData?: InstalledDataConsumerDefinition; readonly physicalSource?: PhysicalSourceDefinition };
 }
@@ -1090,7 +1093,7 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
           sound = false;
           return;
         }
-        checkClosed(findings, at, entry, ["id", "findingCodes", "command", "check", "inheritDescriptors"]);
+        checkClosed(findings, at, entry, ["id", "findingCodes", "command", "check", "inheritDescriptors", "independentOfScopedChecks"]);
         const id = readString(findings, `${at}.id`, entry["id"], { pattern: ID_PATTERN, describe: "a provider id" });
         const findingCodes = readStringArray(findings, `${at}.findingCodes`, entry["findingCodes"], {
           pattern: FINDING_CODE_PATTERN,
@@ -1146,8 +1149,13 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
             sound = false;
           } else inheritDescriptors = value as InheritedDescriptor[];
         }
+        const independent = entry["independentOfScopedChecks"];
+        if (independent !== undefined && (independent !== true || command === undefined)) {
+          findings.add("config_invalid_member", `${at}.independentOfScopedChecks`, "may only be true, and only on a provider with a command");
+          sound = false;
+        }
         if (id === undefined || findingCodes === undefined) sound = false;
-        else registrations.push({ id, findingCodes, ...(command === undefined ? {} : { command }), ...(check === undefined ? {} : { check }), ...(inheritDescriptors === undefined ? {} : { inheritDescriptors }) });
+        else registrations.push({ id, findingCodes, ...(command === undefined ? {} : { command }), ...(check === undefined ? {} : { check }), ...(inheritDescriptors === undefined ? {} : { inheritDescriptors }), ...(independent === true ? { independentOfScopedChecks: true as const } : {}) });
       });
       if (sound) providers = registrations;
     }

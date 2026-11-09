@@ -135,6 +135,8 @@ export interface CommandContext {
     readonly providerId: string;
     readonly payload: Readonly<Record<string, unknown>>;
     readonly requiresEvidence: boolean;
+    /** Cancels this one attempt through the rail, as an interruption of the invocation would. */
+    readonly signal?: AbortSignal;
   }) => Promise<ProviderRailInvocationResult | undefined>;
   /** Emits one line of operator-facing output to stdout. */
   readonly write: (text: string) => void;
@@ -530,7 +532,7 @@ async function runConfiguredCommand(
         ? { promptForWaiver: observation?.prompt(runtime.promptForWaiver) ?? runtime.promptForWaiver }
         : {}),
       ...(runtime.liveResults === undefined ? {} : { liveResults: runtime.liveResults }),
-      invokeProvider: async ({ providerId, payload, requiresEvidence }) => {
+      invokeProvider: async ({ providerId, payload, requiresEvidence, signal: attemptSignal }) => {
         const provider = config.providers.find((registration) => registration.id === providerId);
         if (provider?.command === undefined) return undefined;
         const command = provider.command;
@@ -583,7 +585,7 @@ async function runConfiguredCommand(
                     ...wiring.storageOptions,
                   },
                 ),
-              signal: runtime.signal ?? interruptController?.signal,
+              signal: [runtime.signal ?? interruptController?.signal, attemptSignal].filter((s): s is AbortSignal => s !== undefined).reduce<AbortSignal | undefined>((one, other) => one ? AbortSignal.any([one, other]) : other, undefined),
               cancellationId: randomUUID(),
             },
           );

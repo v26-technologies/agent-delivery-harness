@@ -1206,3 +1206,18 @@ describe("inherited provider descriptors (V26-3314)", () => {
     expectOnly(withDescriptors([3, 4], null), "config_invalid_member");
   });
 });
+
+describe("a provider declared independent of scoped checks (V26-3329)", () => {
+  const declaring = (independentOfScopedChecks: unknown, command: unknown = ["bun", "provider.ts"]) =>
+    withInput((input) => { input.providers[0] = { ...input.providers[0], ...(command === null ? {} : { command }), independentOfScopedChecks }; });
+  it("accepts true on a rail provider, and keeps an undeclared provider free of it", () => {
+    expect(define(declaring(true)).providers[0]?.independentOfScopedChecks).toBe(true);
+    expect(define(withInput(() => {})).providers[0]).not.toHaveProperty("independentOfScopedChecks");
+  });
+  it.each([[false], ["true"], [1], [null]])("refuses independentOfScopedChecks %j", (value) => {
+    expectOnly(declaring(value), "config_invalid_member");
+  });
+  it("refuses the declaration on a provider with no rail command", () => {
+    expectOnly(declaring(true, null), "config_invalid_member");
+  });
+});
