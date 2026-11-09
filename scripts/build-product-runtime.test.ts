@@ -189,6 +189,8 @@ it.each([
   ["cli", "export const load = configPath => import(configPath);", "loads configPath through a computed specifier"],
   ["cli-api", "export const load = () => eval('x');", "loads eval('x') through a computed specifier"],
   ["cli", "export const load = (x, configPath) => import(x ? pathToFileURL(configPath).href : x);", "loads x ? pathToFileURL(configPath).href : x through"],
+  ["cli", "export const load = (x, configPath) => import(pathToFileURL(configPath).href + x);", "loads pathToFileURL(configPath).href + x through"],
+  ["cli", "export const load = (x, configPath) => import(x + pathToFileURL(configPath).href);", "loads x + pathToFileURL(configPath).href through"],
   ["kernel", loader, "kernel.mjs has 1 config loaders, expected 0"],
   ["cli", literal, "cli.mjs has 0 config loaders, expected 1"],
   ["cli-api", `${loader}\n${loader.replace("load", "again")}`, "cli-api.mjs has 2 config loaders, expected 1"],
