@@ -226,6 +226,32 @@ describe("base focused", () => {
     } finally { process.env["PATH"] = original; }
   });
 
+  it("writes no record after an interrupt during the read, on a candidate whose gate passed", async () => {
+    // The boundary answers any abort with 130 once a command returns, so the exit code alone
+    // can't show the posture's own check: a record written before that return can.
+    const f = await fixture();
+    expect((await f.cli("prepare")).code).toBe(0);
+    const gated = await f.cli("gate");
+    expect(gated.code, gated.stderr).toBe(0);
+    const recordPath = await f.recordPath();
+    const bin = path.join(f.root, "shim"); await mkdir(bin);
+    const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in\n  *" ls-remote "*) sleep 120 ;;\nesac\nexec "${real}" "$@"\n`);
+    await chmod(path.join(bin, "git"), 0o755);
+    const original = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${original}`;
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 300);
+      expect(await runCli(["record"], { ...f.runtime, signal: controller.signal })).toBe(130);
+    } finally { process.env["PATH"] = original; }
+    expect(existsSync(recordPath)).toBe(false);
+    // The control: the same record, uninterrupted, writes the record there.
+    const recorded = await f.cli("record");
+    expect(recorded.code, recorded.stderr).toBe(0);
+    expect(existsSync(recordPath)).toBe(true);
+  });
+
   it("gates, by the real command, from a subdirectory holding a committed bare layout", async () => {
     const f = await fixture();
     await f.publish(declaration("gate"));
@@ -433,5 +459,90 @@ describe("a baseRef moved to a branch that publishes itself", () => {
     const { f } = await setUp();
     await writeFile(path.join(f.repo, "harness.config.ts"), configText(f, `const baseRef = "origin/self";`));
     await expectGated(f);
+  });
+});
+
+describe("the directory a command runs from", () => {
+  /** One invocation from another directory, with the fixture's runtime otherwise. */
+  const cliIn = async (f: Awaited<ReturnType<typeof fixture>>, cwd: string, ...args: string[]) => {
+    const out: string[] = [], err: string[] = [];
+    const code = await runCli(args, { ...f.runtime, cwd, stdout: text => out.push(text), stderr: text => err.push(text) });
+    return { code, stdout: out.join(""), stderr: err.join("") };
+  };
+
+  /** A second published repository whose base declares focused, as a nested route would read it. */
+  const focusedElsewhere = async () => {
+    const other = await fixture();
+    await other.publish(declaration("focused", "Declared by another repository."));
+    return other;
+  };
+
+  /**
+   * Gated from `dir` with the root's base declaring focused: stdout empty, and
+   * stderr the `posture_unreadable` line naming the directory, then the command's
+   * own blocker: byte for byte what it gives there under a gate base, since what
+   * the base declares is never read.
+   */
+  const expectRefusedIn = async (f: Awaited<ReturnType<typeof fixture>>, dir: string) => {
+    await f.publish(declaration("gate"));
+    const gated = await cliIn(f, dir, "verify");
+    const tip = await f.publish(declaration("focused"));
+    expectFocused(await f.cli("verify"), tip);
+    const result = await cliIn(f, dir, "verify");
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    const [first, ...rest] = result.stderr.split("\n");
+    const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(first).toMatch(new RegExp(`^posture_unreadable: ${escaped(`${DELIVERY_POSTURE_PATH} on origin/main could not be read: ${dir} is not a repository root it may be read from: `)}[^;]+; treating the base as gate\\.$`));
+    expect(rest[0]).toMatch(/^\[[a-z_]+\] /);
+    expect(rest.join("\n")).not.toMatch(/posture|focused/);
+    expect(result).toEqual(gated);
+  };
+
+  it("verify from a plain subdirectory is gated, naming it ahead of the command's blocker", async () => {
+    const f = await fixture();
+    const sub = path.join(f.repo, "packages"); await mkdir(sub);
+    await expectRefusedIn(f, sub);
+  });
+
+  it("verify from a nested repository whose origin declares focused is gated the same way", async () => {
+    const f = await fixture();
+    const other = await focusedElsewhere();
+    const nested = path.join(f.repo, "nested");
+    await f.git("clone", "-q", other.remote, nested);
+    await expectRefusedIn(f, nested);
+  });
+
+  it("verify from an initialised submodule whose origin declares focused is gated the same way", async () => {
+    const f = await fixture();
+    const other = await focusedElsewhere();
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await expectRefusedIn(f, path.join(f.repo, "sub"));
+  });
+
+  it("verify through an untracked gitfile pointing at a repository that declares focused is gated the same way", async () => {
+    const f = await fixture();
+    const other = await focusedElsewhere();
+    const pkg = path.join(f.repo, "pkg"); await mkdir(pkg);
+    await writeFile(path.join(pkg, ".git"), `gitdir: ${path.join(other.repo, ".git")}\n`);
+    await expectRefusedIn(f, pkg);
+  });
+
+  it("verify from a linked worktree nested under the root exits 0 with the focused outcome", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0001");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    expectFocused(await cliIn(f, lane, "verify"), tip);
+  });
+
+  it("writes nothing for a refusal the base causes, from the root", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.git("remote", "set-url", "origin", path.join(f.root, "gone.git"));
+    await f.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
+    const result = await f.cli("verify");
+    expect(result.code).toBe(1);
+    expect(result.stdout + result.stderr).not.toMatch(/posture|focused/);
   });
 });

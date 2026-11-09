@@ -26,9 +26,19 @@
  * bare layout committed there as the repository, with its own config and refs
  * answering every question here. So only an explicit bare repository is honoured.
  *
+ * WHY ONLY FROM THE REPOSITORY ROOT. From a subdirectory, the repository that
+ * answers need not be the candidate's: a real nested repository, an initialised
+ * submodule or an untracked gitfile each brings its own `origin`. And a git older
+ * than 2.38 ignores `safe.bareRepository`, so a bare layout would answer too. So
+ * the directory must be its work tree's root, not a submodule's, and not nested
+ * in another repository's work tree, unless every enclosing repository shares its
+ * git directory, as a linked worktree nested in its own main checkout does.
+ *
  * Everything that can't be read resolves to `gate`. This never rejects.
  */
 import { spawn } from "node:child_process";
+import { lstat, realpath } from "node:fs/promises";
+import path from "node:path";
 import { scrubbedEnvironment } from "./candidate.ts";
 
 export const DELIVERY_POSTURE_PATH = ".agents/delivery-posture.json";
@@ -142,12 +152,49 @@ function boundedGit(args: readonly string[], cwd: string, env: Record<string, st
  */
 const BLANK = /^[\s\x1c-\x1f\x85]*$/;
 
+/**
+ * How deep a declaration may nest arrays and objects, the top-level object being
+ * depth 1. No declared member needs depth, and a decoder's own limit differs by
+ * language and version, so each reader measures the text before it parses.
+ */
+const MAX_DEPTH = 64;
+
+const QUOTE = 0x22, BACKSLASH = 0x5c, OPEN_ARRAY = 0x5b, CLOSE_ARRAY = 0x5d, OPEN_OBJECT = 0x7b, CLOSE_OBJECT = 0x7d;
+
+/**
+ * Whether more than `MAX_DEPTH` arrays and objects are open at once, outside
+ * strings. A string starts and ends at an unescaped `"`, and inside one a `\`
+ * escapes exactly the next character. Malformed text is the parser's to refuse.
+ */
+function nestsTooDeep(text: string): boolean {
+  let depth = 0, inString = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const unit = text.charCodeAt(i);
+    if (inString) {
+      if (unit === BACKSLASH) i += 1;
+      else if (unit === QUOTE) inString = false;
+    } else if (unit === QUOTE) inString = true;
+    else if (unit === OPEN_ARRAY || unit === OPEN_OBJECT) {
+      depth += 1;
+      if (depth > MAX_DEPTH) return true;
+    } else if (unit === CLOSE_ARRAY || unit === CLOSE_OBJECT) depth -= 1;
+  }
+  return false;
+}
+
 /** The declaration's verdict from its bytes, or why it didn't take. */
 function parseDeclaration(bytes: Buffer): { readonly posture: DeliveryPosture; readonly reason: string } | { readonly malformed: string } {
-  let parsed: unknown;
+  let text: string;
   try {
     // `ignoreBOM` keeps a byte-order mark as a character, and `JSON.parse` refuses it.
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return { malformed: "it is not valid UTF-8 JSON" };
+  }
+  if (nestsTooDeep(text)) return { malformed: `it nests deeper than ${MAX_DEPTH} levels` };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
   } catch {
     return { malformed: "it is not valid UTF-8 JSON" };
   }
@@ -168,6 +215,87 @@ const unreadable = (baseRef: string, why: string): DeliveryPostureResult => ({
   baseTipSha: null,
   code: "posture_unreadable",
 });
+
+/** The results refused because the directory was not a repository's root, which a caller may report. */
+const notAtRoot = new WeakSet<DeliveryPostureResult>();
+
+/**
+ * Whether this result is the refusal of a directory that is not its repository's
+ * root. Its shape is that of any other `posture_unreadable`, so a caller that
+ * reports only this case can tell it from one the base caused.
+ */
+export function deliveryPostureRefusedOutsideRoot(result: DeliveryPostureResult): boolean {
+  return notAtRoot.has(result);
+}
+
+/** A path as the file system names it, symlinks followed, or undefined where it doesn't exist. */
+async function canonical(target: string): Promise<string | undefined> {
+  try { return await realpath(target); } catch { return undefined; }
+}
+
+/**
+ * Whether a path may exist, of any type, as `lstat` sees it. Only "no such
+ * entry" is an answer of no; any other failure counts as yes, so git is asked.
+ */
+async function mayExist(target: string): Promise<boolean> {
+  try { await lstat(target); return true; } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
+  }
+}
+
+/**
+ * Whether git could take this directory for a repository: it holds a `.git`
+ * entry of any kind, or it has the shape of a git directory itself (`HEAD`,
+ * `objects` and `refs`), as a bare layout does.
+ */
+async function couldBeRepository(dir: string): Promise<boolean> {
+  const [dotGit, ...gitDirectory] = await Promise.all([".git", "HEAD", "objects", "refs"].map(name => mayExist(path.join(dir, name))));
+  return dotGit === true || gitDirectory.every(Boolean);
+}
+
+/**
+ * Why the directory is not a repository root the posture may be read from, or
+ * undefined where it is one. Each condition fails closed: a git that fails,
+ * times out or prints something else refuses, except where git finds no
+ * repository at all above the directory.
+ */
+async function whyNotRoot(rootDir: string, git: GitRunner, gitIn: (cwd: string) => GitRunner): Promise<string | undefined> {
+  const directory = await canonical(rootDir);
+  if (directory === undefined) return "it does not exist";
+  const top = await git(["rev-parse", "--show-toplevel"], LOCAL_TIMEOUT_MS);
+  if (top.exitCode !== 0) return "it is not in a work tree";
+  const topText = top.stdout.toString("utf8").replace(/\n$/, "");
+  // An empty answer canonicalises to nothing, so it refuses too.
+  if (await canonical(topText) !== directory) return "it is not its work tree's root";
+  const superproject = await git(["rev-parse", "--show-superproject-working-tree"], LOCAL_TIMEOUT_MS);
+  if (superproject.exitCode !== 0 || superproject.stdout.length !== 0) return "it is a submodule's work tree";
+  const commonDir = async (run: GitRunner, cwd: string): Promise<string | undefined> => {
+    const listed = await run(["rev-parse", "--git-common-dir"], LOCAL_TIMEOUT_MS);
+    const text = listed.stdout.toString("utf8").replace(/\n$/, "");
+    if (listed.exitCode !== 0 || text === "") return undefined;
+    return canonical(path.resolve(cwd, text));
+  };
+  const own = await commonDir(git, directory);
+  if (own === undefined) return "its git directory did not read";
+  const nested = "it is nested in another repository's work tree";
+  // The parent as the file system has it, as `git -C <dir>/..` would reach it.
+  const parent = path.dirname(directory);
+  const parentGit = gitIn(parent);
+  const enclosing = await parentGit(["rev-parse", "--is-inside-work-tree"], LOCAL_TIMEOUT_MS);
+  // A git that never ran or was stopped told nothing; one that found no repository is the walk's to settle.
+  if (enclosing.exitCode === -1) return nested;
+  if (enclosing.exitCode === 0 && enclosing.stdout.toString("utf8").trim() === "true" && await commonDir(parentGit, parent) !== own) return nested;
+  // Every ancestor git could take for a repository, not only the parent's: a worktree of a nested clone
+  // shares its parent's git directory, and a layout git refuses to open hides what encloses it from the
+  // parent's own answer. Each must read, and be the directory's own repository.
+  for (let ancestor = parent; ; ancestor = path.dirname(ancestor)) {
+    // The directory's own git directory encloses it where a worktree sits inside its bare repository,
+    // which git, told to honour only an explicit bare repository, would refuse to read from inside.
+    if (ancestor !== own && await couldBeRepository(ancestor) && await commonDir(gitIn(ancestor), ancestor) !== own) return nested;
+    if (path.dirname(ancestor) === ancestor) return undefined;
+  }
+}
 
 /**
  * What one exact ref holds: an object, nothing, or `undefined` where git failed.
@@ -238,9 +366,16 @@ export async function resolveDeliveryPosture(input: ResolveDeliveryPostureInput)
   const networkTimeoutMs = input.networkTimeoutMs ?? DELIVERY_POSTURE_NETWORK_TIMEOUT_MS;
   const git: GitRunner = (args, timeoutMs) => boundedGit(args, rootDir, localEnvironment(), timeoutMs, signal);
   const network: GitRunner = (args, timeoutMs) => boundedGit(args, rootDir, networkEnvironment(), timeoutMs, signal);
+  const gitIn = (cwd: string): GitRunner => (args, timeoutMs) => boundedGit(args, cwd, localEnvironment(), timeoutMs, signal);
   try {
     const named = /^origin\/(.+)$/.exec(baseRef)?.[1];
     if (named === undefined) return unreadable(baseRef, "the base does not name origin/<branch>");
+    const notRoot = await whyNotRoot(rootDir, git, gitIn);
+    if (notRoot !== undefined) {
+      const refused = unreadable(baseRef, `${rootDir} is not a repository root it may be read from: ${notRoot}`);
+      notAtRoot.add(refused);
+      return refused;
+    }
     const url = await network(["config", "--get", "remote.origin.url"], LOCAL_TIMEOUT_MS);
     if (url.exitCode !== 0 || url.stdout.toString("utf8").trim() === "") return unreadable(baseRef, "origin is not a configured remote");
     const branch = await defaultBranch(git, network, networkTimeoutMs);

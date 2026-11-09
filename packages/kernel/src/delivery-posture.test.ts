@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -7,8 +9,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DELIVERY_POSTURE_NETWORK_TIMEOUT_MS,
   DELIVERY_POSTURE_PATH,
+  deliveryPostureRefusedOutsideRoot,
   resolveDeliveryPosture,
 } from "./index.ts";
+
+// lstat passes through unless a row names a path whose lstat should fail with some error other than absence.
+const lstatFails = vi.hoisted(() => new Map<string, string>());
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...original,
+    lstat: (async (target: string, ...rest: unknown[]) => {
+      const code = lstatFails.get(String(target));
+      if (code !== undefined) throw Object.assign(new Error(`${code}: lstat '${String(target)}'`), { code });
+      return (original.lstat as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof original.lstat,
+  };
+});
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
@@ -18,6 +35,7 @@ let originalPath: string | undefined;
 beforeEach(() => { originalPath = process.env["PATH"]; });
 afterEach(async () => {
   process.env["PATH"] = originalPath;
+  lstatFails.clear();
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
 });
 
@@ -312,11 +330,16 @@ describe("which base is trusted", () => {
     expect(await resolveDeliveryPosture({ rootDir: pkg, baseRef: "origin/main" })).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
   });
 
-  it("reads the same declaration from a real subdirectory of the repository", async () => {
+  it("does not read from a plain subdirectory of the repository, naming the directory", async () => {
     const f = await fixture();
     const tip = await f.publish(declaration("focused"));
     const nested = path.join(f.repo, "nested"); await mkdir(nested);
-    expect(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    // The control: the root itself reads focused.
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    const result = await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" });
+    expect(result).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+    expect(result.reason).toContain(nested);
+    expect(deliveryPostureRefusedOutsideRoot(result)).toBe(true);
   });
 
   it("does not let a ref below the tracking ref's name answer for a missing one", async () => {
@@ -727,5 +750,505 @@ describe("the bound on every network call", () => {
     await f.resolve();
     expect(await f.tracking()).toBe(stale);
     expect(await f.git("tag", "--list", "seed-tag")).toBe("");
+  });
+});
+
+/** A focused declaration with `extra` spliced in as further members, as raw JSON text. */
+const focusedWith = (extra: string): string => `{"schemaVersion":"delivery-posture/1","posture":"focused","reason":"r",${extra}}`;
+
+/**
+ * A `git` first on PATH that behaves as one before 2.38, which has no
+ * `safe.bareRepository`: it drops the resolver's `-c safe.bareRepository=explicit`
+ * pair and runs the real git with no global or system config, so nothing else
+ * restores the setting.
+ */
+async function preBareSafetyGit(dir: string): Promise<string> {
+  const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
+  const bin = path.join(dir, "old-git"); await mkdir(bin, { recursive: true });
+  const wrapper = path.join(bin, "git");
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    "first=1; pending=0",
+    "for arg do",
+    "  if [ \"$first\" = 1 ]; then set --; first=0; fi",
+    "  if [ \"$pending\" = 1 ]; then",
+    "    pending=0",
+    "    if [ \"$arg\" = safe.bareRepository=explicit ]; then continue; fi",
+    "    set -- \"$@\" -c",
+    "  fi",
+    "  if [ \"$arg\" = -c ]; then pending=1; continue; fi",
+    "  set -- \"$@\" \"$arg\"",
+    "done",
+    "if [ \"$pending\" = 1 ]; then set -- \"$@\" -c; fi",
+    `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 exec "${real}" "$@"`,
+    "",
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  return wrapper;
+}
+
+/** A second, unrelated published repository whose base declares focused: what a nested route would answer from. */
+async function focusedElsewhere() {
+  const other = await fixture();
+  const tip = await other.publish(declaration("focused", "Declared by another repository."));
+  return { other, tip };
+}
+
+const refusedAtRoot = (result: Awaited<ReturnType<typeof resolveDeliveryPosture>>, dir: string) => {
+  expect(result).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  expect(result.reason).toContain(dir);
+  expect(deliveryPostureRefusedOutsideRoot(result)).toBe(true);
+};
+
+describe("which directory is read", () => {
+  it("does not read from a real nested repository whose origin declares focused", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    const nested = path.join(f.repo, "vendor", "nested");
+    await mkdir(path.dirname(nested), { recursive: true });
+    await f.git("clone", "-q", other.remote, nested);
+    // The controls: the root reads focused, and git takes the nested directory as a work tree's root.
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+    expect(await realpath((await exec("git", ["rev-parse", "--show-toplevel"], { cwd: nested })).stdout.trim())).toBe(await realpath(nested));
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
+  it("does not read from an initialised submodule whose origin declares focused", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "a submodule");
+    const sub = path.join(f.repo, "sub");
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+    expect(await f.git("-C", sub, "rev-parse", "--show-superproject-working-tree")).not.toBe("");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: sub, baseRef: "origin/main" }), sub);
+  });
+
+  it("refuses a submodule for being one, even where the enclosing work tree is not seen", async () => {
+    // Every real submodule's git directory differs from its superproject's, so the nested rule refuses it too.
+    // This answers the enclosing check with false, so only the submodule rule stands between it and focused.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "a submodule");
+    const sub = path.join(f.repo, "sub");
+    await shimmedGit(f, `  *" rev-parse --is-inside-work-tree "*) echo false; exit 0 ;;`);
+    // The control: under the shim, the enclosing work tree is not seen.
+    expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: f.repo })).stdout.trim()).toBe("false");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: sub, baseRef: "origin/main" }), sub);
+  });
+
+  it("does not read through an untracked gitfile pointing at a repository that declares focused", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    await other.git("fetch", "-q", "origin");
+    const pkg = path.join(f.repo, "pkg"); await mkdir(pkg);
+    await writeFile(path.join(pkg, ".git"), `gitdir: ${path.join(other.repo, ".git")}\n`);
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+    // The control: from there, git answers as the other repository, whose base declares focused.
+    expect(await realpath((await exec("git", ["rev-parse", "--show-toplevel"], { cwd: pkg })).stdout.trim())).toBe(await realpath(pkg));
+    expect((await exec("git", ["config", "--get", "remote.origin.url"], { cwd: pkg })).stdout.trim()).toBe(other.remote);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: pkg, baseRef: "origin/main" }), pkg);
+  });
+
+  it.each([
+    ["a bare layout git refuses to open", "bare"],
+    ["a gitfile pointing nowhere", "broken"],
+  ])("does not read from a real nested repository under %s inside the root", async (_name, kind) => {
+    // From such a directory git fails rather than say it is in a work tree, so its answer hides the root's.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    const holder = path.join(f.repo, kind);
+    if (kind === "bare") await f.git("clone", "-q", "--bare", other.remote, holder);
+    else { await mkdir(holder); await writeFile(path.join(holder, ".git"), `gitdir: ${path.join(f.root, "nowhere")}\n`); }
+    const nested = path.join(holder, "nested");
+    await f.git("clone", "-q", other.remote, nested);
+    // The control: from the nested repository's parent, git fails.
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--is-inside-work-tree"], { cwd: holder })).rejects.toThrow();
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
+  it.each([
+    ["a bare layout git refuses to open", "bare"],
+    ["a gitfile pointing nowhere", "broken"],
+  ])("does not read from a real nested repository whose only enclosing layout is its parent, %s", async (_name, kind) => {
+    // No work tree holds the parent, so nothing above it refuses: the parent's own place in the walk decides.
+    const { other } = await focusedElsewhere();
+    const outside = await mkdtemp(path.join(tmpdir(), "delivery-posture-holder-")); dirs.push(outside);
+    const holder = path.join(outside, kind);
+    if (kind === "bare") await exec("git", ["clone", "-q", "--bare", other.remote, holder]);
+    else { await mkdir(holder); await writeFile(path.join(holder, ".git"), `gitdir: ${path.join(outside, "nowhere")}\n`); }
+    const nested = path.join(holder, "nested");
+    await exec("git", ["clone", "-q", other.remote, nested]);
+    // The controls: git fails from the parent, and nothing above the parent is in a work tree.
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--is-inside-work-tree"], { cwd: holder })).rejects.toThrow();
+    expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: outside }).catch(() => ({ stdout: "no repository" }))).stdout.trim()).not.toBe("true");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
+  it.each(["EACCES", "ENAMETOOLONG", "EIO"])("refuses when an ancestor's .git cannot be looked at (%s)", async (code) => {
+    // Only absence clears an ancestor: an entry that may be there is probed, and an ancestor that is no repository then fails to read.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+    lstatFails.set(path.join(await realpath(f.root), ".git"), code);
+    refusedAtRoot(await f.resolve(), f.repo);
+  });
+
+  it("refuses under a bare repository whose objects directory cannot be looked at", async () => {
+    // A path near PATH_MAX makes lstat fail this way on the one name longer than the directory's own .git.
+    const { other } = await focusedElsewhere();
+    const outside = await mkdtemp(path.join(tmpdir(), "delivery-posture-holder-")); dirs.push(outside);
+    const holder = path.join(await realpath(outside), "bare");
+    await exec("git", ["clone", "-q", "--bare", other.remote, holder]);
+    const nested = path.join(holder, "nested");
+    await exec("git", ["clone", "-q", other.remote, nested]);
+    lstatFails.set(path.join(holder, "objects"), "ENAMETOOLONG");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
+  it("does not read from a linked worktree of a real nested repository", async () => {
+    // Its parent is the nested clone, which shares its git directory: only the root above encloses it with another.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    const nested = path.join(f.repo, "vendor", "nested");
+    await mkdir(path.dirname(nested), { recursive: true });
+    await f.git("clone", "-q", other.remote, nested);
+    const linked = path.join(nested, ".wt");
+    await f.git("-C", nested, "worktree", "add", "-q", "--detach", linked);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: linked, baseRef: "origin/main" }), linked);
+  });
+
+  it("refuses when the probe of the parent's work tree times out", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0003");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    // The control: unhindered, the nested worktree reads focused.
+    expect(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null });
+    const { pidFile } = await hangingGit(f, ["rev-parse --is-inside-work-tree"]);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" }), lane);
+    await expectGone(await pidIn(pidFile));
+  });
+
+  /** A bare clone of a focused base on its own, in a temporary directory no work tree holds. */
+  async function standaloneBare() {
+    const { other, tip } = await focusedElsewhere();
+    const holder = await mkdtemp(path.join(tmpdir(), "delivery-posture-bare-")); dirs.push(holder);
+    const bare = path.join(holder, "standalone.git");
+    await exec("git", ["clone", "-q", "--bare", other.remote, bare]);
+    await exec("git", ["--git-dir", bare, "update-ref", "refs/remotes/origin/main", tip]);
+    return { holder, bare, tip };
+  }
+
+  it("does not read a standalone bare repository under a git with no safe.bareRepository", async () => {
+    const { holder, bare } = await standaloneBare();
+    const wrapper = await preBareSafetyGit(holder);
+    // The controls: under the wrapper, the resolver's own invocation reads the bare repository's base, and
+    // the parent is in no work tree.
+    await exec(wrapper, ["-c", "safe.bareRepository=explicit", "rev-parse", "--verify", "refs/remotes/origin/main"], { cwd: bare });
+    expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: holder }).catch(() => ({ stdout: "no repository" }))).stdout.trim()).not.toBe("true");
+    process.env["PATH"] = `${path.dirname(wrapper)}${path.delimiter}${originalPath}`;
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: bare, baseRef: "origin/main" }), bare);
+  });
+
+  it("does not read a standalone bare repository under this git either, by git's own refusal", async () => {
+    const { bare } = await standaloneBare();
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--verify", "refs/remotes/origin/main"], { cwd: bare })).rejects.toThrow();
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: bare, baseRef: "origin/main" }), bare);
+  });
+
+  it.each([["this git", false], ["a git with no safe.bareRepository", true]])("does not read a bare repository embedded in the tree, under %s", async (_name, old) => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    const pkg = path.join(f.repo, "pkg");
+    await f.git("clone", "-q", "--bare", other.remote, pkg);
+    if (old) process.env["PATH"] = `${path.dirname(await preBareSafetyGit(f.root))}${path.delimiter}${originalPath}`;
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: pkg, baseRef: "origin/main" }), pkg);
+  });
+
+  /** A nested lane worktree, which reads focused when nothing fails, and the main checkout above it. */
+  async function nestedLane(f: Fixture) {
+    await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0004");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    expect(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null });
+    return { lane, main: await realpath(f.repo) };
+  }
+
+  it.each([["the directory's own", "lane"], ["the enclosing main checkout's", "main"]])("refuses when %s git common directory does not read", async (_name, which) => {
+    const f = await fixture();
+    const { lane, main } = await nestedLane(f);
+    const where = which === "lane" ? await realpath(lane) : main;
+    await shimmedGit(f, `  *" rev-parse --git-common-dir "*) if [ "$(pwd -P)" = "${where}" ]; then exit 128; fi ;;`);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" }), lane);
+  });
+
+  it("refuses a clone with no repository above it when its own git common directory does not read", async () => {
+    // Nothing above the clone could refuse it instead, so only the directory's own probe stands between it and a read.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const where = await realpath(f.repo);
+    await shimmedGit(f, `  *" rev-parse --git-common-dir "*) if [ "$(pwd -P)" = "${where}" ]; then exit 128; fi ;;`);
+    refusedAtRoot(await f.resolve(), f.repo);
+  });
+
+  it("refuses when git fails to name the work tree, whatever it printed", async () => {
+    // git prints the directory itself and still fails, so only the exit code tells the answer apart.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const where = await realpath(f.repo);
+    await shimmedGit(f, `  *" rev-parse --show-toplevel "*) echo "${where}"; exit 128 ;;`);
+    const result = await f.resolve();
+    refusedAtRoot(result, f.repo);
+    expect(result.reason).toContain("it is not in a work tree");
+  });
+
+  it("refuses when git cannot say whether the directory is a submodule's", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await shimmedGit(f, `  *" rev-parse --show-superproject-working-tree "*) exit 128 ;;`);
+    refusedAtRoot(await f.resolve(), f.repo);
+  });
+
+  it("compares the git common directories as the file system resolves them", async () => {
+    // git prints the enclosing main checkout's common directory through a symlink to it, so only the
+    // canonical paths are equal.
+    const f = await fixture();
+    const { lane, main } = await nestedLane(f);
+    const alias = path.join(f.root, "alias-of-git-dir");
+    await symlink(path.join(main, ".git"), alias);
+    await shimmedGit(f, `  *" rev-parse --git-common-dir "*) if [ "$(pwd -P)" = "${main}" ]; then echo "${alias}"; exit 0; fi ;;`);
+    expect(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null });
+  });
+
+  /** The ways one root is named: as made, and through a symlink to it, as macOS reaches temporary folders through `/var`. */
+  async function namings(dir: string, holder: string): Promise<readonly string[]> {
+    const link = path.join(holder, `link-${path.basename(dir)}-${Math.random().toString(36).slice(2)}`);
+    await symlink(dir, link);
+    expect(await realpath(link)).not.toBe(link);
+    return [dir, link];
+  }
+
+  it("reads a normal clone from its root, however the root is named", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    for (const rootDir of await namings(f.repo, f.root)) {
+      expect(await resolveDeliveryPosture({ rootDir, baseRef: "origin/main" }), rootDir).toEqual({ posture: "focused", reason: "The gate is still being optimized.", source: "origin/main", baseTipSha: tip, code: null });
+    }
+  });
+
+  it("reads a linked worktree outside its main checkout from its root, however the root is named", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const linked = path.join(f.root, "linked");
+    await f.git("worktree", "add", "-q", "--detach", linked);
+    for (const rootDir of await namings(linked, f.root)) {
+      expect(await resolveDeliveryPosture({ rootDir, baseRef: "origin/main" }), rootDir).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    }
+  });
+
+  it("reads a linked worktree nested under its main checkout from its root, however the root is named", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0001");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    // The control: its parent is inside the main checkout's work tree.
+    expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: path.dirname(lane) })).stdout.trim()).toBe("true");
+    for (const rootDir of await namings(lane, f.root)) {
+      expect(await resolveDeliveryPosture({ rootDir, baseRef: "origin/main" }), rootDir).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    }
+  });
+
+  it("reads a linked worktree inside its own bare repository from its root, however the root is named", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const bare = path.join(f.root, "project.git");
+    await exec("git", ["clone", "-q", "--bare", f.remote, bare]);
+    await exec("git", ["--git-dir", bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    await exec("git", ["--git-dir", bare, "fetch", "-q", "origin"]);
+    await exec("git", ["--git-dir", bare, "remote", "set-head", "origin", "main"]);
+    const linked = path.join(bare, "main");
+    await exec("git", ["--git-dir", bare, "worktree", "add", "-q", "--detach", linked]);
+    // The control: from inside the bare repository, git told to honour only an explicit one refuses.
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--git-common-dir"], { cwd: bare })).rejects.toThrow();
+    for (const rootDir of await namings(linked, f.root)) {
+      expect(await resolveDeliveryPosture({ rootDir, baseRef: "origin/main" }), rootDir).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    }
+  });
+
+  it("reads the root's own declaration with a nested worktree, a nested repository and a submodule beside it", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("gate", "The root's own."));
+    const { other } = await focusedElsewhere();
+    await f.git("clone", "-q", other.remote, path.join(f.repo, "nested"));
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await f.git("worktree", "add", "-q", "--detach", path.join(f.repo, ".orchestration", "lanes", "V26-0002"));
+    expect(await f.resolve()).toEqual({ posture: "gate", reason: "The root's own.", source: "origin/main", baseTipSha: tip, code: null });
+  });
+
+  it("names the directory and refuses one that does not exist", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const gone = path.join(f.root, "gone");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: gone, baseRef: "origin/main" }), gone);
+  });
+
+  it("leaves every other refusal unmarked", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    expect(deliveryPostureRefusedOutsideRoot(await f.resolve("main"))).toBe(false);
+    await f.disconnect();
+    await f.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
+    const offline = await f.resolve();
+    expect(offline).toMatchObject({ posture: "gate", code: "posture_unreadable" });
+    expect(deliveryPostureRefusedOutsideRoot(offline)).toBe(false);
+    expect(deliveryPostureRefusedOutsideRoot({ ...offline })).toBe(false);
+  });
+});
+
+describe("what the fetch leaves alone", () => {
+  /** Two loose objects under `objects/17/`, which is what git samples to decide that auto maintenance is due. */
+  async function dueForMaintenance(f: Fixture): Promise<void> {
+    const found: string[] = [];
+    for (let i = 0; found.length < 2; i += 1) {
+      const content = `loose ${i}\n`;
+      const sha = createHash("sha1").update(`blob ${Buffer.byteLength(content)}\0${content}`).digest("hex");
+      if (sha.startsWith("17")) found.push(content);
+    }
+    for (const [index, content] of found.entries()) {
+      const file = path.join(f.root, `loose-${index}`); await writeFile(file, content);
+      await f.git("hash-object", "-w", file);
+    }
+    await f.git("config", "gc.auto", "1");
+    await f.git("config", "gc.autoDetach", "false");
+    await f.git("config", "maintenance.autoDetach", "false");
+    // Newer git's automatic maintenance can leave out the gc task, whose check runs the pre-auto-gc hook, so turn it on.
+    await f.git("config", "maintenance.gc.enabled", "true");
+  }
+
+  it("runs no auto maintenance", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await dueForMaintenance(f);
+    const marker = path.join(f.root, "maintenance-ran");
+    const hook = path.join(f.repo, ".git", "hooks", "pre-auto-gc");
+    await writeFile(hook, `#!/bin/sh\necho ran >> "${marker}"\nexit 1\n`); await chmod(hook, 0o755);
+    // The control: a fetch that leaves maintenance on reaches the hook.
+    await f.git("fetch", "-q", "origin");
+    expect(existsSync(marker)).toBe(true);
+    await rm(marker);
+    await f.publish(declaration("focused"));
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("fetches no submodule", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "a submodule");
+    const sub = path.join(f.repo, "sub");
+    await f.git("-C", sub, "config", "protocol.file.allow", "always");
+    await f.git("config", "fetch.recurseSubmodules", "true");
+    const before = await f.git("-C", sub, "rev-parse", "refs/remotes/origin/main");
+    await other.publish(declaration("gate"));
+    // The tracking ref is still at the clone's undeclared tip, so a failed fetch would read posture_undeclared.
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    expect(await f.git("-C", sub, "rev-parse", "refs/remotes/origin/main")).toBe(before);
+    // The control: the same fetch with recursion left on moves the submodule's ref.
+    await f.git("fetch", "--no-tags", "--refmap=", "--no-write-fetch-head", "--no-auto-maintenance", "origin", "+refs/heads/main:refs/delivery/posture/main");
+    expect(await f.git("-C", sub, "rev-parse", "refs/remotes/origin/main")).not.toBe(before);
+  });
+});
+
+describe("each read's own guard", () => {
+  it.each([["its size", "cat-file -s"], ["its content", "cat-file blob"]])("gives posture_unreadable when only reading %s fails", async (_name, pattern) => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await shimmedGit(f, `  *" ${pattern} "*) exit 128 ;;`);
+    expect(await f.resolve()).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback", baseTipSha: null });
+  });
+
+  it("reads origin's URL from the repository it's asked about, whatever GIT_DIR an ancestor left set", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.git("remote", "remove", "origin");
+    const { other } = await focusedElsewhere();
+    process.env["GIT_DIR"] = path.join(other.repo, ".git");
+    try {
+      const result = await f.resolve();
+      expect(result).toMatchObject({ posture: "gate", code: "posture_unreadable", source: "fallback" });
+      expect(result.reason).toContain("origin is not a configured remote");
+    } finally { delete process.env["GIT_DIR"]; }
+  });
+});
+
+describe("how deep a declaration may nest", () => {
+  const nestArrays = (depth: number, name = "deep") => `"${name}":${"[".repeat(depth - 1)}${"]".repeat(depth - 1)}`;
+  const nestObjects = (depth: number, name = "deep") => `"${name}":${`{"k":`.repeat(depth - 2)}{}${"}".repeat(depth - 2)}`;
+  /** Depth reached by alternating an object and an array under the top-level object, so neither kind alone is deep. */
+  const nestAlternating = (depth: number, name = "deep") => {
+    let open = "", close = "";
+    for (let level = 2; level <= depth; level += 1) {
+      if (level % 2 === 0) { open += `{"k":`; close = `}${close}`; } else { open += "["; close = `]${close}`; }
+    }
+    return `"${name}":${open}1${close}`;
+  };
+  const siblings = (count: number, value: string) => Array.from({ length: count }, (_, i) => `"s${i}":${value}`).join(",");
+  const deepest = (): string => {
+    const head = `{"schemaVersion":"delivery-posture/1","posture":"focused","reason":"r","deep":`;
+    const levels = Math.floor((64 * 1024 - head.length - 1) / 2);
+    return `${head}${"[".repeat(levels)}${"]".repeat(levels)}}`;
+  };
+  it.each<[string, string, "focused" | "malformed"]>([
+    ["one member nested 64 deep", focusedWith(nestArrays(64)), "focused"],
+    ["one member nested 65 deep", focusedWith(nestArrays(65)), "malformed"],
+    ["one member nested 1500 deep", focusedWith(nestArrays(1500)), "malformed"],
+    ["the deepest nesting 64 KiB can hold", deepest(), "malformed"],
+    ["65 sibling arrays at depth 2", focusedWith(siblings(65, "[]")), "focused"],
+    ["65 sibling objects at depth 2", focusedWith(siblings(65, "{}")), "focused"],
+    ["objects then arrays, each 64 deep", focusedWith(`${nestObjects(64, "objects")},${nestArrays(64, "arrays")}`), "focused"],
+    ["one member nesting objects 65 deep", focusedWith(nestObjects(65)), "malformed"],
+    ["one member alternating objects and arrays to 65 deep", focusedWith(nestAlternating(65)), "malformed"],
+    ["one member alternating objects and arrays to 64 deep", focusedWith(nestAlternating(64)), "focused"],
+    ["a string holding 65 [", focusedWith(`"text":"${"[".repeat(65)}"`), "focused"],
+    ["a string holding closing brackets at depth 64", focusedWith(`"deep":${"[".repeat(63)}"${"]}".repeat(65)}"${"]".repeat(63)}`), "focused"],
+    ["a string holding an escaped quote then 65 [", focusedWith(`"text":"\\"${"[".repeat(65)}"`), "focused"],
+    ["a string ending in an escaped backslash, then a member 65 deep", focusedWith(`"text":"r\\\\",${nestArrays(65)}`), "malformed"],
+  ])("reads %s as the bound says", async (_name, text, expected) => {
+    const f = await fixture();
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(64 * 1024);
+    const tip = await f.publish(text);
+    const result = await f.resolve();
+    if (expected === "focused") expect(result).toMatchObject({ posture: "focused", code: null, baseTipSha: tip });
+    else {
+      expect(result).toMatchObject({ posture: "gate", code: "posture_malformed", source: "origin/main", baseTipSha: tip });
+      expect(result.reason).toContain("nests deeper than 64 levels");
+    }
+  });
+
+  it("measures the vectors' depth as the bound counts it", () => {
+    /** The greatest number of arrays and objects open at once, from the parsed value. */
+    const depthOf = (node: unknown, at = 1): number => node === null || typeof node !== "object" ? at - 1
+      : Math.max(at, ...Object.values(node as object).map(child => depthOf(child, at + 1)));
+    expect(depthOf(JSON.parse(focusedWith(nestArrays(64))))).toBe(64);
+    expect(depthOf(JSON.parse(focusedWith(nestArrays(65))))).toBe(65);
+    expect(depthOf(JSON.parse(focusedWith(`${nestObjects(64, "objects")},${nestArrays(64, "arrays")}`)))).toBe(64);
+    expect(depthOf(JSON.parse(focusedWith(siblings(65, "{}"))))).toBe(2);
+    expect(depthOf(JSON.parse(focusedWith(siblings(65, "[]"))))).toBe(2);
+    expect(depthOf(JSON.parse(focusedWith(nestObjects(65))))).toBe(65);
+    expect(depthOf(JSON.parse(focusedWith(nestAlternating(65))))).toBe(65);
+    expect(depthOf(JSON.parse(focusedWith(nestAlternating(64))))).toBe(64);
+    expect(depthOf(JSON.parse(focusedWith(`"deep":${"[".repeat(63)}"x"${"]".repeat(63)}`)))).toBe(64);
   });
 });

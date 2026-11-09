@@ -46,6 +46,7 @@ export {
   DELIVERY_POSTURE_NETWORK_TIMEOUT_MS,
   DELIVERY_POSTURE_PATH,
   DELIVERY_POSTURE_SCHEMA,
+  deliveryPostureRefusedOutsideRoot,
   resolveDeliveryPosture,
   type DeliveryPosture,
   type DeliveryPostureCode,
