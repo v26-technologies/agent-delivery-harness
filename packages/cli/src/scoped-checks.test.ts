@@ -1924,12 +1924,19 @@ it("the gate prewarms first the setup whose own critical path is longest: its la
   expect(first(/^prewarm pc1: materialization /), lines.join("\n")).toBeGreaterThanOrEqual(0);
   expect(first(/^prewarm pc1: materialization /)).toBeLessThan(first(/^prewarm pc2: materialization /));
 }, 120000);
-it("a prewarm whose setup failed leaves no base, and the check that next needs it sets up itself", async () => {
-  const method = await (await import("./check-snapshot.ts")).snapshotCloneMethod();
+it.each(["cloning", "no cloning"] as const)("a prewarm whose setup failed leaves no base, and the check that next needs it sets up itself (%s)", async variant => {
+  const snapshots = await import("./check-snapshot.ts");
+  // Linux CI has no copy-on-write clone: the second variant takes that branch on every platform.
+  const probe = variant === "no cloning" ? vi.spyOn(snapshots, "snapshotCloneMethod").mockResolvedValue(undefined) : undefined;
+  try {
+  const method = await snapshots.snapshotCloneMethod();
+  if (variant === "cloning" && !method) return;
   const f = await poolFixture(["1", "1"], 2, () => "");
   const once = JSON.stringify(path.join(f.shared, "failed-once"));
+  // Without cloning both workers set up at once: both reach the marker together, so only an atomic claim lets one fail.
+  const together = method ? "const fs=require('fs');" : `${barrier(f.shared, 2)};`;
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, profiles: f.config.scopedExecution!.profiles.map(p => ({ ...p,
-    dependencies: { command: [process.execPath, "-e", `const fs=require('fs');{let first=true;try{fs.writeFileSync(${once},'',{flag:'wx'})}catch(e){if(e.code!=='EEXIST')throw e;first=false}if(first)process.exit(3)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000);${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
+    dependencies: { command: [process.execPath, "-e", `${together}{let first=true;try{fs.writeFileSync(${once},'',{flag:'wx'})}catch(e){if(e.code!=='EEXIST')throw e;first=false}if(first)process.exit(3)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000);${p.dependencies!.command[2]}`] as [string, ...string[]], timeoutMs: 60000 } })) } });
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const gate = await f.run("gate");
   const out = f.out.join("\n");
@@ -1949,6 +1956,7 @@ it("a prewarm whose setup failed leaves no base, and the check that next needs i
   // The other check waited for that second-long setup outside its attempt, not inside it.
   const reused = setups.find(d => d!.setup!.action === "reused")!.setup!;
   expect(reused.phases.find(p => p.phase === "warm-base-wait")!.durationMs).toBeLessThan(500);
+  } finally { probe?.mockRestore(); }
 }, 90000);
 it("a setup that always fails is recorded on each check that needed it", async () => {
   const f = await poolFixture(["1", "1"], 2, () => "");
