@@ -31,13 +31,13 @@
  * submodule or an untracked gitfile each brings its own `origin`. And a git older
  * than 2.38 ignores `safe.bareRepository`, so a bare layout would answer too. So
  * the directory must be its work tree's root, not a submodule's, and not nested
- * in another repository's work tree, unless that enclosing work tree shares its
+ * in another repository's work tree, unless every enclosing repository shares its
  * git directory, as a linked worktree nested in its own main checkout does.
  *
  * Everything that can't be read resolves to `gate`. This never rejects.
  */
 import { spawn } from "node:child_process";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { scrubbedEnvironment } from "./candidate.ts";
 
@@ -234,9 +234,31 @@ async function canonical(target: string): Promise<string | undefined> {
 }
 
 /**
+ * Whether a path may exist, of any type, as `lstat` sees it. Only "no such
+ * entry" is an answer of no; any other failure counts as yes, so git is asked.
+ */
+async function mayExist(target: string): Promise<boolean> {
+  try { await lstat(target); return true; } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
+  }
+}
+
+/**
+ * Whether git could take this directory for a repository: it holds a `.git`
+ * entry of any kind, or it has the shape of a git directory itself (`HEAD`,
+ * `objects` and `refs`), as a bare layout does.
+ */
+async function couldBeRepository(dir: string): Promise<boolean> {
+  const [dotGit, ...gitDirectory] = await Promise.all([".git", "HEAD", "objects", "refs"].map(name => mayExist(path.join(dir, name))));
+  return dotGit === true || gitDirectory.every(Boolean);
+}
+
+/**
  * Why the directory is not a repository root the posture may be read from, or
- * undefined where it is one. Each condition fails closed: a git that fails or
- * prints something else refuses.
+ * undefined where it is one. Each condition fails closed: a git that fails,
+ * times out or prints something else refuses, except where git finds no
+ * repository at all above the directory.
  */
 async function whyNotRoot(rootDir: string, git: GitRunner, gitIn: (cwd: string) => GitRunner): Promise<string | undefined> {
   const directory = await canonical(rootDir);
@@ -244,14 +266,10 @@ async function whyNotRoot(rootDir: string, git: GitRunner, gitIn: (cwd: string) 
   const top = await git(["rev-parse", "--show-toplevel"], LOCAL_TIMEOUT_MS);
   if (top.exitCode !== 0) return "it is not in a work tree";
   const topText = top.stdout.toString("utf8").replace(/\n$/, "");
-  if (topText === "" || await canonical(topText) !== directory) return "it is not its work tree's root";
+  // An empty answer canonicalises to nothing, so it refuses too.
+  if (await canonical(topText) !== directory) return "it is not its work tree's root";
   const superproject = await git(["rev-parse", "--show-superproject-working-tree"], LOCAL_TIMEOUT_MS);
   if (superproject.exitCode !== 0 || superproject.stdout.length !== 0) return "it is a submodule's work tree";
-  // The parent as the file system has it, as `git -C <dir>/..` would reach it.
-  const parent = path.dirname(directory);
-  const parentGit = gitIn(parent);
-  const enclosing = await parentGit(["rev-parse", "--is-inside-work-tree"], LOCAL_TIMEOUT_MS);
-  if (enclosing.exitCode !== 0 || enclosing.stdout.toString("utf8").trim() !== "true") return undefined;
   const commonDir = async (run: GitRunner, cwd: string): Promise<string | undefined> => {
     const listed = await run(["rev-parse", "--git-common-dir"], LOCAL_TIMEOUT_MS);
     const text = listed.stdout.toString("utf8").replace(/\n$/, "");
@@ -259,9 +277,22 @@ async function whyNotRoot(rootDir: string, git: GitRunner, gitIn: (cwd: string) 
     return canonical(path.resolve(cwd, text));
   };
   const own = await commonDir(git, directory);
-  const theirs = await commonDir(parentGit, parent);
-  if (own === undefined || theirs === undefined || own !== theirs) return "it is nested in another repository's work tree";
-  return undefined;
+  if (own === undefined) return "its git directory did not read";
+  const nested = "it is nested in another repository's work tree";
+  // The parent as the file system has it, as `git -C <dir>/..` would reach it.
+  const parent = path.dirname(directory);
+  const parentGit = gitIn(parent);
+  const enclosing = await parentGit(["rev-parse", "--is-inside-work-tree"], LOCAL_TIMEOUT_MS);
+  // A git that never ran or was stopped told nothing; one that found no repository is the walk's to settle.
+  if (enclosing.exitCode === -1) return nested;
+  if (enclosing.exitCode === 0 && enclosing.stdout.toString("utf8").trim() === "true" && await commonDir(parentGit, parent) !== own) return nested;
+  // Every ancestor git could take for a repository, not only the parent's: a worktree of a nested clone
+  // shares its parent's git directory, and a layout git refuses to open hides what encloses it from the
+  // parent's own answer. Each must read, and be the directory's own repository.
+  for (let ancestor = parent; ; ancestor = path.dirname(ancestor)) {
+    if (await couldBeRepository(ancestor) && await commonDir(gitIn(ancestor), ancestor) !== own) return nested;
+    if (path.dirname(ancestor) === ancestor) return undefined;
+  }
 }
 
 /**

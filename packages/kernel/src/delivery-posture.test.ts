@@ -840,6 +840,50 @@ describe("which directory is read", () => {
     refusedAtRoot(await resolveDeliveryPosture({ rootDir: pkg, baseRef: "origin/main" }), pkg);
   });
 
+  it.each([
+    ["a bare layout git refuses to open", "bare"],
+    ["a gitfile pointing nowhere", "broken"],
+  ])("does not read from a real nested repository under %s inside the root", async (_name, kind) => {
+    // From such a directory git fails rather than say it is in a work tree, so its answer hides the root's.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    const holder = path.join(f.repo, kind);
+    if (kind === "bare") await f.git("clone", "-q", "--bare", other.remote, holder);
+    else { await mkdir(holder); await writeFile(path.join(holder, ".git"), `gitdir: ${path.join(f.root, "nowhere")}\n`); }
+    const nested = path.join(holder, "nested");
+    await f.git("clone", "-q", other.remote, nested);
+    // The control: from the nested repository's parent, git fails.
+    await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--is-inside-work-tree"], { cwd: holder })).rejects.toThrow();
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
+  it("does not read from a linked worktree of a real nested repository", async () => {
+    // Its parent is the nested clone, which shares its git directory: only the root above encloses it with another.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    const nested = path.join(f.repo, "vendor", "nested");
+    await mkdir(path.dirname(nested), { recursive: true });
+    await f.git("clone", "-q", other.remote, nested);
+    const linked = path.join(nested, ".wt");
+    await f.git("-C", nested, "worktree", "add", "-q", "--detach", linked);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: linked, baseRef: "origin/main" }), linked);
+  });
+
+  it("refuses when the probe of the parent's work tree times out", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0003");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    // The control: unhindered, the nested worktree reads focused.
+    expect(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null });
+    const { pidFile } = await hangingGit(f, ["rev-parse --is-inside-work-tree"]);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" }), lane);
+    await expectGone(await pidIn(pidFile));
+  });
+
   /** A bare clone of a focused base on its own, in a temporary directory no work tree holds. */
   async function standaloneBare() {
     const { other, tip } = await focusedElsewhere();
@@ -875,6 +919,41 @@ describe("which directory is read", () => {
     await f.git("clone", "-q", "--bare", other.remote, pkg);
     if (old) process.env["PATH"] = `${path.dirname(await preBareSafetyGit(f.root))}${path.delimiter}${originalPath}`;
     refusedAtRoot(await resolveDeliveryPosture({ rootDir: pkg, baseRef: "origin/main" }), pkg);
+  });
+
+  /** A nested lane worktree, which reads focused when nothing fails, and the main checkout above it. */
+  async function nestedLane(f: Fixture) {
+    await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0004");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    expect(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null });
+    return { lane, main: await realpath(f.repo) };
+  }
+
+  it.each([["the directory's own", "lane"], ["the enclosing main checkout's", "main"]])("refuses when %s git common directory does not read", async (_name, which) => {
+    const f = await fixture();
+    const { lane, main } = await nestedLane(f);
+    const where = which === "lane" ? await realpath(lane) : main;
+    await shimmedGit(f, `  *" rev-parse --git-common-dir "*) if [ "$(pwd -P)" = "${where}" ]; then exit 128; fi ;;`);
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" }), lane);
+  });
+
+  it("refuses when git cannot say whether the directory is a submodule's", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await shimmedGit(f, `  *" rev-parse --show-superproject-working-tree "*) exit 128 ;;`);
+    refusedAtRoot(await f.resolve(), f.repo);
+  });
+
+  it("compares the git common directories as the file system resolves them", async () => {
+    // git prints the enclosing main checkout's common directory through a symlink to it, so only the
+    // canonical paths are equal.
+    const f = await fixture();
+    const { lane, main } = await nestedLane(f);
+    const alias = path.join(f.root, "alias-of-git-dir");
+    await symlink(path.join(main, ".git"), alias);
+    await shimmedGit(f, `  *" rev-parse --git-common-dir "*) if [ "$(pwd -P)" = "${main}" ]; then echo "${alias}"; exit 0; fi ;;`);
+    expect(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" })).toMatchObject({ posture: "focused", code: null });
   });
 
   /** The ways one root is named: as made, and through a symlink to it, as macOS reaches temporary folders through `/var`. */
@@ -1024,6 +1103,14 @@ describe("each read's own guard", () => {
 describe("how deep a declaration may nest", () => {
   const nestArrays = (depth: number, name = "deep") => `"${name}":${"[".repeat(depth - 1)}${"]".repeat(depth - 1)}`;
   const nestObjects = (depth: number, name = "deep") => `"${name}":${`{"k":`.repeat(depth - 2)}{}${"}".repeat(depth - 2)}`;
+  /** Depth reached by alternating an object and an array under the top-level object, so neither kind alone is deep. */
+  const nestAlternating = (depth: number, name = "deep") => {
+    let open = "", close = "";
+    for (let level = 2; level <= depth; level += 1) {
+      if (level % 2 === 0) { open += `{"k":`; close = `}${close}`; } else { open += "["; close = `]${close}`; }
+    }
+    return `"${name}":${open}1${close}`;
+  };
   const siblings = (count: number, value: string) => Array.from({ length: count }, (_, i) => `"s${i}":${value}`).join(",");
   const deepest = (): string => {
     const head = `{"schemaVersion":"delivery-posture/1","posture":"focused","reason":"r","deep":`;
@@ -1038,6 +1125,9 @@ describe("how deep a declaration may nest", () => {
     ["65 sibling arrays at depth 2", focusedWith(siblings(65, "[]")), "focused"],
     ["65 sibling objects at depth 2", focusedWith(siblings(65, "{}")), "focused"],
     ["objects then arrays, each 64 deep", focusedWith(`${nestObjects(64, "objects")},${nestArrays(64, "arrays")}`), "focused"],
+    ["one member nesting objects 65 deep", focusedWith(nestObjects(65)), "malformed"],
+    ["one member alternating objects and arrays to 65 deep", focusedWith(nestAlternating(65)), "malformed"],
+    ["one member alternating objects and arrays to 64 deep", focusedWith(nestAlternating(64)), "focused"],
     ["a string holding 65 [", focusedWith(`"text":"${"[".repeat(65)}"`), "focused"],
     ["a string holding closing brackets at depth 64", focusedWith(`"deep":${"[".repeat(63)}"${"]}".repeat(65)}"${"]".repeat(63)}`), "focused"],
     ["a string holding an escaped quote then 65 [", focusedWith(`"text":"\\"${"[".repeat(65)}"`), "focused"],
@@ -1063,6 +1153,9 @@ describe("how deep a declaration may nest", () => {
     expect(depthOf(JSON.parse(focusedWith(`${nestObjects(64, "objects")},${nestArrays(64, "arrays")}`)))).toBe(64);
     expect(depthOf(JSON.parse(focusedWith(siblings(65, "{}"))))).toBe(2);
     expect(depthOf(JSON.parse(focusedWith(siblings(65, "[]"))))).toBe(2);
+    expect(depthOf(JSON.parse(focusedWith(nestObjects(65))))).toBe(65);
+    expect(depthOf(JSON.parse(focusedWith(nestAlternating(65))))).toBe(65);
+    expect(depthOf(JSON.parse(focusedWith(nestAlternating(64))))).toBe(64);
     expect(depthOf(JSON.parse(focusedWith(`"deep":${"[".repeat(63)}"x"${"]".repeat(63)}`)))).toBe(64);
   });
 });
