@@ -158,31 +158,60 @@ it("qualifies scoped execution through the actual bundled runtime", async () => 
   } finally { await rm(temporary, { recursive: true, force: true }); }
 }, 180000);
 
-it("finds every import and require whose specifier is not one literal string", () => {
+it("finds every load a scanner cannot bound from its specifier", () => {
   expect(computedImports([
-    'import("node:fs"); import(`bun:ffi`); require("x"); __require("y"); import("./a.mjs", { with: {} });',
+    'import("node:fs"); require("x"); __require("y"); await import("bun:ffi");',
     "// import(commented)",
     'const text = "import(quoted)";',
   ].join("\n"))).toEqual([]);
   expect(computedImports([
     'const ffiModule = "bun:ffi"; await import(ffiModule);',
+    "import(`bun:ffi`);",
+    'import("./a.mjs", { with: { type: "json" } });',
     "import(`./${name}.mjs`);",
     'require("a" + b);',
     "__require(dep);",
     "import(pathToFileURL(configPath).href);",
-  ].join("\n"))).toEqual(["ffiModule", "`./${name}.mjs`", '"a" + b', "dep", "pathToFileURL(configPath).href"]);
+    "createRequire(import.meta.url)(dep);",
+    'eval("1"); Function("return 1"); new Function("return 1");',
+  ].join("\n"))).toEqual([
+    "ffiModule", "`bun:ffi`", '"./a.mjs", { with: { type: "json" } }', "`./${name}.mjs`", '"a" + b', "dep",
+    "pathToFileURL(configPath).href", "createRequire(import.meta.url)(dep)", 'eval("1")', 'Function("return 1")', 'new Function("return 1")',
+  ]);
 });
 
+const literal = 'export const load = () => import("node:fs");';
+const loader = "export const load = configPath => import(pathToFileURL2(configPath2).href);";
 it.each([
-  ["kernel", 'const ffiModule = "bun:ffi"; export const load = () => import(ffiModule);', "ffiModule"],
-  ["policy", "export const load = name => require(name);", "name"],
-  ["cli", "export const load = configPath => import(configPath);", "configPath"],
-])("refuses a runtime whose %s bundle loads through a computed specifier", async (bundle, text, specifier) => {
+  ["kernel", 'const ffiModule = "bun:ffi"; export const load = () => import(ffiModule);', "loads ffiModule through a computed specifier"],
+  ["policy", "export const load = name => require(name);", "loads name through a computed specifier"],
+  ["cli", "export const load = configPath => import(configPath);", "loads configPath through a computed specifier"],
+  ["cli-api", "export const load = () => eval('x');", "loads eval('x') through a computed specifier"],
+  ["kernel", loader, "kernel.mjs has 1 config loaders, expected 0"],
+  ["cli", literal, "cli.mjs has 0 config loaders, expected 1"],
+  ["cli-api", `${loader}\n${loader.replace("load", "again")}`, "cli-api.mjs has 2 config loaders, expected 1"],
+])("refuses a runtime whose %s bundle is %s", async (bundle, text, message) => {
   const out = await mkdtemp(path.join(os.tmpdir(), "computed-import-"));
   try {
-    for (const name of ["cli-api", "cli", "kernel", "policy"]) await writeFile(path.join(out, `${name}.mjs`), name === bundle ? text : 'export const load = () => import("node:fs");');
-    await expect(refuseComputedImports(out)).rejects.toThrow(`product.computed_import: ${bundle}.mjs loads ${specifier} through a computed specifier`);
-    await writeFile(path.join(out, `${bundle}.mjs`), "export const load = configPath => import(pathToFileURL2(configPath2).href);");
+    const clean = (name: string) => name.startsWith("cli") ? loader : literal;
+    for (const name of ["cli-api", "cli", "kernel", "policy"]) await writeFile(path.join(out, `${name}.mjs`), name === bundle ? text : clean(name));
+    await expect(refuseComputedImports(out)).rejects.toThrow(message);
+    await writeFile(path.join(out, `${bundle}.mjs`), clean(bundle));
     await expect(refuseComputedImports(out)).resolves.toBeUndefined();
   } finally { await rm(out, { recursive: true, force: true }); }
+});
+
+it("refuses to finish a build whose kernel loads through a computed specifier", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "computed-import-root-"));
+  try {
+    const sources: Record<string, string> = {
+      "packages/cli/src/index.ts": loader, "packages/cli/src/main.ts": loader, "scripts/recompile-policy-snapshot.ts": literal,
+      "packages/kernel/src/index.ts": 'const ffiModule = "bun:ffi"; export const load = () => import(ffiModule);',
+    };
+    for (const [file, text] of Object.entries(sources)) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), text); }
+    const manifest = path.join(root, "workflow.json");
+    await writeFile(manifest, JSON.stringify({ schemaVersion: "agent-skills-release/1", contentSha256: "a".repeat(64) }));
+    await expect(buildProductRuntime(root, manifest, path.join(root, "runtime"))).rejects.toThrow("product.computed_import: kernel.mjs loads ffiModule");
+    await expect(readdir(path.join(root, "runtime"))).resolves.not.toContain("runtime.json");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

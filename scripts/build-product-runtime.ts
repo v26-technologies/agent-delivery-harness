@@ -8,31 +8,43 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
-/** The one module load an adopter's import scanner cannot bound from the specifier alone: the CLI loading the
- * adopter's own `harness.config.ts`, which it names. Every other `import()` or `require()` in a runtime bundle is
- * a literal, so a scanner sees exactly what the runtime can load. */
-const BOUNDED_COMPUTED_IMPORTS = [/^pathToFileURL\d*\(configPath\d*\)\.href$/];
+/** The one load an adopter's import scanner cannot bound from its specifier: the CLI loading the adopter's own
+ * `harness.config.ts`, once in each CLI bundle. An adopter bounds it by naming that config. */
+const CONFIG_LOADER = /^pathToFileURL\d*\(configPath\d*\)\.href$/;
+const BOUNDED_COMPUTED_IMPORTS: Record<string, number> = { "cli-api": 1, cli: 1, kernel: 0, policy: 0 };
 
-/** Each `import()` and `require()` in `text` whose specifier is not a single literal string, as written. */
+/**
+ * Each load in `text` an import scanner cannot bound from the source alone, as written: an `import()`,
+ * `require()` or `__require()` whose specifier is anything but one quoted string with nothing after it, a call
+ * through `createRequire(...)`'s result, and code built at run time (`eval`, `Function`). Scanners such as
+ * Athena's accept the same literal form, so a runtime this passes cannot read to them as opaque.
+ */
 export function computedImports(text: string): string[] {
   const source = ts.createSourceFile("bundle.mjs", text, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
   const found: string[] = [];
+  const named = (node: ts.Node, names: RegExp) => ts.isIdentifier(node) && names.test(node.text);
   const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && /^(?:__)?require$/.test(node.expression.text))) {
-      const [specifier] = node.arguments;
-      if (!specifier || !(ts.isStringLiteral(specifier) || ts.isNoSubstitutionTemplateLiteral(specifier))) found.push(specifier ? specifier.getText(source) : "");
-    }
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (callee.kind === ts.SyntaxKind.ImportKeyword || named(callee, /^(?:__)?require$/)) {
+        const [specifier, ...rest] = node.arguments;
+        if (!specifier || !ts.isStringLiteral(specifier) || rest.length) found.push(node.arguments.map(arg => arg.getText(source)).join(", "));
+      } else if (ts.isCallExpression(callee) && named(callee.expression, /^createRequire\d*$/)) found.push(node.getText(source));
+      else if (named(callee, /^(?:eval|Function)$/)) found.push(node.getText(source));
+    } else if (ts.isNewExpression(node) && named(node.expression, /^Function$/)) found.push(node.getText(source));
     ts.forEachChild(node, visit);
   };
   visit(source);
   return found;
 }
 
-/** Refuses a runtime whose bundles load anything through a computed specifier, other than the config loader. */
+/** Refuses a runtime whose bundles load anything a scanner cannot bound, other than each CLI's one config loader. */
 export async function refuseComputedImports(out: string): Promise<void> {
-  for (const name of ["cli-api", "cli", "kernel", "policy"]) {
-    const unbounded = computedImports(await readFile(path.join(out, `${name}.mjs`), "utf8")).filter(specifier => !BOUNDED_COMPUTED_IMPORTS.some(bound => bound.test(specifier)));
+  for (const [name, loaders] of Object.entries(BOUNDED_COMPUTED_IMPORTS)) {
+    const computed = computedImports(await readFile(path.join(out, `${name}.mjs`), "utf8"));
+    const unbounded = computed.filter(specifier => !CONFIG_LOADER.test(specifier));
     if (unbounded.length) throw new Error(`product.computed_import: ${name}.mjs loads ${unbounded.join(", ")} through a computed specifier; spell it as a literal`);
+    if (computed.length !== loaders) throw new Error(`product.computed_import: ${name}.mjs has ${computed.length} config loaders, expected ${loaders}`);
   }
 }
 
