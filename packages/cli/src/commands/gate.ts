@@ -103,15 +103,23 @@ async function providerAdmission(
       });
       const cancelBeside = new AbortController();
       let cancelledAfter: string | undefined;
-      const besideRuns = beside.map(([providerId, request]) => invokeProvider!({ providerId, requiresEvidence: false, signal: cancelBeside.signal,
-        payload: { gateId: context.config.gateId, providerId, obligationIds: [...new Set(request.obligationIds)].sort(), candidate: admission.candidate! } })
-        .then(result => ({ result }), (error: unknown) => ({ error })));
+      // They start once every scoped check has taken a worker, not at once: a check that sizes itself to the
+      // machine (a memory-planned typecheck, say) has then already measured what it may use.
+      const besideRuns: Promise<{ result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }>[] = [];
+      const startBeside = () => {
+        if (besideRuns.length > 0 || cancelBeside.signal.aborted) return;
+        for (const [providerId, request] of beside) besideRuns.push(invokeProvider!({ providerId, requiresEvidence: false, signal: cancelBeside.signal,
+          payload: { gateId: context.config.gateId, providerId, obligationIds: [...new Set(request.obligationIds)].sort(), candidate: admission.candidate! } })
+          .then(result => ({ result }), (error: unknown) => ({ error })));
+      };
       let failures: CheckSnapshotError[];
       try {
         // The first scoped failure under failFast ends them too: nothing else of this admission may finish.
         failures = await session.executeAll(scoped.map(([id, request]) => ({ provider: context.config.providers.find(p => p.id === id)!, obligationIds: request.obligationIds })),
-          failed => { cancelledAfter = failed; cancelBeside.abort(); });
+          failed => { cancelledAfter = failed; cancelBeside.abort(); }, startBeside);
       } catch (error) { cancelBeside.abort(); await Promise.all(besideRuns); throw error; }
+      // A run that never reached its last check starts them now, unless a failure cancelled them.
+      if (cancelledAfter === undefined) startBeside();
       const settled = await Promise.all(besideRuns);
       // An interrupted invocation is an interruption, not a scoped failure's cancellation.
       if (context.signal?.aborted) throw new CliInterruption();

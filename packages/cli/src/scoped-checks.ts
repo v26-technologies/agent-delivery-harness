@@ -310,7 +310,8 @@ export class ScopedChecks {
    * worker takes the startable id expected to run longest instead, and its clone queues by that cost, so
    * the critical path gets its base, clone and worker first.
    */
-  private async pool(ids: readonly string[], run: (id: string, lane: Lane) => Promise<void>, halted: () => boolean = () => false, expected?: ReadonlyMap<string, number>): Promise<void> {
+  private async pool(ids: readonly string[], run: (id: string, lane: Lane) => Promise<void>, halted: () => boolean = () => false, expected?: ReadonlyMap<string, number>, onDrained?: () => void): Promise<void> {
+    if (ids.length === 0) onDrained?.();
     const failures = new Map<string, unknown>(), remaining = [...ids];
     const sleepers = new Set<() => void>();
     const woken = () => new Promise<void>(resolve => { sleepers.add(resolve); });
@@ -321,7 +322,7 @@ export class ScopedChecks {
         if (failures.size > 0 || remaining.length === 0) return undefined;
         const index = halted() ? 0 : remaining.reduce((best, id, i) => !this.startable(id) ? best
           : best < 0 || (expected?.get(id) ?? 0) > (expected?.get(remaining[best]!) ?? 0) ? i : best, -1);
-        if (index >= 0) { const id = remaining.splice(index, 1)[0]!; this.claim(id); return id; }
+        if (index >= 0) { const id = remaining.splice(index, 1)[0]!; this.claim(id); if (remaining.length === 0) onDrained?.(); return id; }
         await Promise.race([woken(), ...remaining.flatMap(id => { const key = this.keyOf(id), base = this.bases.get(key); return base ? [this.settling.get(base)!] : this.claims.has(key) ? [this.claims.get(key)!.released] : []; })]);
       }
     };
@@ -387,7 +388,8 @@ export class ScopedChecks {
    * yet started never starts and one running has its process group signalled, and both are recorded
    * `interrupted` with `check_cancelled` and left out of the returned failures.
    */
-  async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[], onFailFast?: (failed: string) => void): Promise<CheckSnapshotError[]> {
+  /** `onAllStarted` hears, once, that every requested check has taken a worker, or that the run halted first. */
+  async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[], onFailFast?: (failed: string) => void, onAllStarted?: () => void): Promise<CheckSnapshotError[]> {
     const failures = new Map<string, CheckSnapshotError>();
     const failFast = this.context.config.scopedExecution?.failFast === true;
     const running = new Map<string, AbortController>(), unstarted: string[] = [];
@@ -422,8 +424,8 @@ export class ScopedChecks {
     await this.prewarm(requests.map(r => r.provider.id), expected, serialIds);
     if (resource) {
       for (const id of serialIds) await run(id, this.serial);
-      await this.pool(requests.map(r => r.provider.id).filter(id => !serialIds.includes(id)), run, halted, expected);
-    } else await this.pool(requests.map(r => r.provider.id), run, halted, expected);
+      await this.pool(requests.map(r => r.provider.id).filter(id => !serialIds.includes(id)), run, halted, expected, onAllStarted);
+    } else await this.pool(requests.map(r => r.provider.id), run, halted, expected, onAllStarted);
     if (firstFailure !== undefined) await this.cancelUnstarted(unstarted, firstFailure);
     return requests.flatMap(r => failures.has(r.provider.id) ? [failures.get(r.provider.id)!] : []);
   }

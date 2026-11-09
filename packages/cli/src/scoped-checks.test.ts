@@ -2183,7 +2183,8 @@ it("a provider running beside the checks is cancelled and awaited when the scope
   withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000, undefined, "success", 1500), independent: true }]);
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype;
-  const thrown = vi.spyOn(proto, "executeAll").mockImplementation(async () => {
+  const thrown = vi.spyOn(proto, "executeAll").mockImplementation(async (_requests, _onFailFast, onAllStarted) => {
+    onAllStarted?.();
     for (const end = Date.now() + 20000; !await at(f.shared, "beside-start") && Date.now() < end;) await new Promise(resolve => setTimeout(resolve, 20));
     throw new Error("the scoped run broke");
   });
@@ -2245,4 +2246,20 @@ it("a second pass of the scoped pool does not start a provider that already ran 
   try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { spy.mockRestore(); }
   expect(f.out.join("\n").match(/passed check\.c\d/g)?.sort()).toEqual(["passed check.c1", "passed check.c2"]);
   expect(await starts(f.shared, "p")).toBe(1);
+}, 90000);
+it("providers beside the checks start only once every scoped check has taken a worker", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // Three checks on two workers: c3 takes a worker only when c1 or c2 frees one.
+  const f = await poolFixture(["1", "1", "1"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `check-${id}`))},String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${id === "c3" ? 0 : 700})`);
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype, executeAll = proto.executeAll, checked = path.join(f.shared, "checks-done");
+  const wrapped = vi.spyOn(proto, "executeAll").mockImplementation(async function (this: unknown, ...args: Parameters<typeof executeAll>) { const out = await executeAll.apply(this as never, args); await writeFile(checked, String(Date.now())); return out; });
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { wrapped.mockRestore(); }
+  const started = [(await at(f.shared, "check-c1"))!, (await at(f.shared, "check-c2"))!, (await at(f.shared, "check-c3"))!];
+  const beside = (await at(f.shared, "beside-start"))!;
+  // c3 takes a worker only once c1 or c2 has run its 700 ms out, and the providers start no earlier than that;
+  // still before the checks were done.
+  expect(beside).toBeGreaterThan(Math.min(...started) + 600);
+  expect(beside).toBeLessThan((await at(f.shared, "checks-done"))!);
 }, 90000);
