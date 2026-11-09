@@ -67,6 +67,70 @@ export function createExecPort(): ExecPort {
   };
 }
 
+const ESRCH = 3; // The same value on darwin and linux.
+
+/** libc kill(2) on a whole group, for Bun on darwin and linux only: true when
+ * the group was signalled or is already gone (ESRCH). Any other result is
+ * false, so the caller still kills the group by other means. Resolved once;
+ * null where bun:ffi is absent or cannot load libc. */
+type NativeGroupKill = (pid: number) => boolean;
+let nativeGroupKillOnce: Promise<NativeGroupKill | null> | undefined;
+export function nativeGroupKill(): Promise<NativeGroupKill | null> {
+  return nativeGroupKillOnce ??= (async () => {
+    if (!("Bun" in globalThis) || (process.platform !== "darwin" && process.platform !== "linux")) return null;
+    try {
+      const ffiModule = "bun:ffi";
+      const { dlopen, FFIType, read } = await import(ffiModule) as BunFfi;
+      const errnoSymbol = process.platform === "darwin" ? "__error" : "__errno_location";
+      const libc = dlopen(process.platform === "darwin" ? "libc.dylib" : "libc.so.6", {
+        kill: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+        [errnoSymbol]: { args: [], returns: FFIType.ptr },
+      });
+      const kill = libc.symbols["kill"] as (pid: number, signal: number) => number;
+      const errno = libc.symbols[errnoSymbol] as () => unknown;
+      return (pid: number) => kill(-pid, 9) === 0 || read.i32(errno(), 0) === ESRCH;
+    } catch {
+      return null;
+    }
+  })();
+}
+type BunFfi = {
+  dlopen: (path: string, symbols: Record<string, { args: unknown[]; returns: unknown }>) => { symbols: Record<string, unknown> };
+  FFIType: { i32: unknown; ptr: unknown };
+  read: { i32: (pointer: unknown, offset: number) => number };
+};
+
+/** Launch failures, not a kill that ran and failed: the group is still there. */
+const LAUNCH_FAILURES = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]);
+const UTILITY_RETRY_DELAYS_MS = [0, 50, 100, 250, 500];
+
+/** /bin/kill on a whole group. A launch that fails under load (Bun 1.1.29 can
+ * throw synchronously from execFile when the spawn itself fails) is retried
+ * within about a second; a kill that ran and failed is not, and neither is a
+ * launch that fails every time. */
+async function killGroupWithUtility(pid: number): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // Await the bounded utility asynchronously: a synchronous launch in
+      // an exit callback can lose sibling completion events in Bun 1.1.29.
+      await new Promise<void>((resolve, reject) => {
+        execFile("/bin/kill", ["-KILL", "--", `-${pid}`], {
+          timeout: 1000, maxBuffer: 16 * 1024,
+          env: { PATH: "/usr/bin:/bin", LC_ALL: "C" },
+        }, (error, _stdout, stderr) => {
+          if (error && !stderr.includes("No such process")) reject(Object.assign(error, { launched: typeof error.code !== "string" || !LAUNCH_FAILURES.has(error.code) }));
+          else resolve();
+        });
+      });
+      return;
+    } catch (error) {
+      // A synchronous throw never launched; a callback error launched unless its code says otherwise.
+      if ((error as { launched?: boolean }).launched === true || attempt + 1 >= UTILITY_RETRY_DELAYS_MS.length) throw error;
+      await new Promise(resolve => setTimeout(resolve, UTILITY_RETRY_DELAYS_MS[attempt + 1]));
+    }
+  }
+}
+
 /** A dedicated POSIX session gives this invocation exclusive signal ownership. */
 function runProcessGroup(invocation: ExecInvocation): Promise<ExecOutcome> {
   if (invocation.signal?.aborted) return Promise.resolve({ code: 1, stdout: "", stderr: "", errorCode: "ABORT_ERR" });
@@ -89,18 +153,11 @@ function runProcessGroup(invocation: ExecInvocation): Promise<ExecOutcome> {
         try { process.kill(-child.pid, "SIGKILL"); }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ERR_OUT_OF_RANGE") throw error;
-          // Older Bun rejects negative PIDs even for a group it created.
-          // Await the bounded utility asynchronously: a synchronous launch in
-          // an exit callback can lose sibling completion events in Bun 1.1.29.
-          await new Promise<void>((resolve, reject) => {
-            execFile("/bin/kill", ["-KILL", "--", `-${child.pid}`], {
-              timeout: 1000, maxBuffer: 16 * 1024,
-              env: { PATH: "/usr/bin:/bin", LC_ALL: "C" },
-            }, (error, _stdout, stderr) => {
-              if (error && !stderr.includes("No such process")) reject(error);
-              else resolve();
-            });
-          });
+          // Older Bun rejects negative PIDs even for a group it created. libc
+          // signals the group without launching anything; otherwise the
+          // bounded utility does.
+          const native = await nativeGroupKill();
+          if (native?.(child.pid) !== true) await killGroupWithUtility(child.pid);
         }
       }
       catch (error) {
