@@ -104,7 +104,8 @@ async function providerAdmission(
       const cancelBeside = new AbortController();
       let cancelledAfter: string | undefined;
       // They start once the pool is saturated (every worker holds a check, or none is left to hand out), not at
-      // once: the checks handed out first, the longest expected first, have then started and sized themselves.
+      // once: the checks handed out first, the longest expected first, have then been handed out, usually with time
+      // to size themselves while the rest wait on their bases.
       const besideRuns: Promise<{ result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }>[] = [];
       const startBeside = () => {
         if (besideRuns.length > 0 || cancelBeside.signal.aborted) return;

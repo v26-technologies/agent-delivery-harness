@@ -51,7 +51,9 @@ begin. The pool is saturated when every worker holds a check, or when no check i
 left to hand out. The gate hands out the check expected to run longest first. So a
 long check that sizes itself to the machine as it starts, such as a memory-planned
 typecheck, usually measures before any provider runs. This is a heuristic, not a
-guarantee: a check handed out after saturation starts while the providers run. The outcome is held until the gate reaches that provider in its
+guarantee. The check whose hand-out saturates the pool, any check handed out in the
+same turn (for example when several checks share one base that is already ready),
+and any check handed out later all start while the providers run. The outcome is held until the gate reaches that provider in its
 usual order, one provider at a time with an admission after each. So the verdict,
 the output and every delivery record are the same either way. A provider shares an
 existential obligation with another provider when either of them may satisfy it. A
