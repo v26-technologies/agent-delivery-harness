@@ -2282,3 +2282,16 @@ it("under failFast a check failing before the pool is saturated leaves the provi
   expect(allocated).not.toContain("live.beside");
   expect(await at(f.shared, "beside-start")).toBeUndefined();
 }, 90000);
+it("a worker that has finished its check no longer counts toward saturation", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  // c1 finishes at once on the first worker; c2's base is ready after 1.5 s, c3's after a further 1.5 s. Only when c3
+  // is handed out are both workers busy again.
+  const f = await poolFixture(["1", "2", "3"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `check-${id}`))},String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${id === "c2" ? 4000 : 0})`);
+  slowSetups(f, ["pc2", "pc3"], 1500);
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0);
+  const c2 = (await at(f.shared, "check-c2"))!, c3 = (await at(f.shared, "check-c3"))!, beside = (await at(f.shared, "beside-start"))!;
+  expect(c3 - c2).toBeGreaterThan(800);
+  expect(beside).toBeGreaterThan(c3 - 400);
+}, 90000);

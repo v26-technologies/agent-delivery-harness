@@ -119,10 +119,8 @@ async function providerAdmission(
         failures = await session.executeAll(scoped.map(([id, request]) => ({ provider: context.config.providers.find(p => p.id === id)!, obligationIds: request.obligationIds })),
           failed => { cancelledAfter = failed; cancelBeside.abort(); }, startBeside);
       } catch (error) { cancelBeside.abort(); await Promise.all(besideRuns); throw error; }
-      // A safety net only: the real executeAll either throws, or has reported saturation (at once when the pool has
-      // nothing left, otherwise when its workers fill or its last check is handed out). Unless a failure cancelled
-      // them, an executeAll that never reported starts them now, after its checks, which is serial order.
-      if (cancelledAfter === undefined) startBeside();
+      // executeAll either throws or has reported saturation: at once when the pool has nothing left, otherwise when its
+      // workers fill or its last check is handed out. A failFast cancel leaves them unstarted, as serial would.
       const settled = await Promise.all(besideRuns);
       // An interrupted invocation is an interruption, not a scoped failure's cancellation.
       if (context.signal?.aborted) throw new CliInterruption();
