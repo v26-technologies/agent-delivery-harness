@@ -61,6 +61,13 @@ describe("provider rail launch", () => {
     expect(descriptorIdentity({ dev: -1n, ino: 555203n })).toBe("18446744073709551615:555203");
     expect(descriptorIdentity({ dev: 0n, ino: 11824129486413362295n })).toBe("0:11824129486413362295");
     expect(descriptorIdentity({ dev: 0n, ino: 11824129486413362297n })).not.toBe(descriptorIdentity({ dev: 0n, ino: 11824129486413362295n }));
+    // A number-typed fstat (Bun 1.1.29 ignores bigint: true): exact when safe,
+    // and no identity at all once the value may have been rounded.
+    expect(descriptorIdentity({ dev: -1, ino: 555203 })).toBe("18446744073709551615:555203");
+    expect(descriptorIdentity({ dev: 16777229, ino: 528858049 })).toBe("16777229:528858049");
+    expect(descriptorIdentity({ dev: 0, ino: 9992126735548248000 })).toBeUndefined();
+    expect(descriptorIdentity({ dev: 2 ** 53, ino: 1 })).toBeUndefined();
+    expect(descriptorIdentity({ dev: 1, ino: 2 ** 53 - 1 })).toBe("1:9007199254740991");
   });
   it("never passes a descriptor nobody vouched for", () => {
     for (const env of [{}, { [INHERITED_DESCRIPTORS_ENV]: "" }, { [INHERITED_DESCRIPTORS_ENV]: "3,4" }, { [INHERITED_DESCRIPTORS_ENV]: "5:1:50" }, { [INHERITED_DESCRIPTORS_ENV]: "3:x:y" }])

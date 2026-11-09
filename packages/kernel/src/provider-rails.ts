@@ -306,11 +306,17 @@ export function channelIdentity(fd: number): string | undefined {
   } catch { return undefined; }
 }
 
-/** `dev:ino` as exact unsigned 64-bit decimals. A number-typed fstat rounds
- * the values sockets and anonymous pipes carry, and darwin reports a socket's
- * device as -1. */
-export function descriptorIdentity(stat: { readonly dev: bigint; readonly ino: bigint }): string {
-  return `${BigInt.asUintN(64, stat.dev)}:${BigInt.asUintN(64, stat.ino)}`;
+/** `dev:ino` as exact unsigned 64-bit decimals, or undefined when they are not
+ * exact. A number-typed fstat rounds the values sockets and anonymous pipes
+ * can carry, and Bun 1.1.29 returns numbers even when asked for bigints; a
+ * rounded value could name another pipe, so it never vouches. darwin reports
+ * a socket's device as -1. */
+export function descriptorIdentity(stat: { readonly dev: bigint | number; readonly ino: bigint | number }): string | undefined {
+  const exact = (value: bigint | number): bigint | undefined =>
+    typeof value === "bigint" ? BigInt.asUintN(64, value) : Number.isSafeInteger(value) ? BigInt.asUintN(64, BigInt(value)) : undefined;
+  const dev = exact(stat.dev);
+  const ino = exact(stat.ino);
+  return dev === undefined || ino === undefined ? undefined : `${dev}:${ino}`;
 }
 
 /** Stdio and environment for a rail provider: three pipes, then each
