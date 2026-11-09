@@ -47,8 +47,8 @@ A command provider gets plain stdio. It may also declare
 descriptors from the invocation. An invocation uses this to hand a provider a
 capability it already holds, such as a pipe to its own analysis worker. Only
 the declaring provider receives them, and only if the invocation actually holds
-them open; otherwise the provider sees them closed. No other descriptor is ever
-passed.
+them open; otherwise the provider never receives them. No other descriptor is
+ever passed.
 
 The command exchanges one JSON document per stdout/stdin line. The documents
 and state transitions are the exact vendored

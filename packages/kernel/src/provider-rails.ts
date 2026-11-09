@@ -291,7 +291,7 @@ export interface OpenProviderRailProcessInput {
 
 /** Stdio for a rail provider: three pipes, then exactly the declared
  * descriptors the invocation actually holds open. An undeclared or closed
- * descriptor is never passed: the provider sees it closed (V26-3314). */
+ * descriptor is never passed; its slot is "ignore" (V26-3314). */
 export function providerRailStdio(declared: readonly InheritedDescriptor[] = [], isOpen: (fd: number) => boolean = descriptorOpen): ("pipe" | "ignore" | number)[] {
   const stdio: ("pipe" | "ignore" | number)[] = ["pipe", "pipe", "pipe"];
   const last = Math.max(2, ...declared);
