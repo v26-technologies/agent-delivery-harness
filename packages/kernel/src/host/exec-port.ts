@@ -93,8 +93,8 @@ export function nativeGroupKill(): Promise<NativeGroupKill | null> {
   return nativeGroupKillOnce ??= (async () => {
     if (!("Bun" in globalThis) || (process.platform !== "darwin" && process.platform !== "linux")) return null;
     try {
-      const ffiModule = "bun:ffi";
-      const { dlopen, FFIType, read } = await import(ffiModule) as BunFfi;
+      // A literal specifier, so an adopter's import scanner can bound it; only Bun evaluates it.
+      const { dlopen, FFIType, read } = await import("bun:ffi") as BunFfi;
       const errnoSymbol = process.platform === "darwin" ? "__error" : "__errno_location";
       const libc = dlopen(process.platform === "darwin" ? "libc.dylib" : "libc.so.6", {
         kill: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
