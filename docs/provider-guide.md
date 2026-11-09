@@ -48,7 +48,7 @@ on a provider with `command`. When the gate runs scoped checks on more than one
 worker, it then starts that provider's live attempt while those checks run, rather
 than after them. The outcome is held until the gate reaches that provider in its
 usual order, one provider at a time with an admission after each. So the verdict,
-the output and every record are the same either way. A provider shares an
+the output and every delivery record are the same either way. A provider shares an
 existential obligation with another provider when either of them may satisfy it. A
 declared provider in that position still waits, because the gate may never need it.
 

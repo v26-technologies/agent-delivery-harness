@@ -2038,11 +2038,11 @@ it("a gate reports the same result and records whether or not its trees' deletio
 
 /** A live rail provider that marks when it starts and ends, waits `ms` (or until `until` exists), and then succeeds.
  * A `cancel` from the gate makes it mark that and exit, so a stopped provider never reports success. */
-function liveProvider(shared: string, name: string, ms: number, until?: string, outcome: "success" | "failed" | "cancelled" = "success"): [string, ...string[]] {
+function liveProvider(shared: string, name: string, ms: number, until?: string, outcome: "success" | "failed" | "cancelled" = "success", cancelDelayMs = 0): [string, ...string[]] {
   const mark = (what: string) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-`))}+'${what}',String(Date.now()))`;
   return [process.execPath, "-e", `${mark("start")};require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-pid`))},String(process.pid));let id;require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
  if(m.kind==='negotiate')console.log(JSON.stringify({kind:'negotiation',outcome:'supported',selectedVersion:'delivery-provider-rails/1',supportedVersions:['delivery-provider-rails/1']}));
- if(m.kind==='cancel'){${mark("cancelled")};process.exit(0)}
+ if(m.kind==='cancel'){${mark("cancelled")};setTimeout(()=>process.exit(0),${cancelDelayMs})}
  if(m.kind==='request'){id=m.requestId;const end=Date.now()+${ms};const done=()=>{${mark("end")};console.log(JSON.stringify({kind:'terminal',version:m.version,requestId:m.requestId,sequence:1,summary:'observed',outcome:'${outcome}'}))};
   const tick=()=>{if(${until ? `require('fs').existsSync(${JSON.stringify(until)})||` : ""}Date.now()>=end)return done();setTimeout(tick,20)};tick()}});`];
 }
@@ -2171,7 +2171,7 @@ it.each([false, true])("a provider whose invocation throws fails the gate the sa
   const f = await poolFixture(["1"], 2, () => "");
   withLiveProviders(f, [{ id: "live.root", command: liveProvider(f.shared, "root", 0), independent }]);
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
-  const artifacts = f.runtime.artifacts, allocate = artifacts.allocateRunRoot.bind(artifacts);
+  const artifacts = f.runtime.artifacts!, allocate = artifacts.allocateRunRoot.bind(artifacts);
   (artifacts as { allocateRunRoot: typeof allocate }).allocateRunRoot = async input => input.providerId === "live.root" ? { ok: false, reason: "refused for the test" } as never : allocate(input);
   expect(await f.run("gate")).toBe(1);
   expect(f.err.join("\n") + f.out.join("\n")).toContain("provider_rail_run_root_refused");
@@ -2179,7 +2179,8 @@ it.each([false, true])("a provider whose invocation throws fails the gate the sa
 it("a provider running beside the checks is cancelled and awaited when the scoped run itself throws", async () => {
   if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
   const f = await poolFixture(["1"], 2, () => "");
-  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000), independent: true }]);
+  // Slow to honour its cancel: the gate must still wait for it to end.
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000, undefined, "success", 1500), independent: true }]);
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype;
   const thrown = vi.spyOn(proto, "executeAll").mockImplementation(async () => {
@@ -2193,4 +2194,18 @@ it("a provider running beside the checks is cancelled and awaited when the scope
   const pid = (await at(f.shared, "beside-pid"))!;
   expect(() => process.kill(pid, 0)).toThrow();
   expect(Date.now() - started).toBeLessThan(15000);
+}, 90000);
+it.each([true, false])("an interruption while a provider runs beside the checks interrupts the gate and stops the provider, never reported as a failure's cancellation (failFast %s)", async failFast => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, (_, shared) => `const fs=require('fs'),end=Date.now()+20000;while(!fs.existsSync(${JSON.stringify(path.join(shared, "beside-start"))})){if(Date.now()>end)process.exit(7);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20000)`);
+  f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast } });
+  withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 20000), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const controller = new AbortController();
+  (f.runtime as { signal?: AbortSignal }).signal = controller.signal;
+  void (async () => { for (const end = Date.now() + 20000; !await at(f.shared, "beside-start") && Date.now() < end;) await new Promise(resolve => setTimeout(resolve, 20)); controller.abort(); })();
+  expect(await f.run("gate")).toBe(130);
+  expect(f.out.join("\n") + f.err.join("\n")).not.toMatch(/check_cancelled after/);
+  // The invocation's own interruption reached the provider: it never ran its twenty seconds out.
+  expect(await at(f.shared, "beside-end")).toBeUndefined();
 }, 90000);

@@ -14,7 +14,7 @@ import { refuseOverBudget } from "../scoped-budget.ts";
  * only ever offers a waiver to a `human` context, all-or-nothing over waivable
  * findings; the CLI adds no waiver logic of its own.
  */
-import { computeDeliverableIdentity, runAdmission, type AdmissionResult, type Blocker, type LiveProviderResult } from "@agent-delivery-harness/kernel";
+import { computeDeliverableIdentity, digestCanonical, runAdmission, type AdmissionResult, type Blocker, type LiveProviderResult } from "@agent-delivery-harness/kernel";
 import { CliInterruption, type CommandContext, type CommandDescriptor, type CommandResult } from "../boundary.ts";
 import { focusedOutcome } from "../delivery-posture.ts";
 import { oneLine } from "../run-surface.ts";
@@ -59,7 +59,7 @@ async function providerAdmission(
 
   const liveResults: LiveProviderResult[] = options.includeInjectedLiveResults ? [...(context.liveResults ?? [])] : [];
   const invokeProvider = context.invokeProvider;
-  const besideOutcomes = new Map<string, { result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }>();
+  const besideOutcomes = new Map<string, ({ result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }) & { obligationIds: readonly string[] }>();
   const attempted = new Set<string>();
   const attemptBlockers: Blocker[] = [];
   let admission = await admit(input, admissionOptions);
@@ -99,7 +99,7 @@ async function providerAdmission(
       const shared = (id: string) => context.config.obligations.some(o => (o.providerPolicy ?? "all") === "existential" && o.providers.includes(id) && o.providers.length > 1);
       const beside = invokeProvider === undefined ? [] : [...requested].filter(([id, request]) => {
         const registration = context.config.providers.find(p => p.id === id)!;
-        return registration.independentOfScopedChecks === true && registration.command !== undefined && request.needsLiveResult && !request.requiresEvidence && !shared(id);
+        return registration.independentOfScopedChecks === true && registration.command !== undefined && request.needsLiveResult && !request.requiresEvidence && !shared(id) && !besideOutcomes.has(id);
       });
       const cancelBeside = new AbortController();
       let cancelledAfter: string | undefined;
@@ -120,7 +120,7 @@ async function providerAdmission(
       for (const [index, [providerId]] of beside.entries()) {
         // Stopped, or finished too late to count: never reported as passed, and its obligation stays unmet.
         if (cancelledAfter !== undefined) context.write(`interrupted ${providerId}: check_cancelled after ${cancelledAfter} failed`);
-        else besideOutcomes.set(providerId, settled[index]!);
+        else besideOutcomes.set(providerId, { ...settled[index]!, obligationIds: [...new Set(beside[index]![1].obligationIds)].sort() });
       }
       admission = await admit({ ...input, ...(liveResults.length === 0 ? {} : { liveResults }) }, admissionOptions);
       continue;
@@ -148,7 +148,9 @@ async function providerAdmission(
       continue;
     }
     // A provider that already ran beside the scoped checks takes its outcome here, where serial would have run it.
-    const early = besideOutcomes.get(providerId);
+    // Only for the very request it answered: one the loop now makes differently runs again, as serial would run it.
+    const stored = besideOutcomes.get(providerId);
+    const early = stored && digestCanonical(stored.obligationIds) === digestCanonical([...new Set(request.obligationIds)].sort()) ? stored : undefined;
     if (early && "error" in early) throw early.error;
     const result = early ? early.result : await context.invokeProvider?.({
       providerId,
