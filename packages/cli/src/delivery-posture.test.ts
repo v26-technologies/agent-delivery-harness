@@ -226,6 +226,32 @@ describe("base focused", () => {
     } finally { process.env["PATH"] = original; }
   });
 
+  it("writes no record after an interrupt during the read, on a candidate whose gate passed", async () => {
+    // The boundary answers any abort with 130 once a command returns, so the exit code alone
+    // can't show the posture's own check: a record written before that return can.
+    const f = await fixture();
+    expect((await f.cli("prepare")).code).toBe(0);
+    const gated = await f.cli("gate");
+    expect(gated.code, gated.stderr).toBe(0);
+    const recordPath = await f.recordPath();
+    const bin = path.join(f.root, "shim"); await mkdir(bin);
+    const real = (await exec("/bin/sh", ["-c", "command -v git"])).stdout.trim();
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in\n  *" ls-remote "*) sleep 120 ;;\nesac\nexec "${real}" "$@"\n`);
+    await chmod(path.join(bin, "git"), 0o755);
+    const original = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${original}`;
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 300);
+      expect(await runCli(["record"], { ...f.runtime, signal: controller.signal })).toBe(130);
+    } finally { process.env["PATH"] = original; }
+    expect(existsSync(recordPath)).toBe(false);
+    // The control: the same record, uninterrupted, writes the record there.
+    const recorded = await f.cli("record");
+    expect(recorded.code, recorded.stderr).toBe(0);
+    expect(existsSync(recordPath)).toBe(true);
+  });
+
   it("gates, by the real command, from a subdirectory holding a committed bare layout", async () => {
     const f = await fixture();
     await f.publish(declaration("gate"));

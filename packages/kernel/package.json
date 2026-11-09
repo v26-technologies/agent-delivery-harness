@@ -1,6 +1,6 @@
 {
   "name": "@agent-delivery-harness/kernel",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Config-driven delivery-evidence kernel: validator, identity, records, gate evaluator",
   "license": "FSL-1.1-ALv2",

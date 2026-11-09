@@ -811,6 +811,21 @@ describe("which directory is read", () => {
     refusedAtRoot(await resolveDeliveryPosture({ rootDir: sub, baseRef: "origin/main" }), sub);
   });
 
+  it("refuses a submodule for being one, even where the enclosing work tree is not seen", async () => {
+    // Every real submodule's git directory differs from its superproject's, so the nested rule refuses it too.
+    // This answers the enclosing check with false, so only the submodule rule stands between it and focused.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const { other } = await focusedElsewhere();
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "a submodule");
+    const sub = path.join(f.repo, "sub");
+    await shimmedGit(f, `  *" rev-parse --is-inside-work-tree "*) echo false; exit 0 ;;`);
+    // The control: under the shim, the enclosing work tree is not seen.
+    expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: f.repo })).stdout.trim()).toBe("false");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: sub, baseRef: "origin/main" }), sub);
+  });
+
   it("does not read through an untracked gitfile pointing at a repository that declares focused", async () => {
     const f = await fixture();
     await f.publish(declaration("focused"));

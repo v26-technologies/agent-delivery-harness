@@ -184,12 +184,31 @@ checks a repository runs under `focused` stays the repository's, and
 | A valid `gate` declaration | `gate` | none |
 | No file at the tip | `gate` | `posture_undeclared` |
 | Not valid UTF-8 JSON, an object failing the shape above, or an unknown `posture` | `gate` | `posture_malformed` |
+| Arrays and objects nested more than 64 deep, the top-level object being depth 1 | `gate` | `posture_malformed` |
 | A symlink, tree or submodule at that path, or a blob over 64 KiB | `gate` | `posture_malformed` |
 | The base ref can't be resolved or read, or `git` fails or times out | `gate` | `posture_unreadable` |
+| The command ran from a directory that isn't a repository root, as below | `gate` | `posture_unreadable` |
 
 Under `gate`, each command's output and exit code are what they were before the
-file existed. Only `posture_malformed` adds to them, a line on stderr naming the
-code and reason, because there a repository declared something and it didn't take.
+file existed. Two cases add to them, a line on stderr naming the code and reason:
+`posture_malformed`, because there a repository declared something and it didn't
+take, and a run from a directory that isn't a repository root, which names that
+directory, because the fix is where the command runs rather than the base.
+
+The depth is measured on the text before it parses, as the greatest number of
+arrays and objects open at once outside strings, so no decoder's own nesting limit
+decides. Every reader of the file gives the same answer for the same bytes.
+
+The posture is read only from a repository's root. The directory a command runs
+from must be what `git rev-parse --show-toplevel` prints there, it must not be a
+submodule's work tree, and its parent must be in no work tree, or in one whose git
+common directory is the directory's own, with both paths compared as the file
+system resolves them, symlinks followed. So a plain subdirectory, a real nested
+repository, an initialised submodule, an untracked gitfile pointing elsewhere and
+a bare repository all read as `posture_unreadable`, whatever their own `origin`
+declares, while a linked worktree reads its base whether or not it sits inside its
+own main checkout. A repository cloned inside another repository's work tree, and
+not a linked worktree of it, is refused too.
 
 `baseRef` is config, so the candidate supplies it and it is checked rather than
 trusted. It must name `origin/<branch>`, and `<branch>` must be the remote's
@@ -209,8 +228,9 @@ tracking ref first. Each network call is bounded at 15 seconds.
 
 The check assumes the repository's own `.git/config` is the operator's. A
 repository that includes a tracked file from it, through `include.path`, has handed
-the candidate control of git, and can't rely on this check. Refusing a bare
-repository discovered in a subdirectory needs git 2.38 or newer.
+the candidate control of git, and can't rely on this check. A bare repository
+is refused on any git: from 2.38 by `safe.bareRepository`, and on an older git
+because it has no work tree, so it is no repository root.
 
 The hosted action calls the record check directly and doesn't read this file.
 
