@@ -435,3 +435,88 @@ describe("a baseRef moved to a branch that publishes itself", () => {
     await expectGated(f);
   });
 });
+
+describe("the directory a command runs from", () => {
+  /** One invocation from another directory, with the fixture's runtime otherwise. */
+  const cliIn = async (f: Awaited<ReturnType<typeof fixture>>, cwd: string, ...args: string[]) => {
+    const out: string[] = [], err: string[] = [];
+    const code = await runCli(args, { ...f.runtime, cwd, stdout: text => out.push(text), stderr: text => err.push(text) });
+    return { code, stdout: out.join(""), stderr: err.join("") };
+  };
+
+  /** A second published repository whose base declares focused, as a nested route would read it. */
+  const focusedElsewhere = async () => {
+    const other = await fixture();
+    await other.publish(declaration("focused", "Declared by another repository."));
+    return other;
+  };
+
+  /**
+   * Gated from `dir` with the root's base declaring focused: stdout empty, and
+   * stderr the `posture_unreadable` line naming the directory, then the command's
+   * own blocker: byte for byte what it gives there under a gate base, since what
+   * the base declares is never read.
+   */
+  const expectRefusedIn = async (f: Awaited<ReturnType<typeof fixture>>, dir: string) => {
+    await f.publish(declaration("gate"));
+    const gated = await cliIn(f, dir, "verify");
+    const tip = await f.publish(declaration("focused"));
+    expectFocused(await f.cli("verify"), tip);
+    const result = await cliIn(f, dir, "verify");
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    const [first, ...rest] = result.stderr.split("\n");
+    const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(first).toMatch(new RegExp(`^posture_unreadable: ${escaped(`${DELIVERY_POSTURE_PATH} on origin/main could not be read: ${dir} is not a repository root it may be read from: `)}[^;]+; treating the base as gate\\.$`));
+    expect(rest[0]).toMatch(/^\[[a-z_]+\] /);
+    expect(rest.join("\n")).not.toMatch(/posture|focused/);
+    expect(result).toEqual(gated);
+  };
+
+  it("verify from a plain subdirectory is gated, naming it ahead of the command's blocker", async () => {
+    const f = await fixture();
+    const sub = path.join(f.repo, "packages"); await mkdir(sub);
+    await expectRefusedIn(f, sub);
+  });
+
+  it("verify from a nested repository whose origin declares focused is gated the same way", async () => {
+    const f = await fixture();
+    const other = await focusedElsewhere();
+    const nested = path.join(f.repo, "nested");
+    await f.git("clone", "-q", other.remote, nested);
+    await expectRefusedIn(f, nested);
+  });
+
+  it("verify from an initialised submodule whose origin declares focused is gated the same way", async () => {
+    const f = await fixture();
+    const other = await focusedElsewhere();
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other.remote, "sub");
+    await expectRefusedIn(f, path.join(f.repo, "sub"));
+  });
+
+  it("verify through an untracked gitfile pointing at a repository that declares focused is gated the same way", async () => {
+    const f = await fixture();
+    const other = await focusedElsewhere();
+    const pkg = path.join(f.repo, "pkg"); await mkdir(pkg);
+    await writeFile(path.join(pkg, ".git"), `gitdir: ${path.join(other.repo, ".git")}\n`);
+    await expectRefusedIn(f, pkg);
+  });
+
+  it("verify from a linked worktree nested under the root exits 0 with the focused outcome", async () => {
+    const f = await fixture();
+    const tip = await f.publish(declaration("focused"));
+    const lane = path.join(f.repo, ".orchestration", "lanes", "V26-0001");
+    await f.git("worktree", "add", "-q", "--detach", lane);
+    expectFocused(await cliIn(f, lane, "verify"), tip);
+  });
+
+  it("writes nothing for a refusal the base causes, from the root", async () => {
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    await f.git("remote", "set-url", "origin", path.join(f.root, "gone.git"));
+    await f.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
+    const result = await f.cli("verify");
+    expect(result.code).toBe(1);
+    expect(result.stdout + result.stderr).not.toMatch(/posture|focused/);
+  });
+});
