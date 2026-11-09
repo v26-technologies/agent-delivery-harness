@@ -46,11 +46,12 @@ A command provider that reads no scoped check's attempts, records or outputs may
 declare `independentOfScopedChecks: true`. The declaration is only `true`, and only
 on a provider with `command`. When the gate runs scoped checks on more than one
 worker, it then starts that provider's live attempt while those checks run, rather
-than after them. It does so once every scoped check has been handed to a
-worker, not when the checks begin. A check handed out early that sizes itself to
-the machine as it starts, such as a memory-planned typecheck, usually measures
-before any provider runs. This is a heuristic, not a guarantee: the last check
-handed out may still be measuring when the providers start. The outcome is held until the gate reaches that provider in its
+than after them. It does so once the pool is saturated, not when the checks
+begin. The pool is saturated when every worker holds a check, or when no check is
+left to hand out. The gate hands out the check expected to run longest first. So a
+long check that sizes itself to the machine as it starts, such as a memory-planned
+typecheck, usually measures before any provider runs. This is a heuristic, not a
+guarantee: a check handed out after saturation starts while the providers run. The outcome is held until the gate reaches that provider in its
 usual order, one provider at a time with an admission after each. So the verdict,
 the output and every delivery record are the same either way. A provider shares an
 existential obligation with another provider when either of them may satisfy it. A

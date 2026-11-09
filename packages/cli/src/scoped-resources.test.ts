@@ -194,6 +194,26 @@ describe('native scoped installed resources',()=>{
     expect(await readFile(f.setupCount,'utf8')).toBe('setup\nsetup\n');
     expect(f.messages.some(s=>s.includes('consumer command omitted'))).toBe(true);
   },60000);
+  it('parallel gate starts a provider declared independent only after the capture worker\'s serial checks',async()=>{
+    if(!await snapshotCloneMethod())return;
+    const f=await fixture(true,true),font=f.config.providers[0]!;
+    const marks=path.join(f.dir,'.git/marks-');
+    // Both checks are the capture worker's: the first configured one and the resource consumer, which run alone first.
+    const peer={id:'check.peer',findingCodes:[],check:{command:[process.execPath,'-e',`const fs=require('fs');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,400);fs.writeFileSync('peer.json','peer');fs.writeFileSync(${JSON.stringify(marks)}+'serial-end',String(Date.now()));`] as [string,...string[]],timeoutMs:5000,outputs:['peer.json'],scope:font.check!.scope}};
+    const sensor=[process.execPath,'-e',`require('fs').writeFileSync(${JSON.stringify(marks)}+'sensor-start',String(Date.now()));require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+ if(m.kind==='negotiate')console.log(JSON.stringify({kind:'negotiation',outcome:'supported',selectedVersion:'delivery-provider-rails/1',supportedVersions:['delivery-provider-rails/1']}));
+ if(m.kind==='request')console.log(JSON.stringify({kind:'terminal',version:m.version,requestId:m.requestId,sequence:1,summary:'observed',outcome:'success'}));});`] as [string,...string[]];
+    const config=defineHarnessConfig({...f.config,providers:[peer,font,{id:'live.sensor',findingCodes:[],command:sensor,independentOfScopedChecks:true}],
+      obligations:[{...f.config.obligations[0]!,id:'peer.passed',providers:[peer.id],acceptedPayloadSpecs:['checks.passed/1']},...f.config.obligations,
+        {...f.config.obligations[0]!,id:'live.sensor.current',freshness:'live',providers:['live.sensor'],acceptedPayloadSpecs:['checks.passed/1'],allowedResolutionKinds:['satisfied_live_fact','not_applicable']}],
+      scopedExecution:{...f.config.scopedExecution!,concurrency:2,profiles:f.config.scopedExecution!.profiles.map(p=>({...p,mutableOutputs:[...p.mutableOutputs,'peer.json']}))}} as unknown as HarnessConfigInput);
+    const runtime={...f.runtime,loadConfig:async()=>config};
+    expect(await runCli(['prepare'],runtime),f.errors.join('\n')).toBe(0);
+    expect(await runCli(['gate'],runtime),f.errors.join('\n')+f.messages.join('\n')).toBe(0);
+    expect(f.messages.join('\n')).toMatch(/live\.sensor\.current=satisfied_live_fact/);
+    // The pool holds nothing once the serial checks are done, so the provider starts only then.
+    expect(Number(await readFile(marks+'sensor-start','utf8'))).toBeGreaterThanOrEqual(Number(await readFile(marks+'serial-end','utf8')));
+  },60000);
   it('parallel gate prewarms the capture worker\'s setups ahead of a longer check\'s',async()=>{
     if(!await snapshotCloneMethod())return;
     const f=await fixture(true,true),font=f.config.providers[0]!,fontProfile=font.check!.scope!.profile;

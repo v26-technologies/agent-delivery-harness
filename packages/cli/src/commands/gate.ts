@@ -103,8 +103,8 @@ async function providerAdmission(
       });
       const cancelBeside = new AbortController();
       let cancelledAfter: string | undefined;
-      // They start once every scoped check has taken a worker, not at once: a check that sizes itself to the
-      // machine (a memory-planned typecheck, say) has then already measured what it may use.
+      // They start once the pool is saturated (every worker holds a check, or none is left to hand out), not at
+      // once: the checks handed out first, the longest expected first, have then started and sized themselves.
       const besideRuns: Promise<{ result: Awaited<ReturnType<NonNullable<CommandContext["invokeProvider"]>>> } | { error: unknown }>[] = [];
       const startBeside = () => {
         if (besideRuns.length > 0 || cancelBeside.signal.aborted) return;
@@ -118,7 +118,9 @@ async function providerAdmission(
         failures = await session.executeAll(scoped.map(([id, request]) => ({ provider: context.config.providers.find(p => p.id === id)!, obligationIds: request.obligationIds })),
           failed => { cancelledAfter = failed; cancelBeside.abort(); }, startBeside);
       } catch (error) { cancelBeside.abort(); await Promise.all(besideRuns); throw error; }
-      // A run that never reached its last check starts them now, unless a failure cancelled them.
+      // A safety net only: the real executeAll either throws, or has reported saturation (at once when the pool has
+      // nothing left, otherwise when its workers fill or its last check is handed out). Unless a failure cancelled
+      // them, an executeAll that never reported starts them now, after its checks, which is serial order.
       if (cancelledAfter === undefined) startBeside();
       const settled = await Promise.all(besideRuns);
       // An interrupted invocation is an interruption, not a scoped failure's cancellation.

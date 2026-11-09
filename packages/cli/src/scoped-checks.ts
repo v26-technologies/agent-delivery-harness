@@ -310,8 +310,11 @@ export class ScopedChecks {
    * worker takes the startable id expected to run longest instead, and its clone queues by that cost, so
    * the critical path gets its base, clone and worker first.
    */
-  private async pool(ids: readonly string[], run: (id: string, lane: Lane) => Promise<void>, halted: () => boolean = () => false, expected?: ReadonlyMap<string, number>, onDrained?: () => void): Promise<void> {
-    if (ids.length === 0) onDrained?.();
+  private async pool(ids: readonly string[], run: (id: string, lane: Lane) => Promise<void>, halted: () => boolean = () => false, expected?: ReadonlyMap<string, number>, onSaturated?: () => void): Promise<void> {
+    // Once every worker holds a check, or none remains to hand out: whichever comes first, and only once.
+    let busy = 0, saturated = false;
+    const saturate = () => { if (!saturated) { saturated = true; onSaturated?.(); } };
+    if (ids.length === 0) saturate();
     const failures = new Map<string, unknown>(), remaining = [...ids];
     const sleepers = new Set<() => void>();
     const woken = () => new Promise<void>(resolve => { sleepers.add(resolve); });
@@ -322,7 +325,7 @@ export class ScopedChecks {
         if (failures.size > 0 || remaining.length === 0) return undefined;
         const index = halted() ? 0 : remaining.reduce((best, id, i) => !this.startable(id) ? best
           : best < 0 || (expected?.get(id) ?? 0) > (expected?.get(remaining[best]!) ?? 0) ? i : best, -1);
-        if (index >= 0) { const id = remaining.splice(index, 1)[0]!; this.claim(id); if (remaining.length === 0) onDrained?.(); return id; }
+        if (index >= 0) { const id = remaining.splice(index, 1)[0]!; this.claim(id); busy += 1; if (remaining.length === 0 || busy >= this.workers.length) saturate(); return id; }
         await Promise.race([woken(), ...remaining.flatMap(id => { const key = this.keyOf(id), base = this.bases.get(key); return base ? [this.settling.get(base)!] : this.claims.has(key) ? [this.claims.get(key)!.released] : []; })]);
       }
     };
@@ -332,7 +335,7 @@ export class ScopedChecks {
           const lines: string[] = [];
           try { await run(id, this.concurrency === 1 ? this.serial : { snapshots, write: text => { lines.push(text); }, priority: expected?.get(id) ?? 0 }); }
           catch (error) { failures.set(id, error); this.wakePools(); }
-          finally { this.release(this.keyOf(id), id); for (const line of lines) this.context.write(line); }
+          finally { busy -= 1; this.release(this.keyOf(id), id); for (const line of lines) this.context.write(line); }
         }
       }));
     } finally { this.poolWakers.delete(waker); }
@@ -387,8 +390,8 @@ export class ScopedChecks {
    * `scopedExecution.failFast` it stops nothing; with it, the first failure cancels every other check: one not
    * yet started never starts and one running has its process group signalled, and both are recorded
    * `interrupted` with `check_cancelled` and left out of the returned failures. `onFailFast` hears that first
-   * failure. `onAllStarted` hears, once, that every requested check has been handed to a worker (at once when none
-   * remains for the pool), and not at all if the pool throws.
+   * failure. `onAllStarted` hears, once, that the pool is saturated: every worker holds a check, or every
+   * requested check has been handed out (at once when none remains for the pool). Not at all if the pool throws.
    */
   async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[], onFailFast?: (failed: string) => void, onAllStarted?: () => void): Promise<CheckSnapshotError[]> {
     const failures = new Map<string, CheckSnapshotError>();

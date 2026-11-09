@@ -2247,26 +2247,30 @@ it("a second pass of the scoped pool does not start a provider that already ran 
   expect(f.out.join("\n").match(/passed check\.c\d/g)?.sort()).toEqual(["passed check.c1", "passed check.c2"]);
   expect(await starts(f.shared, "p")).toBe(1);
 }, 90000);
-it("providers beside the checks start only once every scoped check has taken a worker", async () => {
+it("providers beside the checks start only once the pool is saturated: every worker holds a check", async () => {
   if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
-  // Three checks on two workers: c3 takes a worker only when c1 or c2 frees one.
-  const f = await poolFixture(["1", "1", "1"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `check-${id}`))},String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${id === "c3" ? 0 : 700})`);
+  // Three checks on two workers. c2's and c3's base takes 1.5 s longer to set up, so the second worker stays empty
+  // until then; the third check waits for c1 to free a worker. Saturation comes at the first, not the last.
+  const f = await poolFixture(["1", "2", "2"], 2, (id, shared) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `check-${id}`))},String(Date.now()));Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2500)`);
+  slowSetups(f, ["pc2"], 1500);
   withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
   const proto = (await import("./scoped-checks.ts")).ScopedChecks.prototype, executeAll = proto.executeAll, checked = path.join(f.shared, "checks-done");
   const wrapped = vi.spyOn(proto, "executeAll").mockImplementation(async function (this: unknown, ...args: Parameters<typeof executeAll>) { const out = await executeAll.apply(this as never, args); await writeFile(checked, String(Date.now())); return out; });
   try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { wrapped.mockRestore(); }
-  const started = [(await at(f.shared, "check-c1"))!, (await at(f.shared, "check-c2"))!, (await at(f.shared, "check-c3"))!];
-  const beside = (await at(f.shared, "beside-start"))!;
-  // c3 takes a worker only once c1 or c2 has run its 700 ms out, and the providers start no earlier than that;
-  // still before the checks were done.
-  expect(beside).toBeGreaterThan(Math.min(...started) + 600);
+  const c1 = (await at(f.shared, "check-c1"))!, later = [(await at(f.shared, "check-c2"))!, (await at(f.shared, "check-c3"))!].sort((a, b) => a - b), beside = (await at(f.shared, "beside-start"))!;
+  // c1 ran alone first; the providers waited for the second worker to fill, but not for the last check to be handed out.
+  expect(later[0]! - c1).toBeGreaterThan(800);
+  expect(beside).toBeGreaterThan(c1 + 800);
+  expect(beside).toBeLessThan(later[1]! - 300);
   expect(beside).toBeLessThan((await at(f.shared, "checks-done"))!);
 }, 90000);
-it("under failFast a check failing before every check has a worker leaves the providers beside the checks unstarted", async () => {
+it("under failFast a check failing before the pool is saturated leaves the providers beside the checks unstarted", async () => {
   if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
-  // Three checks on two workers: c1 fails at once while c2 runs, so the halted pool hands out c3 after the cancel.
-  const f = await poolFixture(["1", "1", "1"], 2, id => id === "c1" ? "process.exit(3)" : "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1500)");
+  // c1 fails at once while c2's base is still setting up, so the second worker is still empty: the halted pool then
+  // hands c2 out after the cancel, and the providers must not start then.
+  const f = await poolFixture(["1", "2"], 2, id => id === "c1" ? "process.exit(3)" : "");
+  slowSetups(f, ["pc2"], 2000);
   f.setConfig({ ...f.config, scopedExecution: { ...f.config.scopedExecution!, failFast: true } });
   withLiveProviders(f, [{ id: "live.beside", command: liveProvider(f.shared, "beside", 0), independent: true }]);
   expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
