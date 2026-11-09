@@ -2040,7 +2040,7 @@ it("a gate reports the same result and records whether or not its trees' deletio
  * A `cancel` from the gate makes it mark that and exit, so a stopped provider never reports success. */
 function liveProvider(shared: string, name: string, ms: number, until?: string, outcome: "success" | "failed" | "cancelled" = "success", cancelDelayMs = 0): [string, ...string[]] {
   const mark = (what: string) => `require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-`))}+'${what}',String(Date.now()))`;
-  return [process.execPath, "-e", `${mark("start")};require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-pid`))},String(process.pid));let id;require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+  return [process.execPath, "-e", `${mark("start")};require('fs').appendFileSync(${JSON.stringify(path.join(shared, `${name}-starts`))},'x');require('fs').writeFileSync(${JSON.stringify(path.join(shared, `${name}-pid`))},String(process.pid));let id;require('readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
  if(m.kind==='negotiate')console.log(JSON.stringify({kind:'negotiation',outcome:'supported',selectedVersion:'delivery-provider-rails/1',supportedVersions:['delivery-provider-rails/1']}));
  if(m.kind==='cancel'){${mark("cancelled")};setTimeout(()=>process.exit(0),${cancelDelayMs})}
  if(m.kind==='request'){id=m.requestId;const end=Date.now()+${ms};const done=()=>{${mark("end")};console.log(JSON.stringify({kind:'terminal',version:m.version,requestId:m.requestId,sequence:1,summary:'observed',outcome:'${outcome}'}))};
@@ -2208,4 +2208,41 @@ it.each([true, false])("an interruption while a provider runs beside the checks 
   expect(f.out.join("\n") + f.err.join("\n")).not.toMatch(/check_cancelled after/);
   // The invocation's own interruption reached the provider: it never ran its twenty seconds out.
   expect(await at(f.shared, "beside-end")).toBeUndefined();
+}, 90000);
+/** Admits as the kernel does, except that the first admission leaves out the blocked resolutions of `hidden`: what a
+ * waiver lost later in the gate looks like to the loop, an obligation it requests only after its first pass. */
+async function hideFromFirstAdmission(hidden: readonly string[]) {
+  const kernel = await import("@agent-delivery-harness/kernel"), real = kernel.runAdmission;
+  let calls = 0;
+  return vi.spyOn(kernel, "runAdmission").mockImplementation(async (input, options) => {
+    const result = await real(input, options);
+    if (calls++ > 0 || !result.decision) return result;
+    return { ...result, decision: { ...result.decision, resolutions: result.decision.resolutions.filter(r => !(r.kind === "blocked" && hidden.includes(r.obligationId))) } };
+  });
+}
+const starts = async (shared: string, name: string) => (await readFile(path.join(shared, `${name}-starts`), "utf8").catch(() => "")).length;
+it("a provider the loop later requests for more obligations than it ran beside the checks for runs again, as serial runs it then", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.p", command: liveProvider(f.shared, "p", 0), independent: true }]);
+  // A second live obligation of the same provider, which the loop sees only after its first pass.
+  const template = f.config.obligations.find(o => o.id === "live.p.current")!;
+  f.setConfig({ ...f.config, obligations: [...f.config.obligations, { ...template, id: "live.p.late" }] } as unknown as HarnessConfigInput);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  const spy = await hideFromFirstAdmission(["live.p.late"]);
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { spy.mockRestore(); }
+  // Beside the checks for one obligation, then again for both: never the first answer replayed for the larger request.
+  expect(await starts(f.shared, "p")).toBe(2);
+  expect(f.out.join("\n")).toMatch(/live\.p\.late=satisfied_live_fact/);
+}, 90000);
+it("a second pass of the scoped pool does not start a provider that already ran beside the first", async () => {
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) return;
+  const f = await poolFixture(["1", "2"], 2, () => "");
+  withLiveProviders(f, [{ id: "live.p", command: liveProvider(f.shared, "p", 0), independent: true }]);
+  expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+  // c2 becomes requestable only after the first pass, so the pool runs twice.
+  const spy = await hideFromFirstAdmission(["check.c2.passed"]);
+  try { expect(await f.run("gate"), f.err.join("\n") + f.out.join("\n")).toBe(0); } finally { spy.mockRestore(); }
+  expect(f.out.join("\n").match(/passed check\.c\d/g)?.sort()).toEqual(["passed check.c1", "passed check.c2"]);
+  expect(await starts(f.shared, "p")).toBe(1);
 }, 90000);
