@@ -74,6 +74,7 @@ async function ownTrash(create: boolean): Promise<string | undefined> {
   try {
     if (create) await mkdir(dir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
     const found = await lstat(dir);
+    // A link's own mode usually fails the mode test as well; isDirectory() still refuses one made private.
     return found.isDirectory() && found.uid === process.getuid?.() && (found.mode & 0o077) === 0 ? dir : undefined;
   } catch { return undefined; }
 }

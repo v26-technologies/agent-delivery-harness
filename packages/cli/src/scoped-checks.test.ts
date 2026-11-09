@@ -1996,10 +1996,14 @@ it("each scoped session sweeps what ended sessions left in the trash", async () 
   const { spawn: start } = await import("node:child_process");
   const { access, mkdir: makeDir } = await import("node:fs/promises");
   const done = start("/bin/sh", ["-c", "exit 0"]); await new Promise(resolve => done.once("exit", resolve));
-  const trashed = path.join(tmpdir(), `delivery-harness-trash-${process.getuid!()}`);
-  const left = path.join(trashed, `${done.pid}-left${process.pid}${Date.now()}`);
-  await makeDir(trashed, { recursive: true, mode: 0o700 });
+  // A private temporary directory: this user's other sessions sweep the real trash too.
+  const shared = await mkdtemp(path.join(tmpdir(), "scoped-session-sweep-")); dirs.push(shared);
+  const trashed = path.join(shared, `delivery-harness-trash-${process.getuid!()}`);
+  const left = path.join(trashed, `${done.pid}-left`);
+  await makeDir(trashed, { mode: 0o700 });
   await makeDir(path.join(left, "node_modules"), { recursive: true });
+  const previous = process.env["TMPDIR"];
+  process.env["TMPDIR"] = shared;
   try {
     const f = await poolFixture(["1"], 1, () => "");
     expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
@@ -2008,8 +2012,8 @@ it("each scoped session sweeps what ended sessions left in the trash", async () 
     for (const end = Date.now() + 20_000; !gone && Date.now() < end; await new Promise(resolve => setTimeout(resolve, 50)))
       gone = await access(left).then(() => false, () => true);
     expect(gone).toBe(true);
-  } finally { await rm(left, { recursive: true, force: true }); }
-});
+  } finally { if (previous === undefined) delete process.env["TMPDIR"]; else process.env["TMPDIR"] = previous; }
+}, 90_000);
 it("a gate reports the same result and records whether or not its trees' deletion finishes", async ({ skip }) => {
   // Without cloning a gate owns no snapshot trees to delete; the row is reported skipped, not passed.
   if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) skip();

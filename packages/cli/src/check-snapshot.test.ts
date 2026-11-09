@@ -260,25 +260,33 @@ it("a tree that cannot be moved aside is removed in place", async () => {
 it("the sweep deletes what ended sessions left in the trash and leaves a live owner's", async () => {
   const { mkdir: makeDir, access } = await import("node:fs/promises");
   const { spawn: start } = await import("node:child_process");
-  const trashed = path.join(tmpdir(), `delivery-harness-trash-${process.getuid!()}`);
+  // A private temporary directory: this user's other sessions sweep the real trash too.
+  const shared = await mkdtemp(path.join(tmpdir(), "scoped-sweep-test-")); roots.push(shared);
+  const trashed = path.join(shared, `delivery-harness-trash-${process.getuid!()}`);
   // A finished process's pid is dead; a running sleep's is alive.
   const done = start("/bin/sh", ["-c", "exit 0"]); await new Promise(resolve => done.once("exit", resolve));
   const live = start("/bin/sleep", ["30"]);
-  const tag = `${process.pid}${Date.now()}`;
-  const dead = path.join(trashed, `${done.pid}-dead${tag}`), alive = path.join(trashed, `${live.pid}-live${tag}`), legacy = path.join(trashed, `legacy${tag}`);
-  // pid 1 belongs to another user: signalling it is refused, and a refused owner is alive.
-  const foreign = path.join(trashed, `1-foreign${tag}`);
-  await makeDir(trashed, { recursive: true, mode: 0o700 });
+  // More dead entries than one deletion takes, so every batch must carry its share.
+  const dead = Array.from({ length: 300 }, (_, n) => path.join(trashed, `${done.pid}-dead${n}`));
+  const alive = path.join(trashed, `${live.pid}-live`), legacy = path.join(trashed, "legacy");
+  // pid 1 belongs to another user unless this runs as root: signalling it is refused, and a refused owner is alive.
+  const foreign = path.join(trashed, "1-foreign");
+  await makeDir(trashed, { mode: 0o700 });
+  const previous = process.env["TMPDIR"];
+  process.env["TMPDIR"] = shared;
   try {
-    for (const left of [dead, alive, legacy, foreign]) { await makeDir(path.join(left, "node_modules"), { recursive: true }); await writeFile(path.join(left, "node_modules/dep"), "x"); }
+    for (const left of [...dead, alive, legacy, foreign]) await makeDir(path.join(left, "node_modules"), { recursive: true });
+    const before = inventoryProbe.commands.length;
     await sweepRemovedTrees();
-    expect(await gone(dead)).toBe(true);
-    expect(await gone(legacy)).toBe(true);
+    const batches = inventoryProbe.commands.slice(before).filter(c => c.command === "/bin/rm").map(c => c.args.slice(2));
+    expect(batches.map(batch => batch.length)).toEqual([256, 45]);
+    expect(batches.flat().sort()).toEqual([...dead, legacy].sort());
+    for (const left of [...dead, legacy]) expect(await gone(left)).toBe(true);
     await new Promise(resolve => setTimeout(resolve, 500));
     await expect(access(alive)).resolves.toBeUndefined();
-    await expect(access(foreign)).resolves.toBeUndefined();
-  } finally { live.kill("SIGKILL"); await Promise.all([alive, foreign].map(left => rm(left, { recursive: true, force: true }))); }
-});
+    if (process.getuid!() !== 0) await expect(access(foreign)).resolves.toBeUndefined();
+  } finally { live.kill("SIGKILL"); if (previous === undefined) delete process.env["TMPDIR"]; else process.env["TMPDIR"] = previous; }
+}, 60_000);
 it("a move that finds the trash gone removes the tree in place rather than calling it removed", async () => {
   const f = await fixture();
   const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} });
@@ -292,6 +300,7 @@ it("a move that finds the trash gone removes the tree in place rather than calli
 it.each([
   ["a link to another directory", "link"],
   ["a directory others can write", "open"],
+  ["a directory another user owns", "foreign"],
 ] as const)("a trash that is %s is neither swept nor moved into", async (_, planted) => {
   const { chmod: setMode, access, readdir: list } = await import("node:fs/promises");
   const temp = await mkdtemp(path.join(tmpdir(), "scoped-trash-test-")); roots.push(temp);
@@ -300,11 +309,13 @@ it.each([
   const done = (await import("node:child_process")).spawn("/bin/sh", ["-c", "exit 0"]); await new Promise(resolve => done.once("exit", resolve));
   const previous = process.env["TMPDIR"];
   process.env["TMPDIR"] = shared;
+  // Another user's directory at this user's name: seen as foreign by the uid it reports, without needing root.
+  const uid = planted === "foreign" ? vi.spyOn(process, "getuid").mockReturnValue(process.getuid!() + 1) : undefined;
   try {
     await mkdir(shared);
     const trashed = path.join(shared, `delivery-harness-trash-${process.getuid!()}`);
     if (planted === "link") { await mkdir(victim); await symlink(victim, trashed); }
-    else { await mkdir(trashed); await setMode(trashed, 0o777); }
+    else { await mkdir(trashed, { mode: 0o700 }); if (planted === "open") await setMode(trashed, 0o777); }
     const target = planted === "link" ? victim : trashed;
     await writeFile(path.join(target, "keep"), "x"); await mkdir(path.join(target, `${done.pid}-dead`));
     await sweepRemovedTrees();
@@ -313,8 +324,8 @@ it.each([
     await expect(access(snapshot.rootDir)).rejects.toMatchObject({ code: "ENOENT" });
     await new Promise(resolve => setTimeout(resolve, 500));
     expect((await list(target)).sort()).toEqual([`${done.pid}-dead`, "keep"]);
-  } finally { if (previous === undefined) delete process.env["TMPDIR"]; else process.env["TMPDIR"] = previous; }
-});
+  } finally { uid?.mockRestore(); if (previous === undefined) delete process.env["TMPDIR"]; else process.env["TMPDIR"] = previous; }
+}, 60_000);
 it("reports cleanup failure without hiding ownership of the retained snapshot", async () => {
   const f = await fixture();
   const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} });
