@@ -1139,8 +1139,9 @@ function readShape(findings: FindingList, input: unknown): HarnessConfig | undef
         let inheritDescriptors: readonly InheritedDescriptor[] | undefined;
         if (entry["inheritDescriptors"] !== undefined) {
           const value = entry["inheritDescriptors"];
+          // Array.from turns holes into undefined, which no descriptor matches.
           if (command === undefined || !Array.isArray(value) || value.length === 0 ||
-              !value.every((fd, index) => (INHERITABLE_DESCRIPTORS as readonly unknown[]).includes(fd) && (index === 0 || (fd as number) > (value[index - 1] as number)))) {
+              !Array.from(value).every((fd, index) => (INHERITABLE_DESCRIPTORS as readonly unknown[]).includes(fd) && (index === 0 || (fd as number) > (value[index - 1] as number)))) {
             findings.add("config_invalid_member", `${at}.inheritDescriptors`, "requires a provider command and ascending unique descriptors from 3 and 4");
             sound = false;
           } else inheritDescriptors = value as InheritedDescriptor[];

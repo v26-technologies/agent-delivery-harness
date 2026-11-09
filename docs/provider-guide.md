@@ -50,7 +50,9 @@ capability it already holds, such as a pipe to its own analysis worker.
 A declared descriptor is passed only when the launcher that opened it vouches
 for that very pipe or socket in `DELIVERY_HARNESS_INHERITED_DESCRIPTORS`, as
 `<fd>:<dev>:<ino>` entries (for example `3:16777220:1234,4:16777220:1235`), and
-the descriptor's own identity matches. An open descriptor alone is not enough:
+the descriptor's own identity matches. `dev` and `ino` are written as the
+decimal values `fstat` reports for the open descriptor. This applies wherever
+the product opens a provider: `gate`, `record`, and `verify`'s live collection. An open descriptor alone is not enough:
 Bun and Node hold descriptors 3 and 4 themselves, and a setting can outlive the
 descriptors it named. The provider's environment then states exactly what it
 received, and nothing when it received nothing. Only the declaring provider

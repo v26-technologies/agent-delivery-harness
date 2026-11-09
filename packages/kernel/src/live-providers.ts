@@ -94,7 +94,8 @@ export async function collectLiveProviderResults(input: CollectLiveProviderInput
       if (input.signal?.aborted) {
         return { liveResults: [], blockers: [refusal("live_provider_cancelled", "Live verification was cancelled.")] };
       }
-      const command = input.config.providers.find(provider => provider.id === providerId)?.command;
+      const registration = input.config.providers.find(provider => provider.id === providerId);
+      const command = registration?.command;
       // Missing registrations remain absent observations. The existing evaluator
       // decides whether that absence blocks this obligation's provider coverage.
       if (command === undefined) continue;
@@ -111,7 +112,9 @@ export async function collectLiveProviderResults(input: CollectLiveProviderInput
           candidate: before.candidate,
         },
       }, {
-        open: () => openProviderRailProcess({ command, cwd: input.rootDir, env: input.env }),
+        // The provider's own declaration, as at the gate and record boundary.
+        open: () => openProviderRailProcess({ command, cwd: input.rootDir, env: input.env,
+          ...(registration?.inheritDescriptors ? { inheritDescriptors: registration.inheritDescriptors } : {}) }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
       });
       if (result.kind === "success") {

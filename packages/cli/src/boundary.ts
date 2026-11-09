@@ -569,10 +569,14 @@ async function runConfiguredCommand(
               requiresEvidence,
             },
             {
-              open: () =>
-                runtime.openProviderRail === undefined
-                  ? openProviderRailProcess({ command, cwd: runtime.cwd, env: { ...runtime.env }, ...(inherited ? { inheritDescriptors: inherited } : {}) })
-                  : runtime.openProviderRail({ providerId, command, cwd: runtime.cwd, env: runtime.env, ...(inherited ? { inheritDescriptors: inherited } : {}) }),
+              open: () => {
+                // Both openers receive the same input, so the test seam
+                // observes exactly what the real launch is given.
+                const rail = { command, cwd: runtime.cwd, env: { ...runtime.env }, ...(inherited ? { inheritDescriptors: inherited } : {}) };
+                return runtime.openProviderRail === undefined
+                  ? openProviderRailProcess(rail)
+                  : runtime.openProviderRail({ providerId, ...rail });
+              },
               publishManifest: (manifestPath) =>
                 submitManifest(
                   { rootDir: runtime.cwd, config, manifestPath },

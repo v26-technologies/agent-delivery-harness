@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { INHERITED_DESCRIPTORS_ENV, providerRailLaunch } from "./provider-rails.ts";
+import { closeSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { channelIdentity, INHERITED_DESCRIPTORS_ENV, providerRailLaunch } from "./provider-rails.ts";
 
 // V26-3314: a rail provider inherits a descriptor only when it declares it and
 // the launcher vouched for that very pipe or socket; its environment then says
@@ -26,9 +29,57 @@ describe("provider rail launch", () => {
     expect(slots([3, 4], vouched, () => undefined)).toEqual(["ignore", "ignore"]);
     expect(providerRailLaunch([3, 4], vouched, () => "9:9").env).toEqual({});
   });
+  it("reads the vouch strictly: an exact fd field, the whole entry, the device as well as the inode, and the first entry per fd", () => {
+    for (const entry of ["13:1:30", "3:1:30:9", "03:1:30", "x3:1:30", "3:2:30", "3:1:3"])
+      expect(slots([3], { [INHERITED_DESCRIPTORS_ENV]: entry }), entry).toEqual(["ignore"]);
+    expect(slots([3], { [INHERITED_DESCRIPTORS_ENV]: "3:1:30,3:1:31" })).toEqual([3]);
+    expect(slots([3], { [INHERITED_DESCRIPTORS_ENV]: "3:1:31,3:1:30" })).toEqual(["ignore"]);
+  });
+  it("gives only a pipe or socket an identity", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "rail-identity-"));
+    const file = path.join(root, "plain");
+    writeFileSync(file, "x");
+    const fd = openSync(file, "r");
+    try {
+      expect(channelIdentity(fd)).toBeUndefined();
+      expect(channelIdentity(987654)).toBeUndefined();
+    } finally {
+      closeSync(fd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("never passes a descriptor nobody vouched for", () => {
     for (const env of [{}, { [INHERITED_DESCRIPTORS_ENV]: "" }, { [INHERITED_DESCRIPTORS_ENV]: "3,4" }, { [INHERITED_DESCRIPTORS_ENV]: "5:1:50" }, { [INHERITED_DESCRIPTORS_ENV]: "3:x:y" }])
       expect(slots([3, 4], env)).toEqual(["ignore", "ignore"]);
+  });
+  it.skipIf(process.platform === "win32")("opens a real provider with the vouched pipe only when it declares it, and states only what it passed", async () => {
+    // Through openProviderRailProcess itself: the parent holds a pipe on fd 3
+    // carrying a marker, and each provider reports what fd 3 held and what its
+    // environment says it inherited.
+    const rails = pathToFileURL(fileURLToPath(new URL("./provider-rails.ts", import.meta.url))).href;
+    const provider = "const fs=require('fs');let held=null;try{held=fs.readFileSync(3,'utf8')}catch{}" +
+      `process.stdout.write(JSON.stringify({held,stated:process.env.${INHERITED_DESCRIPTORS_ENV}??null})+'\\n');process.stdin.resume();`;
+    const parent = `import { openProviderRailProcess, channelIdentity, INHERITED_DESCRIPTORS_ENV } from ${JSON.stringify(rails)};
+const own = { ...process.env, [INHERITED_DESCRIPTORS_ENV]: "3:" + channelIdentity(3) };
+const stale = { ...process.env, [INHERITED_DESCRIPTORS_ENV]: "3:0:1" };
+for (const [declared, env] of [[undefined, own], [[3], stale], [[3], own]]) {
+  const session = await openProviderRailProcess({ command: [process.execPath, "-e", ${JSON.stringify(provider)}], cwd: process.cwd(), env,
+    ...(declared ? { inheritDescriptors: declared } : {}) });
+  console.log(JSON.stringify(await session.receive()));
+  await session.close();
+}`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", parent], { stdio: ["ignore", "pipe", "pipe", "pipe"] });
+    let out = "", err = "";
+    child.stdout!.on("data", (chunk) => { out += chunk; });
+    child.stderr!.on("data", (chunk) => { err += chunk; });
+    (child.stdio[3] as NodeJS.WritableStream).end("marker");
+    await new Promise((resolve) => child.once("close", resolve));
+    expect(err).toBe("");
+    const [undeclared, stale, declared] = out.trim().split("\n").map((line) => JSON.parse(line) as { held: string | null; stated: string | null });
+    expect(undeclared).toEqual({ held: null, stated: null });
+    expect(stale).toEqual({ held: null, stated: null });
+    expect(declared!.held).toBe("marker");
+    expect(declared!.stated).toMatch(/^3:\d+:\d+$/);
   });
   it.skipIf(process.platform === "win32")("hands a real child the vouched pipe only when declared and only for its own identity", async () => {
     // The parent holds a pipe on fd 3 carrying a marker. A shell child reads fd
