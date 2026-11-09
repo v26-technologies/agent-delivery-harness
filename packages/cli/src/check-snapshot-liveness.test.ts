@@ -58,7 +58,8 @@ it.each([process.execPath, ...(spawnSync("bun", ["--version"]).status === 0 ? ["
   await symlink("a.txt",path.join(consumer,"link"));
   const bundle=path.join(root,"snapshot.mjs");
   const result=await build({entryPoints:[fileURLToPath(new URL("./check-snapshot.ts",import.meta.url))],outfile:bundle,bundle:true,platform:"node",format:"esm",target:"node22.6",metafile:true,logLevel:"silent"});
-  expect(Object.values(result.metafile!.outputs).flatMap(output=>output.imports).every(row=>row.path.startsWith("node:") || ["fs","path","os","crypto","util","child_process"].includes(row.path))).toBe(true);
+  // Only runtime builtins: Node's, and Bun's FFI, which the kernel loads only under Bun.
+  expect(Object.values(result.metafile!.outputs).flatMap(output=>output.imports).filter(row=>!(row.path.startsWith("node:") || ["fs","path","os","crypto","util","child_process","bun:ffi"].includes(row.path)))).toEqual([]);
   const script=`const {snapshotInventory}=await import(${JSON.stringify(bundle)});console.log(await snapshotInventory(${JSON.stringify(consumer)},['skip/'],true));`;
   const output=await exec(executable,["--input-type=module","--eval",script],{cwd:consumer,env:{PATH:process.env["PATH"]}});
   expect(output.stdout.trim()).toBe(digestCanonical([["a.txt",0o111,sha256Hex("source")],["link","link","a.txt"]]));
