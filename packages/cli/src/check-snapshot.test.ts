@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, expect, it, vi } from "vitest";
-import { createCheckSnapshot } from "./check-snapshot.ts";
+import { createCheckSnapshot, sweepRemovedTrees } from "./check-snapshot.ts";
 
-const removal = vi.hoisted(() => ({ fail: "" }));
+const removal = vi.hoisted(() => ({ fail: "", renameRefused: "" }));
 const inventoryProbe = vi.hoisted(() => ({ preload: "", commands: [] as Array<{ command: string; args: string[] }> }));
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -19,6 +19,9 @@ vi.mock("node:fs/promises", async importOriginal => {
   return { ...actual, rm: async (...args: Parameters<typeof actual.rm>) => {
     if (args[0] === removal.fail) throw Object.assign(new Error("fixture removal refused"), { code: "EACCES" });
     return actual.rm(...args);
+  }, rename: async (...args: Parameters<typeof actual.rename>) => {
+    if (args[0] === removal.fail || removal.renameRefused === args[0]) throw Object.assign(new Error("fixture move refused"), { code: "EXDEV" });
+    return actual.rename(...args);
   } };
 });
 const exec = promisify(execFile);
@@ -218,6 +221,59 @@ it("refuses failed dependency setup and source mutation by install", async () =>
   }
 });
 
+/** Waits until `file` is gone, for a deletion this process does not wait on. */
+async function gone(file: string, ms = 20000) {
+  const { access } = await import("node:fs/promises");
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise(resolve => setTimeout(resolve, 50)))
+    if (await access(file).then(() => false, () => true)) return true;
+  return false;
+}
+it("cleanup moves the tree out of its path at once and deletes it in a detached process", async () => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} });
+  await writeFile(path.join(snapshot.rootDir, "marker"), "owned");
+  const before = inventoryProbe.commands.length;
+  await snapshot.cleanup();
+  const { access } = await import("node:fs/promises");
+  await expect(access(snapshot.rootDir)).rejects.toMatchObject({ code: "ENOENT" });
+  // One detached removal of the trees moved into the trash, not an in-process walk of them.
+  const removals = inventoryProbe.commands.slice(before).filter(c => c.command === "/bin/rm");
+  expect(removals).toHaveLength(1);
+  const moved = removals[0]!.args.slice(2);
+  expect(moved.length).toBeGreaterThan(0);
+  for (const target of moved) {
+    expect(path.dirname(target)).toBe(path.join(tmpdir(), "delivery-harness-trash"));
+    expect(await gone(target)).toBe(true);
+  }
+});
+it("a tree that cannot be moved aside is removed in place", async () => {
+  const f = await fixture();
+  const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} });
+  removal.renameRefused = snapshot.rootDir;
+  try {
+    await snapshot.cleanup();
+    const { access } = await import("node:fs/promises");
+    await expect(access(snapshot.rootDir)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { removal.renameRefused = ""; }
+});
+it("the sweep deletes what ended sessions left in the trash and leaves a live owner's", async () => {
+  const { mkdir: makeDir, access } = await import("node:fs/promises");
+  const { spawn: start } = await import("node:child_process");
+  const trashed = path.join(tmpdir(), "delivery-harness-trash");
+  // A finished process's pid is dead; a running sleep's is alive.
+  const done = start("/bin/sh", ["-c", "exit 0"]); await new Promise(resolve => done.once("exit", resolve));
+  const live = start("/bin/sleep", ["30"]);
+  const tag = `${process.pid}${Date.now()}`;
+  const dead = path.join(trashed, `${done.pid}-dead${tag}`), alive = path.join(trashed, `${live.pid}-live${tag}`), legacy = path.join(trashed, `legacy${tag}`);
+  try {
+    for (const left of [dead, alive, legacy]) { await makeDir(path.join(left, "node_modules"), { recursive: true }); await writeFile(path.join(left, "node_modules/dep"), "x"); }
+    await sweepRemovedTrees();
+    expect(await gone(dead)).toBe(true);
+    expect(await gone(legacy)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await expect(access(alive)).resolves.toBeUndefined();
+  } finally { live.kill("SIGKILL"); await rm(alive, { recursive: true, force: true }); }
+});
 it("reports cleanup failure without hiding ownership of the retained snapshot", async () => {
   const f = await fixture();
   const snapshot = await createCheckSnapshot({ rootDir: f.root, candidate: f.candidate, outputs: [], environment: {} });
