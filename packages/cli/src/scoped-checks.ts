@@ -386,9 +386,10 @@ export class ScopedChecks {
    * Runs the gate's requested checks on the pool. A check's own failure is returned in request order. Without
    * `scopedExecution.failFast` it stops nothing; with it, the first failure cancels every other check: one not
    * yet started never starts and one running has its process group signalled, and both are recorded
-   * `interrupted` with `check_cancelled` and left out of the returned failures.
+   * `interrupted` with `check_cancelled` and left out of the returned failures. `onFailFast` hears that first
+   * failure. `onAllStarted` hears, once, that every requested check has been handed to a worker (at once when none
+   * remains for the pool), and not at all if the pool throws.
    */
-  /** `onAllStarted` hears, once, that every requested check has taken a worker, or that the run halted first. */
   async executeAll(requests: readonly { readonly provider: ProviderRegistration; readonly obligationIds: readonly string[] }[], onFailFast?: (failed: string) => void, onAllStarted?: () => void): Promise<CheckSnapshotError[]> {
     const failures = new Map<string, CheckSnapshotError>();
     const failFast = this.context.config.scopedExecution?.failFast === true;
