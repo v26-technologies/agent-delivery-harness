@@ -204,15 +204,17 @@ from must be what `git rev-parse --show-toplevel` prints there, and it must not 
 a submodule's work tree. Above it, its parent must be in no work tree, or in one
 whose git common directory is the directory's own, and so must every directory up
 to the file system's root that git could take for a repository: one holding a
-`.git` entry of any kind, or shaped as a git directory itself. Each git common
+`.git` entry of any kind, or shaped as a git directory itself, where an entry
+the file system can't say is absent counts as there. Each git common
 directory is compared as the file system resolves it, symlinks followed, and any
 git that fails or times out on the way refuses, except where it finds no
-repository at all. So a plain subdirectory, a real nested repository (including one
+repository at all. The directory's own git directory is the one ancestor not
+probed, since it is the repository that answers for the directory. So a plain subdirectory, a real nested repository (including one
 under a bare layout or a broken gitfile, or a linked worktree of one), an
 initialised submodule, an untracked gitfile pointing elsewhere and a bare
 repository all read as `posture_unreadable`, whatever their own `origin` declares,
 while a linked worktree reads its base whether or not it sits inside its own main
-checkout. A repository cloned inside another repository's work tree, and not a
+checkout, and a linked worktree inside its own bare repository reads it too. A repository cloned inside another repository's work tree, and not a
 linked worktree of it, is refused too, as is every repository under a directory
 that is itself a repository, such as a home directory kept in git.
 

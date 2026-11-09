@@ -13,6 +13,20 @@ import {
   resolveDeliveryPosture,
 } from "./index.ts";
 
+// lstat passes through unless a row names a path whose lstat should fail with some error other than absence.
+const lstatFails = vi.hoisted(() => new Map<string, string>());
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...original,
+    lstat: (async (target: string, ...rest: unknown[]) => {
+      const code = lstatFails.get(String(target));
+      if (code !== undefined) throw Object.assign(new Error(`${code}: lstat '${String(target)}'`), { code });
+      return (original.lstat as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof original.lstat,
+  };
+});
+
 const exec = promisify(execFile);
 const dirs: string[] = [];
 // Each scenario runs many real git commands, which a busy machine can make slow.
@@ -21,6 +35,7 @@ let originalPath: string | undefined;
 beforeEach(() => { originalPath = process.env["PATH"]; });
 afterEach(async () => {
   process.env["PATH"] = originalPath;
+  lstatFails.clear();
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
 });
 
@@ -873,6 +888,27 @@ describe("which directory is read", () => {
     // The controls: git fails from the parent, and nothing above the parent is in a work tree.
     await expect(exec("git", ["-c", "safe.bareRepository=explicit", "rev-parse", "--is-inside-work-tree"], { cwd: holder })).rejects.toThrow();
     expect((await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: outside }).catch(() => ({ stdout: "no repository" }))).stdout.trim()).not.toBe("true");
+    refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
+  });
+
+  it.each(["EACCES", "ENAMETOOLONG", "EIO"])("refuses when an ancestor's .git cannot be looked at (%s)", async (code) => {
+    // Only absence clears an ancestor: an entry that may be there is probed, and an ancestor that is no repository then fails to read.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    expect(await f.resolve()).toMatchObject({ posture: "focused", code: null });
+    lstatFails.set(path.join(await realpath(f.root), ".git"), code);
+    refusedAtRoot(await f.resolve(), f.repo);
+  });
+
+  it("refuses under a bare repository whose objects directory cannot be looked at", async () => {
+    // A path near PATH_MAX makes lstat fail this way on the one name longer than the directory's own .git.
+    const { other } = await focusedElsewhere();
+    const outside = await mkdtemp(path.join(tmpdir(), "delivery-posture-holder-")); dirs.push(outside);
+    const holder = path.join(await realpath(outside), "bare");
+    await exec("git", ["clone", "-q", "--bare", other.remote, holder]);
+    const nested = path.join(holder, "nested");
+    await exec("git", ["clone", "-q", other.remote, nested]);
+    lstatFails.set(path.join(holder, "objects"), "ENAMETOOLONG");
     refusedAtRoot(await resolveDeliveryPosture({ rootDir: nested, baseRef: "origin/main" }), nested);
   });
 
