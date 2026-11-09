@@ -1,6 +1,7 @@
 /** Private execution tree. Never shares writable source, objects, index or dependencies. */
 import { spawn } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { candidateTreeSourceReader, capturePhysicalSource, createExecPort, isPhysicalSourceDefinition, physicalSourceOutputOverlap, type CandidateCommandRunner, type PhysicalSourceDefinition, type ExecOutcome } from "@agent-delivery-harness/kernel";
@@ -60,8 +61,80 @@ function phaseMeter(onPhase?: (phase: SnapshotPhase, durationMs: number) => void
     try { return await operation(); } finally { try { onPhase?.(phase, performance.now() - started); } catch { /* Timing cannot change admission. */ } }
   };
 }
+/** Where removed trees wait to be deleted: beside them in the temporary directory, so moving one is a rename on
+ * the same volume. Nothing here is evidence, and nothing reads it. */
+const trash = () => path.join(tmpdir(), `delivery-harness-trash-${process.getuid?.() ?? "user"}`);
+/**
+ * The trash, only when it is this user's own private directory. A temporary directory may be shared, and the
+ * sweep deletes what it lists, so a link or another user's directory at that name is never followed: the
+ * caller removes in place instead.
+ */
+async function ownTrash(create: boolean): Promise<string | undefined> {
+  const dir = trash();
+  try {
+    if (create) await mkdir(dir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+    const found = await lstat(dir);
+    // A link's own mode usually fails the mode test as well; isDirectory() still refuses one made private.
+    return found.isDirectory() && found.uid === process.getuid?.() && (found.mode & 0o077) === 0 ? dir : undefined;
+  } catch { return undefined; }
+}
+/** Deletes `paths` in a process this one does not wait for or outlive the need of. Best effort: whatever a stopped
+ * deletion leaves in the trash, the next session's sweep removes. Batched so no argument list outgrows the host's. */
+function deleteDetached(paths: readonly string[]): void {
+  for (let at = 0; at < paths.length; at += 256) {
+    try {
+      const child = spawn("/bin/rm", ["-rf", "--", ...paths.slice(at, at + 256)], { detached: true, stdio: "ignore" });
+      child.on("error", () => { /* Left for the next sweep. */ });
+      child.unref();
+    } catch { /* Left for the next sweep. */ }
+  }
+}
+/** Whether the process that moved a tree aside may still be deleting it. A reused pid only delays a sweep. */
+function ownerAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+/** Removes, in the background, what sessions that have ended left in the trash. An entry is named for the process
+ * that moved it there; one whose owner is still alive, this process included, is left to that owner's deletion. */
+export async function sweepRemovedTrees(): Promise<void> {
+  if (process.platform === "win32") return;
+  const dir = await ownTrash(false);
+  if (!dir) return;
+  const entries = await readdir(dir).catch(() => [] as string[]);
+  deleteDetached(entries.filter(entry => {
+    const pid = Number(/^(\d+)-/.exec(entry)?.[1]);
+    return !Number.isSafeInteger(pid) || pid <= 0 || !ownerAlive(pid);
+  }).map(entry => path.join(dir, entry)));
+}
+/**
+ * Takes each owned tree out of its path at once, by renaming it into the trash, and deletes it in a detached
+ * process: a tree with installed dependencies can take ten seconds or more to remove, and the evidence it
+ * produced is already retained. A tree that cannot be moved is removed in place, as before, and only a tree
+ * neither moved nor removed fails the cleanup.
+ */
 async function removeTrees(directories: readonly string[]): Promise<void> {
-  const removed = await Promise.allSettled(directories.map(dir => rm(dir, { recursive: true, force: true })));
+  const moved: string[] = [];
+  const into = process.platform === "win32" ? undefined : await ownTrash(true);
+  const removed = await Promise.allSettled(directories.map(async dir => {
+    if (into) {
+      try {
+        // A rename never copies; on another volume the tree is removed in place instead. The device check only
+        // spares a doomed rename: one across volumes fails with EXDEV and falls through to the same removal.
+        const [from, to] = await Promise.all([stat(path.dirname(dir)), stat(into)]);
+        if (from.dev === to.dev) {
+          const target = path.join(into, `${process.pid}-${randomUUID()}`);
+          await rename(dir, target);
+          moved.push(target);
+          return;
+        }
+      } catch (error) {
+        // Done only when the tree itself is gone, not when the trash went missing under the move.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && await lstat(dir).then(() => false, gone => (gone as NodeJS.ErrnoException).code === "ENOENT")) return;
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }));
+  deleteDetached(moved);
   if (removed.some(result => result.status === "rejected")) throw new CheckSnapshotError("check_snapshot_cleanup_failed", "Cannot remove the owned execution snapshot after retaining evidence.");
 }
 /** One copy-on-write clone of a directory tree into a path that must not exist yet. On macOS
