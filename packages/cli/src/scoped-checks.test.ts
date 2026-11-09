@@ -8,6 +8,16 @@ import { createArtifactsPort, defineHarnessConfig, type HarnessConfigInput } fro
 import base from "../../../harness.config.ts";
 import { runCli, type CliRuntime } from "./index.ts";
 const exec = promisify(execFile), dirs: string[] = [];
+/** With `kill`, each detached tree deletion is killed as it starts, as a machine stopping mid-deletion would. */
+const deletion = vi.hoisted(() => ({ kill: false, killed: 0 }));
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: (...args: Parameters<typeof actual.spawn>) => {
+    const child = actual.spawn(...args);
+    if (deletion.kill && args[0] === "/bin/rm") { child.kill("SIGKILL"); deletion.killed++; }
+    return child;
+  } };
+});
 afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
 async function fixture() {
   const dir = await mkdtemp(path.join(tmpdir(), "scoped-cli-")); dirs.push(dir);
@@ -1949,4 +1959,79 @@ it("a setup that always fails is recorded on each check that needed it", async (
   const setups = await latestSetups(f);
   // Whether or not a prewarm failed first, each failed attempt owns a setup it ran and its dependency result.
   for (const d of setups) expect(d).toMatchObject({ phase: "snapshot-setup", failure: { code: "check_dependency_failed" }, dependency: { command: { exitCode: 3 } }, setup: { action: "executed" } });
+}, 90000);
+it("hashes an unchanged host tool once a process, and a changed one again", async () => {
+  const { hostToolDigest } = await import("./scoped-checks.ts");
+  const { createHash } = await import("node:crypto");
+  const { utimes } = await import("node:fs/promises");
+  const dir = await mkdtemp(path.join(tmpdir(), "host-tool-")); dirs.push(dir);
+  const tool = path.join(dir, "tool");
+  await writeFile(tool, "one", { mode: 0o755 });
+  // A whole-millisecond mtime survives being set again exactly, so only ctime can tell the rewrite apart.
+  const pinned = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+  await utimes(tool, pinned, pinned);
+  let reads = 0;
+  const counting = async (file: string) => { reads++; return readFile(file); };
+  const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+  // Every scoped check binds the same tool: one read serves them all, concurrent or not.
+  const first = await Promise.all([1, 2, 3].map(() => hostToolDigest(tool, counting)));
+  expect(await hostToolDigest(tool, counting)).toEqual(first[0]);
+  expect(first.map(d => d.sha256)).toEqual([sha("one"), sha("one"), sha("one")]);
+  expect(first[0]!.mode).toBe(0o111);
+  expect(reads).toBe(1);
+  // Same size, same mtime: the change of ctime alone gives a new key, so the new bytes are hashed.
+  await writeFile(tool, "two"); await utimes(tool, pinned, pinned);
+  expect((await import("node:fs")).statSync(tool).mtimeMs).toBe(pinned.getTime());
+  expect((await hostToolDigest(tool, counting)).sha256).toBe(sha("two"));
+  expect(reads).toBe(2);
+  // A read that fails is not remembered: the next check reads the tool again.
+  const flaky = path.join(dir, "flaky");
+  await writeFile(flaky, "three", { mode: 0o755 });
+  let failing = true;
+  const once = async (file: string) => { if (failing) { failing = false; throw new Error("fixture read refused"); } return readFile(file); };
+  await expect(hostToolDigest(flaky, once)).rejects.toThrow("fixture read refused");
+  expect((await hostToolDigest(flaky, once)).sha256).toBe(sha("three"));
+});
+it("each scoped session sweeps what ended sessions left in the trash", async () => {
+  const { spawn: start } = await import("node:child_process");
+  const { access, mkdir: makeDir } = await import("node:fs/promises");
+  const done = start("/bin/sh", ["-c", "exit 0"]); await new Promise(resolve => done.once("exit", resolve));
+  // A private temporary directory: this user's other sessions sweep the real trash too.
+  const shared = await mkdtemp(path.join(tmpdir(), "scoped-session-sweep-")); dirs.push(shared);
+  const trashed = path.join(shared, `delivery-harness-trash-${process.getuid!()}`);
+  const left = path.join(trashed, `${done.pid}-left`);
+  await makeDir(trashed, { mode: 0o700 });
+  await makeDir(path.join(left, "node_modules"), { recursive: true });
+  const previous = process.env["TMPDIR"];
+  process.env["TMPDIR"] = shared;
+  try {
+    const f = await poolFixture(["1"], 1, () => "");
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    await f.run("gate");
+    let gone = false;
+    for (const end = Date.now() + 20_000; !gone && Date.now() < end; await new Promise(resolve => setTimeout(resolve, 50)))
+      gone = await access(left).then(() => false, () => true);
+    expect(gone).toBe(true);
+  } finally { if (previous === undefined) delete process.env["TMPDIR"]; else process.env["TMPDIR"] = previous; }
+}, 90_000);
+it("a gate reports the same result and records whether or not its trees' deletion finishes", async ({ skip }) => {
+  // Without cloning a gate owns no snapshot trees to delete; the row is reported skipped, not passed.
+  if (!await (await import("./check-snapshot.ts")).snapshotCloneMethod()) skip();
+  const runs: { gate: number; out: string[]; verify: number }[] = [];
+  for (const kill of [false, true]) {
+    const f = await poolFixture(["1", "2"], 2, () => "");
+    expect(await f.run("prepare"), f.err.join("\n")).toBe(0);
+    deletion.kill = kill; deletion.killed = 0;
+    try {
+      const gate = await f.run("gate");
+      const out = f.out.map(line => normalized(f, line)).filter(line => !/^(snapshot|setup|prewarm) /.test(line)).sort();
+      expect(await f.run("record"), f.err.join("\n")).toBe(0);
+      await f.git("add", ".");
+      runs.push({ gate, out, verify: await f.run("verify") });
+      if (kill) expect(deletion.killed).toBeGreaterThan(0);
+    } finally { deletion.kill = false; }
+  }
+  expect(runs[0]!.gate).toBe(0);
+  expect(runs[0]!.verify).toBe(0);
+  expect(runs[1]).toEqual(runs[0]);
 }, 90000);

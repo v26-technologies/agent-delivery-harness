@@ -7,12 +7,27 @@ import { deliveryRecordPathFor, recordOutputProvider, computeDeliverableIdentity
   type CandidateBinding, type CapturedCandidate, type ProviderRegistration, type ScopedCheckPlan, type ScopedExecutionProfile, type ScopedRuntimeObservation, type RecordCandidateBinding } from "@agent-delivery-harness/kernel";
 import type { CommandContext } from "./boundary.ts";
 import { AttemptStore, type AttemptPayload, type StoredAttempt } from "./scoped-attempts.ts";
-import { CheckSnapshotError, createCheckSnapshot, executionPath, snapshotCloneMethod, type CheckSnapshot, type CloneMethod, type SnapshotRequest } from "./check-snapshot.ts";
+import { CheckSnapshotError, createCheckSnapshot, executionPath, snapshotCloneMethod, sweepRemovedTrees, type CheckSnapshot, type CloneMethod, type SnapshotRequest } from "./check-snapshot.ts";
 import { captureInstalledDataBinding, type InstalledDataSourceTree } from "./scoped-installed-data.ts";
 import { captureOwnedInstalledDataResources } from "./installed-data-resources.ts";
 import { redactScopedStreams, scopedCommandDiagnostic, scopedDependencyDiagnostic, scopedDiagnosticFailure, type RecordedScopedAttemptDiagnostic, type ScopedSetupDiagnostic } from "./scoped-diagnostics.ts";
 export function scopedCandidate(candidate: CandidateBinding): RecordCandidateBinding {
   return { treeSha: candidate.treeSha, deliverableDigest: candidate.deliverable.digest, identityToken: candidate.deliverable.identity, baseRef: candidate.base.ref, baseTipSha: candidate.base.tipSha, mergeBaseSha: candidate.base.mergeBaseSha, workspaceId: candidate.workspaceId };
+}
+/** A host tool's sha256 within this process, by the file's identity and last change: every scoped check binds
+ * the same node, package manager and setup tool, and each is often 50–120 MB. A changed file has a new key. */
+const hostToolDigests = new Map<string, Promise<string>>();
+export async function hostToolDigest(file: string, readBytes: (file: string) => Promise<Uint8Array> = readFile): Promise<{ sha256: string; mode: number }> {
+  const before = await stat(file);
+  const key = JSON.stringify([before.dev, before.ino, before.size, before.mtimeMs, before.ctimeMs]);
+  let digest = hostToolDigests.get(key);
+  if (!digest) {
+    // ctime moves on every write, so a file changed during this read can never present this key again.
+    digest = readBytes(file).then(bytes => sha256Hex(bytes));
+    hostToolDigests.set(key, digest);
+    digest.catch(() => { if (hostToolDigests.get(key) === digest) hostToolDigests.delete(key); });
+  }
+  return { sha256: await digest, mode: before.mode & 0o111 };
 }
 async function executableIdentity(command: string, root: string, searchPath: string, cwd: string, read: Awaited<ReturnType<typeof candidateTreeEvidenceReader>>) {
   if (command.includes(path.sep) && !path.isAbsolute(command)) {
@@ -27,7 +42,8 @@ async function executableIdentity(command: string, root: string, searchPath: str
     try { await access(file); } catch { continue; }
     const relative = path.relative(await realpath(root), await realpath(file));
     if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) throw new CheckSnapshotError("check_runtime_author_path", "Repository execution tools must use a relative command so they run from the private prepared tree.");
-    return { command, sha256: sha256Hex(await readFile(file)), mode: (await stat(file)).mode & 0o111 };
+    const { sha256, mode } = await hostToolDigest(file);
+    return { command, sha256, mode };
   }
   throw new CheckSnapshotError("check_runtime_unavailable", "A declared execution tool cannot be resolved and bound.");
 }
@@ -167,6 +183,8 @@ export class ScopedChecks {
   static async create(context: CommandContext, candidate: CapturedCandidate): Promise<ScopedChecks | undefined> {
     const providers = scopedProviders(context);
     if (!providers.length) return undefined;
+    // Trees an earlier session moved aside but did not finish deleting: one listing, in the background.
+    void sweepRemovedTrees().catch(() => undefined);
     const session = new ScopedChecks(context, candidate);
     const storage = await resolveRecordStorage(context.rootDir, { storageNamespace: context.config.storageNamespace, leaf: "scoped-attempts" });
     const { inventory, read } = await preparedSource(context, candidate);
