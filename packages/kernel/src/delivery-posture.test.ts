@@ -956,6 +956,26 @@ describe("which directory is read", () => {
     refusedAtRoot(await resolveDeliveryPosture({ rootDir: lane, baseRef: "origin/main" }), lane);
   });
 
+  it("refuses a clone with no repository above it when its own git common directory does not read", async () => {
+    // Nothing above the clone could refuse it instead, so only the directory's own probe stands between it and a read.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const where = await realpath(f.repo);
+    await shimmedGit(f, `  *" rev-parse --git-common-dir "*) if [ "$(pwd -P)" = "${where}" ]; then exit 128; fi ;;`);
+    refusedAtRoot(await f.resolve(), f.repo);
+  });
+
+  it("refuses when git fails to name the work tree, whatever it printed", async () => {
+    // git prints the directory itself and still fails, so only the exit code tells the answer apart.
+    const f = await fixture();
+    await f.publish(declaration("focused"));
+    const where = await realpath(f.repo);
+    await shimmedGit(f, `  *" rev-parse --show-toplevel "*) echo "${where}"; exit 128 ;;`);
+    const result = await f.resolve();
+    refusedAtRoot(result, f.repo);
+    expect(result.reason).toContain("it is not in a work tree");
+  });
+
   it("refuses when git cannot say whether the directory is a submodule's", async () => {
     const f = await fixture();
     await f.publish(declaration("focused"));
@@ -1075,6 +1095,8 @@ describe("what the fetch leaves alone", () => {
     await f.git("config", "gc.auto", "1");
     await f.git("config", "gc.autoDetach", "false");
     await f.git("config", "maintenance.autoDetach", "false");
+    // Newer git's automatic maintenance can leave out the gc task, whose check runs the pre-auto-gc hook, so turn it on.
+    await f.git("config", "maintenance.gc.enabled", "true");
   }
 
   it("runs no auto maintenance", async () => {
