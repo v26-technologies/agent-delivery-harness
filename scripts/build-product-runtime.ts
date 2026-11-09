@@ -6,6 +6,35 @@ import { createHash } from "node:crypto";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
+
+/** The one module load an adopter's import scanner cannot bound from the specifier alone: the CLI loading the
+ * adopter's own `harness.config.ts`, which it names. Every other `import()` or `require()` in a runtime bundle is
+ * a literal, so a scanner sees exactly what the runtime can load. */
+const BOUNDED_COMPUTED_IMPORTS = [/^pathToFileURL\d*\(configPath\d*\)\.href$/];
+
+/** Each `import()` and `require()` in `text` whose specifier is not a single literal string, as written. */
+export function computedImports(text: string): string[] {
+  const source = ts.createSourceFile("bundle.mjs", text, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && /^(?:__)?require$/.test(node.expression.text))) {
+      const [specifier] = node.arguments;
+      if (!specifier || !(ts.isStringLiteral(specifier) || ts.isNoSubstitutionTemplateLiteral(specifier))) found.push(specifier ? specifier.getText(source) : "");
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+/** Refuses a runtime whose bundles load anything through a computed specifier, other than the config loader. */
+export async function refuseComputedImports(out: string): Promise<void> {
+  for (const name of ["cli-api", "cli", "kernel", "policy"]) {
+    const unbounded = computedImports(await readFile(path.join(out, `${name}.mjs`), "utf8")).filter(specifier => !BOUNDED_COMPUTED_IMPORTS.some(bound => bound.test(specifier)));
+    if (unbounded.length) throw new Error(`product.computed_import: ${name}.mjs loads ${unbounded.join(", ")} through a computed specifier; spell it as a literal`);
+  }
+}
 
 export async function buildProductRuntime(root: string, workflowManifest: string, out: string): Promise<void> {
   const workflow = JSON.parse(await readFile(workflowManifest, "utf8")) as { contentSha256?: string; schemaVersion?: string };
@@ -14,10 +43,11 @@ export async function buildProductRuntime(root: string, workflowManifest: string
   }
   await mkdir(out, { recursive: true });
   for (const [name, source] of Object.entries({ "cli-api": "packages/cli/src/index.ts", cli: "packages/cli/src/main.ts", kernel: "packages/kernel/src/index.ts", policy: "scripts/recompile-policy-snapshot.ts" })) {
-    await build({ absWorkingDir: root, entryPoints: [source], outfile: path.join(out, `${name}.mjs`), bundle: true, platform: "node", format: "esm", target: "node22.6", legalComments: "inline", plugins: [{ name: "installed-kernel", setup(builder) {
+    await build({ absWorkingDir: root, entryPoints: [source], outfile: path.join(out, `${name}.mjs`), bundle: true, platform: "node", format: "esm", target: "node22.6", legalComments: "inline", external: ["bun:ffi"], plugins: [{ name: "installed-kernel", setup(builder) {
       builder.onResolve({ filter: /^@agent-delivery-harness\/kernel$/ }, () => ({ path: "./kernel.mjs", external: true }));
     } }] });
   }
+  await refuseComputedImports(out);
   // Keep declarations in the same generation as the actual implementation.
   // The CLI API imports this generation's kernel types, never an adopter's
   // independently installed (and potentially older) npm package.
