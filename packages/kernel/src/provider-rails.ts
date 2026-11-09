@@ -289,17 +289,29 @@ export interface OpenProviderRailProcessInput {
   readonly inheritDescriptors?: readonly InheritedDescriptor[];
 }
 
-/** Stdio for a rail provider: three pipes, then exactly the declared
- * descriptors the invocation actually holds open. An undeclared or closed
- * descriptor is never passed; its slot is "ignore" (V26-3314). */
-export function providerRailStdio(declared: readonly InheritedDescriptor[] = [], isOpen: (fd: number) => boolean = descriptorOpen): ("pipe" | "ignore" | number)[] {
+/** The launcher that opened inherited descriptors names them here, as
+ * comma-separated numbers ("3,4"). Bun and Node hold descriptors 3 and 4
+ * themselves when nothing was inherited, so an open descriptor alone is no
+ * evidence that it is the capability a provider declared. */
+export const INHERITED_DESCRIPTORS_ENV = "DELIVERY_HARNESS_INHERITED_DESCRIPTORS";
+
+/** Stdio for a rail provider: three pipes, then each descriptor that the
+ * provider declares, the launcher vouches for in the invocation environment,
+ * and that is a pipe or socket. Every other slot is "ignore", so no undeclared,
+ * unvouched or runtime-internal descriptor is ever passed (V26-3314). */
+export function providerRailStdio(
+  declared: readonly InheritedDescriptor[] = [],
+  env: NodeJS.ProcessEnv = {},
+  isChannel: (fd: number) => boolean = descriptorIsChannel,
+): ("pipe" | "ignore" | number)[] {
+  const vouched = new Set((env[INHERITED_DESCRIPTORS_ENV] ?? "").split(",").map((part) => part.trim()).filter((part) => /^[34]$/.test(part)).map(Number));
   const stdio: ("pipe" | "ignore" | number)[] = ["pipe", "pipe", "pipe"];
   const last = Math.max(2, ...declared);
-  for (let fd = 3; fd <= last; fd++) stdio.push(declared.includes(fd as InheritedDescriptor) && isOpen(fd) ? fd : "ignore");
+  for (let fd = 3; fd <= last; fd++) stdio.push(declared.includes(fd as InheritedDescriptor) && vouched.has(fd) && isChannel(fd) ? fd : "ignore");
   return stdio;
 }
-function descriptorOpen(fd: number): boolean {
-  try { fstatSync(fd); return true; } catch { return false; }
+function descriptorIsChannel(fd: number): boolean {
+  try { const stat = fstatSync(fd); return stat.isFIFO() || stat.isSocket(); } catch { return false; }
 }
 
 const DEFAULT_PROVIDER_RAIL_DEADLINE_MS = 10 * 60_000;
@@ -378,7 +390,7 @@ export function openProviderRailProcess(input: OpenProviderRailProcessInput): Pr
   const child = spawn(executable, args, {
     cwd: input.cwd,
     env: input.env,
-    stdio: providerRailStdio(input.inheritDescriptors),
+    stdio: providerRailStdio(input.inheritDescriptors, input.env),
     shell: false,
   }) as ChildProcessWithoutNullStreams;
   // A deadline may destroy the child while a bounded stdin write is pending.

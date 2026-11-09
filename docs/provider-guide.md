@@ -45,10 +45,14 @@ omit `command` keep the manual flow described in the rest of this guide.
 A command provider gets plain stdio. It may also declare
 `inheritDescriptors: [3, 4]` (or just one of them, ascending) to inherit those
 descriptors from the invocation. An invocation uses this to hand a provider a
-capability it already holds, such as a pipe to its own analysis worker. Only
-the declaring provider receives them, and only if the invocation actually holds
-them open; otherwise the provider never receives them. No other descriptor is
-ever passed.
+capability it already holds, such as a pipe to its own analysis worker.
+
+A declared descriptor is passed only when the launcher that opened it vouches
+for it, by listing its number in `DELIVERY_HARNESS_INHERITED_DESCRIPTORS`
+(for example `3,4`), and only when it is a pipe or socket. An open descriptor
+alone is not enough, because Bun and Node hold descriptors 3 and 4 themselves.
+Only the declaring provider receives them. No undeclared, unvouched or
+runtime-internal descriptor is ever passed.
 
 The command exchanges one JSON document per stdout/stdin line. The documents
 and state transitions are the exact vendored
