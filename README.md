@@ -42,12 +42,8 @@ packages carry the `@agent-delivery-harness/*` npm scope; the command you type
 `delivery-harness`. Nothing is being renamed — the three are the same project at
 three different granularities.
 
-**Publication state.** The packages are **not on npm yet**. Release checks —
-including `npm publish --dry-run` per package — run in CI, but nothing has been
-published, so today you adopt the harness from a checkout of this repository
-(see [step 0 of the getting-started guide](docs/getting-started.md#0-consuming-the-harness-pre-v1)).
-The published-action form of the GitHub Action ships with release mechanics; the
-supported form today is self-hosted, `uses: ./packages/action`.
+Release checks run `npm pack --dry-run` for each workspace. Version tags trigger
+the [publish workflow](.github/workflows/publish.yml).
 
 How it was built, unit by unit, is recorded in the vendored plan at
 [docs/plans/2026-08-25-001-feat-delivery-harness-standalone-v1-plan.md](docs/plans/2026-08-25-001-feat-delivery-harness-standalone-v1-plan.md).
@@ -212,7 +208,7 @@ checked against the actual
 `NOTICE` — and the publishability split: no workspace package private, the root
 manifest private. Every rule is falsified by a test, and
 [`.github/workflows/release.yml`](.github/workflows/release.yml) re-runs the
-sensor alongside a per-package `npm publish --dry-run`.
+sensor alongside a per-package `npm pack --dry-run`.
 
 The documentation has sensors of its own.
 [`docs/docs-examples.test.ts`](docs/docs-examples.test.ts) executes the

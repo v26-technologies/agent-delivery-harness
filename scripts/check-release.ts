@@ -2,7 +2,7 @@
  * Release-mechanics sensor.
  *
  * The release workflow's static half: everything about publishability that can
- * be decided from the tree alone, before `npm publish --dry-run` (which the
+ * be decided from the tree alone, before `npm pack --dry-run` (which the
  * workflow runs per package) touches a tarball. Four independently falsifiable
  * rules:
  *
@@ -28,7 +28,7 @@
  *       import is declared in that package's `dependencies`, pinned to the
  *       lockstep version. Inside the workspace npm symlinks the siblings, so an
  *       undeclared edge resolves for the typecheck, the unit suite, the docs
- *       walkthrough, and `npm publish --dry-run` alike — dry-run verifies that a
+ *       walkthrough, and `npm pack --dry-run` alike — dry-run verifies that a
  *       tarball can be BUILT, never that it can be INSTALLED. Published, the
  *       same edge is `ERR_MODULE_NOT_FOUND` on the consumer's first line. The
  *       import set is read from the PACK SHAPE, for the same reason the license
@@ -39,7 +39,7 @@
  *       the sibling's own), `dependency-unused` (declared, never imported from
  *       the published files).
  *   publishability — no workspace package is marked `private` (npm refuses to
- *       pack one, so the dry-run leg could never go green), while the root
+ *       publish one), while the root
  *       manifest MUST stay private: it is the workspace shell, and a root that
  *       lost the flag is one `npm publish` away from shipping the whole
  *       repository as a package nobody declared.
@@ -559,7 +559,7 @@ export function runReleaseChecks(input: ReleaseCheckInput): ReleaseCheckResult {
       findings.push({
         rule: "publishability",
         file: pkg.path,
-        message: `${pkg.name} is marked private; npm cannot pack it, so the publish dry-run can never go green`,
+        message: `${pkg.name} is marked private; npm cannot publish it`,
       });
     }
   }

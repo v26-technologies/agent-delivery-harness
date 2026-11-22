@@ -5,7 +5,7 @@
  * this repository runs inside the workspace, where npm has symlinked
  * `node_modules/@agent-delivery-harness/*` at the workspace root: the typecheck,
  * the unit suite, the docs walkthrough (which wires the same link by hand, see
- * `docs/getting-started.md` §0), and `npm publish --dry-run` — which verifies
+ * `docs/getting-started.md` §0), and `npm pack --dry-run` — which verifies
  * that a tarball can be BUILT, never that it can be INSTALLED. A package whose
  * shipped source imports a sibling it does not declare resolves fine under all
  * of them and throws `ERR_MODULE_NOT_FOUND` on the first line a consumer runs.

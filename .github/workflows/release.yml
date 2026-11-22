@@ -13,12 +13,9 @@
 #             ordinary CI suite already fails a pull request that breaks one;
 #             this workflow re-runs the same sensor as its own named check.
 #
-#   dry-run — `npm publish --dry-run` per package, one step each so a failure
-#             names the package that cannot pack. Dry-run only: nothing here
-#             publishes, tags, or authenticates. Actual publication (and the
-#             compiled Action bundle the published-action form needs — see the
-#             v1 boundary note in packages/action/action.yml) is deliberate
-#             future release mechanics, not this workflow.
+#   dry-run — `npm pack --dry-run` lists the files each workspace would ship.
+#             The check also runs on versions already present in the registry.
+#             Actual publication is handled by publish.yml on a version tag.
 #
 #   install — scripts/check-standalone-install.ts: the leg that leaves the
 #             workspace. It packs all five packages, installs each tarball ALONE
@@ -87,7 +84,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: npm
 
       - name: Install
@@ -96,20 +93,20 @@ jobs:
       - name: Static release sensor
         run: node --import tsx scripts/check-release.ts
 
-      - name: Publish dry-run (kernel)
-        run: npm publish --dry-run --workspace "@agent-delivery-harness/kernel"
+      - name: Pack dry-run (kernel)
+        run: npm pack --dry-run --workspace "@agent-delivery-harness/kernel"
 
-      - name: Publish dry-run (conformance)
-        run: npm publish --dry-run --workspace "@agent-delivery-harness/conformance"
+      - name: Pack dry-run (conformance)
+        run: npm pack --dry-run --workspace "@agent-delivery-harness/conformance"
 
-      - name: Publish dry-run (cli)
-        run: npm publish --dry-run --workspace "@agent-delivery-harness/cli"
+      - name: Pack dry-run (cli)
+        run: npm pack --dry-run --workspace "@agent-delivery-harness/cli"
 
-      - name: Publish dry-run (mcp)
-        run: npm publish --dry-run --workspace "@agent-delivery-harness/mcp"
+      - name: Pack dry-run (mcp)
+        run: npm pack --dry-run --workspace "@agent-delivery-harness/mcp"
 
-      - name: Publish dry-run (action)
-        run: npm publish --dry-run --workspace "@agent-delivery-harness/action"
+      - name: Pack dry-run (action)
+        run: npm pack --dry-run --workspace "@agent-delivery-harness/action"
 
       # The leg dry-run cannot be: every tarball installed alone, outside the
       # workspace, then imported and run. Offline — it resolves the five names
